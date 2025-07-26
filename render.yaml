@@ -5,6 +5,7 @@ services:
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python main.py"
+    autoDeploy: true
     envVars:
       - key: KUCOIN_API_KEY
         value: "687d0016c714e80001eecdbe"
