@@ -4,126 +4,154 @@ import hashlib
 import base64
 import requests
 import json
-import threading
-from datetime import datetime
 from flask import Flask
+import threading
 import logging
+import math
 
 # === НАСТРОЙКИ ===
-KUCOIN_API_KEY = "687d0016c714e80001eecdbe"
-KUCOIN_API_SECRET = "d954b08b-7fbd-408e-a117-4e358a8a764d"
-KUCOIN_API_PASSPHRASE = "Evgeniy@84"
+API_KEY = "687d0016c714e80001eecdbe"
+API_SECRET = "d954b08b-7fbd-408e-a117-4e358a8a764d"
+API_PASSPHRASE = "Evgeniy@84"
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
-TRADE_AMOUNT = 50  # USDT
-SYMBOLS = ["BTCUSDTM", "ETHUSDTM", "SOLUSDTM", "GALAUSDTM", "TRXUSDTM"]
+TRADE_AMOUNT = 50
+LEVERAGE = 5
+TP_PERCENT = 2.5
+SL_PERCENT = 1.5
 
-# === Telegram уведомление ===
+SYMBOLS = ["BTCUSDTM", "ETHUSDTM", "SOLUSDTM", "TRXUSDTM", "GALAUSDTM"]
+INTERVAL = 60  # Проверка каждые 60 секунд
+last_positions = {}
+
+# === KuCoin Futures ===
+BASE_URL = "https://api-futures.kucoin.com"
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        requests.post(url, data=payload)
+    except:
+        pass
 
-# === Подпись KuCoin запроса ===
-def sign_request(method, endpoint, body=""):
+def get_headers(endpoint, method="GET", body=""):
     now = int(time.time() * 1000)
     str_to_sign = f"{now}{method}{endpoint}{body}"
     signature = base64.b64encode(
-        hmac.new(KUCOIN_API_SECRET.encode(), str_to_sign.encode(), hashlib.sha256).digest()
-    ).decode()
+        hmac.new(API_SECRET.encode('utf-8'), str_to_sign.encode('utf-8'), hashlib.sha256).digest()
+    )
     passphrase = base64.b64encode(
-        hmac.new(KUCOIN_API_SECRET.encode(), KUCOIN_API_PASSPHRASE.encode(), hashlib.sha256).digest()
-    ).decode()
-    headers = {
-        "KC-API-KEY": KUCOIN_API_KEY,
+        hmac.new(API_SECRET.encode('utf-8'), API_PASSPHRASE.encode('utf-8'), hashlib.sha256).digest()
+    )
+    return {
         "KC-API-SIGN": signature,
         "KC-API-TIMESTAMP": str(now),
+        "KC-API-KEY": API_KEY,
         "KC-API-PASSPHRASE": passphrase,
         "KC-API-KEY-VERSION": "2",
         "Content-Type": "application/json"
     }
-    return headers
 
-# === Получение свечей для стратегии ===
 def get_klines(symbol):
-    url = f"https://api-futures.kucoin.com/api/v1/kline/query?symbol={symbol}&granularity=5"
+    url = f"{BASE_URL}/api/v1/kline/query?symbol={symbol}&granularity=1"
     try:
         res = requests.get(url)
         data = res.json()["data"]
-        closes = [float(i[2]) for i in data[-30:]]  # последние 30 свечей
+        closes = [float(k[2]) for k in data[-21:]]  # close price
         return closes
-    except Exception as e:
-        print("Ошибка получения свечей:", e)
+    except:
         return []
 
-# === EMA ===
-def ema(data, period):
-    alpha = 2 / (period + 1)
-    ema_val = data[0]
+def calculate_ema(data, period):
+    k = 2 / (period + 1)
+    ema = data[0]
     for price in data[1:]:
-        ema_val = alpha * price + (1 - alpha) * ema_val
-    return ema_val
+        ema = price * k + ema * (1 - k)
+    return ema
 
-# === Отправка ордера на фьючерсы ===
-def place_futures_order(symbol, side, size):
+def get_balance():
+    endpoint = "/api/v1/account-overview?currency=USDT"
+    headers = get_headers(endpoint)
+    url = BASE_URL + endpoint
+    try:
+        res = requests.get(url, headers=headers)
+        return float(res.json()["data"]["availableBalance"])
+    except:
+        return 0
+
+def place_order(symbol, side, size):
     endpoint = "/api/v1/orders"
-    url = "https://api-futures.kucoin.com" + endpoint
-    body = json.dumps({
+    url = BASE_URL + endpoint
+    body = {
         "symbol": symbol,
         "side": side,
-        "leverage": 5,
+        "leverage": LEVERAGE,
         "type": "market",
         "size": size
-    })
-    headers = sign_request("POST", endpoint, body)
-    response = requests.post(url, headers=headers, data=body)
-    if response.status_code == 200:
-        send_telegram(f"✅ {side.upper()} {symbol} на {size} USD открыт.")
-    else:
-        send_telegram(f"❌ Ошибка при открытии ордера {symbol}: {response.text}")
-
-# === Получение цены — последний trade ===
-def get_price(symbol):
-    url = f"https://api-futures.kucoin.com/api/v1/ticker?symbol={symbol}"
+    }
+    body_json = json.dumps(body)
+    headers = get_headers(endpoint, method="POST", body=body_json)
     try:
-        res = requests.get(url)
-        return float(res.json()['data']['price'])
+        r = requests.post(url, headers=headers, data=body_json)
+        return r.json()
     except:
         return None
 
-# === Основная логика торговли ===
+def get_price(symbol):
+    url = f"{BASE_URL}/api/v1/mark-price/{symbol}"
+    try:
+        res = requests.get(url).json()
+        return float(res['data']['value'])
+    except:
+        return 0
+
 def trade():
     while True:
         for symbol in SYMBOLS:
-            try:
-                candles = get_klines(symbol)
-                if not candles or len(candles) < 21:
+            closes = get_klines(symbol)
+            if len(closes) < 21:
+                continue
+            ema9 = calculate_ema(closes[-9:], 9)
+            ema21 = calculate_ema(closes[-21:], 21)
+            price = get_price(symbol)
+
+            position = last_positions.get(symbol)
+
+            # Условия на вход
+            if not position:
+                if ema9 > ema21:
+                    direction = "buy"
+                elif ema9 < ema21:
+                    direction = "sell"
+                else:
                     continue
 
-                ema9 = ema(candles[-9:], 9)
-                ema21 = ema(candles[-21:], 21)
-                price = get_price(symbol)
-                size = round(TRADE_AMOUNT / price, 3)
+                usdt_balance = get_balance()
+                if usdt_balance < TRADE_AMOUNT:
+                    continue
 
-                if ema9 > ema21:
-                    send_telegram(f"📈 {symbol} сигнал на LONG\nЦена: {price}")
-                    place_futures_order(symbol, "buy", size)
-                elif ema9 < ema21:
-                    send_telegram(f"📉 {symbol} сигнал на SHORT\nЦена: {price}")
-                    place_futures_order(symbol, "sell", size)
-                time.sleep(1)
-            except Exception as e:
-                print(f"[Ошибка] {symbol}:", e)
-        time.sleep(60)
+                size = round((TRADE_AMOUNT * LEVERAGE) / price, 4)
+                result = place_order(symbol, direction, size)
+                if result and result.get("code") == "200000":
+                    last_positions[symbol] = direction
+                    send_telegram(f"✅ Открыт {direction.upper()} по {symbol} на {TRADE_AMOUNT} USDT (цена: {price})")
+            else:
+                # Take Profit / Stop Loss логика будет добавлена при желании
+                pass
+        time.sleep(INTERVAL)
 
 # === Flask keep-alive ===
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def home():
-    return "Криптовалютный трейдер KuCoin работает"
+    return "KuCoin Futures бот активен."
 
-# === Стартуем ===
-if __name__ == '__main__':
-    send_telegram("🤖 Фьючерсный бот KuCoin запущен!")
-    threading.Thread(target=trade).start()
-    app.run(host='0.0.0.0', port=10000)
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+if __name__ == "__main__":
+    send_telegram("🤖 Бот запущен на KuCoin Futures")
+    threading.Thread(target=run).start()
+    trade()
