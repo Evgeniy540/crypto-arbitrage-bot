@@ -1,11 +1,12 @@
 import time
-import requests
 import hmac
 import hashlib
 import base64
+import requests
 import json
-import threading
+import logging
 from flask import Flask
+import threading
 
 # === НАСТРОЙКИ ===
 KUCOIN_API_KEY = "687d0016c714e80001eecdbe"
@@ -15,116 +16,138 @@ KUCOIN_API_PASSPHRASE = "Evgeniy@84"
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 
-SYMBOLS = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "TRX-USDT", "GALA-USDT"]
-TRADE_AMOUNT = 100
-COOLDOWN = 60 * 60 * 3
+TRADE_SYMBOLS = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "GALA-USDT"]
+TRADE_AMOUNT = 28
+COOLDOWN = 60 * 60 * 6  # 6 часов
 TP_PERCENT = 1.5
 SL_PERCENT = 1.0
 
-active_trades = {}
 last_trade_time = {}
 
-# === FLASK ===
+# === Telegram ===
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    except Exception as e:
+        print(f"Telegram error: {e}")
+
+# === KuCoin API подписанный запрос ===
+def kucoin_request(method, path, data=None):
+    url = "https://api.kucoin.com" + path
+    now = int(time.time() * 1000)
+    body = json.dumps(data) if data else ""
+    str_to_sign = f"{now}{method}{path}{body}"
+    signature = base64.b64encode(
+        hmac.new(KUCOIN_API_SECRET.encode(), str_to_sign.encode(), hashlib.sha256).digest()
+    ).decode()
+    passphrase = base64.b64encode(
+        hmac.new(KUCOIN_API_SECRET.encode(), KUCOIN_API_PASSPHRASE.encode(), hashlib.sha256).digest()
+    ).decode()
+    headers = {
+        "KC-API-KEY": KUCOIN_API_KEY,
+        "KC-API-SIGN": signature,
+        "KC-API-TIMESTAMP": str(now),
+        "KC-API-PASSPHRASE": passphrase,
+        "KC-API-KEY-VERSION": "2",
+        "Content-Type": "application/json",
+    }
+    response = requests.request(method, url, headers=headers, data=body)
+    return response.json()
+
+# === Получение свечей ===
+def get_klines(symbol):
+    url = f"https://api.kucoin.com/api/v1/market/candles?type=1min&symbol={symbol}"
+    r = requests.get(url)
+    try:
+        candles = r.json().get("data", [])
+        closes = [float(c[2]) for c in candles][::-1]  # close price
+        return closes
+    except Exception as e:
+        send_telegram(f"❌ Ошибка получения свечей {symbol}: {e}")
+        return []
+
+# === EMA ===
+def ema(prices, period):
+    if len(prices) < period:
+        return None
+    k = 2 / (period + 1)
+    ema_val = prices[0]
+    for price in prices[1:]:
+        ema_val = price * k + ema_val * (1 - k)
+    return ema_val
+
+# === Торговая логика ===
+def trader(symbol):
+    if time.time() - last_trade_time.get(symbol, 0) < COOLDOWN:
+        return
+
+    closes = get_klines(symbol)
+    if not closes or len(closes) < 22:
+        return
+
+    ema9 = ema(closes[-9:], 9)
+    ema21 = ema(closes[-21:], 21)
+
+    if ema9 and ema21 and ema9 > ema21:
+        price = closes[-1]
+        amount = round(TRADE_AMOUNT / price, 6)
+
+        # Покупка
+        order = kucoin_request("POST", "/api/v1/orders", {
+            "clientOid": str(time.time()),
+            "side": "buy",
+            "symbol": symbol,
+            "type": "market",
+            "size": str(amount)
+        })
+        if "data" in order:
+            send_telegram(f"✅ Куплено {symbol} по {price}")
+            last_trade_time[symbol] = time.time()
+
+            # Ждём и продаём по TP или SL
+            target_price = price * (1 + TP_PERCENT / 100)
+            stop_price = price * (1 - SL_PERCENT / 100)
+
+            while True:
+                current = get_klines(symbol)
+                if not current:
+                    break
+                current_price = current[-1]
+                if current_price >= target_price:
+                    side = "sell"
+                    msg = f"📈 Продано {symbol} по {current_price}, профит"
+                    break
+                elif current_price <= stop_price:
+                    side = "sell"
+                    msg = f"📉 Продано {symbol} по {current_price}, убыток"
+                    break
+                time.sleep(30)
+
+            kucoin_request("POST", "/api/v1/orders", {
+                "clientOid": str(time.time()),
+                "side": side,
+                "symbol": symbol,
+                "type": "market",
+                "size": str(amount)
+            })
+            send_telegram(msg)
+
+# === Главный цикл ===
+def main_loop():
+    send_telegram("🤖 Бот успешно запущен на Render и готов торговать на KuCoin!")
+    while True:
+        for s in TRADE_SYMBOLS:
+            threading.Thread(target=trader, args=(s,), daemon=True).start()
+        time.sleep(60)
+
+# === Flask Keep-alive ===
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return '🤖 Бот запущен и работает внутри KuCoin'
+    return "Crypto KuCoin Trader Running"
 
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-    try:
-        requests.post(url, data=data)
-    except:
-        pass
-
-def get_headers(endpoint, method, body=""):
-    now = str(int(time.time() * 1000))
-    str_to_sign = now + method + endpoint + body
-    signature = base64.b64encode(
-        hmac.new(KUCOIN_API_SECRET.encode(), str_to_sign.encode(), hashlib.sha256).digest()).decode()
-    passphrase = base64.b64encode(
-        hmac.new(KUCOIN_API_SECRET.encode(), KUCOIN_API_PASSPHRASE.encode(), hashlib.sha256).digest()).decode()
-
-    return {
-        "KC-API-KEY": KUCOIN_API_KEY,
-        "KC-API-SIGN": signature,
-        "KC-API-TIMESTAMP": now,
-        "KC-API-PASSPHRASE": passphrase,
-        "KC-API-KEY-VERSION": "2",
-        "Content-Type": "application/json"
-    }
-
-def get_price(symbol):
-    url = f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={symbol}"
-    try:
-        r = requests.get(url)
-        return float(r.json()["data"]["price"])
-    except:
-        return None
-
-def get_klines(symbol):
-    url = f"https://api.kucoin.com/api/v1/market/candles?type=1min&symbol={symbol}&limit=50"
-    r = requests.get(url)
-    data = r.json()["data"]
-    closes = [float(c[2]) for c in data[::-1]]
-    return closes
-
-def calculate_ema(data, period):
-    ema = data[0]
-    multiplier = 2 / (period + 1)
-    for price in data[1:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
-
-def place_order(symbol, side, funds):
-    url = "https://api.kucoin.com/api/v1/orders"
-    endpoint = "/api/v1/orders"
-    body = {
-        "clientOid": str(int(time.time() * 1000)),
-        "side": side,
-        "symbol": symbol,
-        "type": "market",
-        "funds": str(funds) if side == "buy" else None
-    }
-    body_json = json.dumps({k: v for k, v in body.items() if v is not None})
-    headers = get_headers(endpoint, "POST", body_json)
-    r = requests.post(url, headers=headers, data=body_json)
-    return r.json()
-
-def trader():
-    send_telegram("🤖 Бот успешно запущен на Render и готов торговать на KuCoin!")
-    while True:
-        for symbol in SYMBOLS:
-            now = time.time()
-            if symbol in last_trade_time and now - last_trade_time[symbol] < COOLDOWN:
-                continue
-
-            price = get_price(symbol)
-            closes = get_klines(symbol)
-            ema21 = calculate_ema(closes, 21)
-
-            if symbol not in active_trades:
-                if price < ema21 * 0.985:
-                    result = place_order(symbol, "buy", TRADE_AMOUNT)
-                    if result.get("code") == "200000":
-                        active_trades[symbol] = price
-                        last_trade_time[symbol] = now
-                        send_telegram(f"🟢 Куплено {symbol} по {price:.4f} USDT (EMA21: {ema21:.4f})")
-            else:
-                entry = active_trades[symbol]
-                if price >= entry * (1 + TP_PERCENT / 100):
-                    result = place_order(symbol, "sell", None)
-                    send_telegram(f"✅ Продано {symbol} по {price:.4f} | Профит +{TP_PERCENT}%")
-                    active_trades.pop(symbol)
-                elif price <= entry * (1 - SL_PERCENT / 100):
-                    result = place_order(symbol, "sell", None)
-                    send_telegram(f"🔴 Продано {symbol} по {price:.4f} | Убыток -{SL_PERCENT}%")
-                    active_trades.pop(symbol)
-            time.sleep(1)
-        time.sleep(15)
-
-if __name__ == "__main__":
-    threading.Thread(target=trader, daemon=True).start()
-    app.run(host="0.0.0.0", port=10000)
+if __name__ == '__main__':
+    threading.Thread(target=main_loop, daemon=True).start()
+    app.run(host='0.0.0.0', port=8080)
