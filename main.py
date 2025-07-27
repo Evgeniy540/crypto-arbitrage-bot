@@ -5,53 +5,42 @@ import base64
 import requests
 import json
 import logging
-import threading
-from datetime import datetime
 from flask import Flask
+import threading
+import numpy as np
+import os
 
-# === НАСТРОЙКИ ===
+# === API ключи ===
 API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
 API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
 API_PASSPHRASE = "Evgeniy84"
-
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 
+# === Настройки ===
 TRADE_SYMBOLS = ["btcusdt_UMCBL", "ethusdt_UMCBL", "solusdt_UMCBL", "xrpusdt_UMCBL", "trxusdt_UMCBL"]
+INTERVAL = "1m"
 TRADE_AMOUNT = 10
-INTERVAL = "1H"
+EMA_FAST = 9
+EMA_SLOW = 21
 TP_PERCENT = 1.5
 SL_PERCENT = 1.0
+COOLDOWN = 60 * 60 * 6
+last_trade_time = {}
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-def send_telegram_message(message):
+def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        requests.post(url, data=payload)
+        requests.post(url, json=payload)
     except Exception as e:
-        logging.error(f"Ошибка Telegram: {e}")
-
-def sign_request(timestamp, method, path, body=""):
-    msg = f'{timestamp}{method}{path}{body}'
-    signature = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-    return signature
-
-def get_headers(method, path, body=""):
-    timestamp = str(int(time.time() * 1000))
-    sign = sign_request(timestamp, method, path, body)
-    return {
-        "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": sign,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": API_PASSPHRASE,
-        "Content-Type": "application/json"
-    }
+        logging.error(f"Ошибка отправки Telegram: {e}")
 
 def get_klines(symbol):
-    url = f"https://api.bitget.com/api/mix/v1/market/candles?symbol={symbol}&granularity={INTERVAL}"
+    url = f"https://api.bitget.com/api/mix/v1/market/candles?symbol={symbol}&granularity={INTERVAL}&limit=100"
     try:
         res = requests.get(url).json()
         if 'data' not in res or not res['data']:
@@ -62,18 +51,15 @@ def get_klines(symbol):
         logging.error(f"Ошибка получения свечей: {e}")
         return None
 
-def calculate_ema(data, period):
+def calc_ema(data, period):
     if len(data) < period:
         return None
-    ema = sum(data[:period]) / period
-    k = 2 / (period + 1)
-    for price in data[period:]:
-        ema = price * k + ema * (1 - k)
-    return ema
+    return np.convolve(data, np.ones(period)/period, mode='valid')
 
 def place_order(symbol, side):
-    url = "https://api.bitget.com/api/mix/v1/order/placeOrder"
-    data = {
+    timestamp = str(int(time.time() * 1000))
+    url = "https://api.bitget.com/api/mix/v1/order/place"
+    body = {
         "symbol": symbol,
         "marginCoin": "USDT",
         "size": str(TRADE_AMOUNT),
@@ -82,50 +68,58 @@ def place_order(symbol, side):
         "tradeSide": "open",
         "productType": "umcbl"
     }
-    body = json.dumps(data)
-    headers = get_headers("POST", "/api/mix/v1/order/placeOrder", body)
-    res = requests.post(url, headers=headers, data=body)
+    msg = timestamp + "POST" + "/api/mix/v1/order/place" + json.dumps(body)
+    sign = base64.b64encode(hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).digest()).decode()
+    headers = {
+        "ACCESS-KEY": API_KEY,
+        "ACCESS-SIGN": sign,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": API_PASSPHRASE,
+        "Content-Type": "application/json"
+    }
     try:
-        result = res.json()
-        if result.get("code") == "00000":
-            send_telegram_message(f"✅ Открыт {side.upper()} ордер по {symbol.upper()} на {TRADE_AMOUNT} USDT")
-        else:
-            send_telegram_message(f"❌ Ошибка при открытии {side.upper()} на {symbol.upper()}:\n{result}")
+        res = requests.post(url, json=body, headers=headers).json()
+        logging.info(res)
+        return res
     except Exception as e:
-        send_telegram_message(f"⚠️ Ошибка при открытии сделки: {e}")
+        logging.error(f"Ошибка размещения ордера: {e}")
+        return None
 
-def strategy():
-    for symbol in TRADE_SYMBOLS:
-        data = get_klines(symbol)
-        if not data or len(data) < 22:
-            logging.warning(f"Недостаточно данных для {symbol}")
-            continue
-
-        ema9 = calculate_ema(data, 9)
-        ema21 = calculate_ema(data, 21)
-        logging.info(f"{symbol} EMA9: {ema9:.2f}, EMA21: {ema21:.2f}")
-
-        if ema9 > ema21:
-            place_order(symbol, "buy")
-        elif ema9 < ema21:
-            place_order(symbol, "sell")
-        else:
-            logging.info(f"📊 Нет сигнала для {symbol}")
-
-def run_bot():
+def trade_logic():
     while True:
-        try:
-            send_telegram_message("🤖 Бот запущен и анализирует рынок...")
-            strategy()
-        except Exception as e:
-            logging.error(f"Ошибка в стратегии: {e}")
-            send_telegram_message(f"⚠️ Ошибка бота: {e}")
-        time.sleep(60 * 60)  # раз в час
+        for symbol in TRADE_SYMBOLS:
+            now = time.time()
+            if symbol in last_trade_time and now - last_trade_time[symbol] < COOLDOWN:
+                continue
+            klines = get_klines(symbol)
+            if not klines or len(klines) < EMA_SLOW + 1:
+                logging.warning(f"Недостаточно данных для {symbol}")
+                send_telegram(f"⚠️ Нет данных по {symbol.upper()}")
+                continue
+            ema_fast = calc_ema(klines, EMA_FAST)
+            ema_slow = calc_ema(klines, EMA_SLOW)
+            if ema_fast is None or ema_slow is None:
+                continue
+            if ema_fast[-1] > ema_slow[-1] and ema_fast[-2] <= ema_slow[-2]:
+                side = "buy"
+                response = place_order(symbol, side)
+                send_telegram(f"📈 LONG-сигнал по {symbol.upper()}! Ордер: {response}")
+                last_trade_time[symbol] = now
+            elif ema_fast[-1] < ema_slow[-1] and ema_fast[-2] >= ema_slow[-2]:
+                side = "sell"
+                response = place_order(symbol, side)
+                send_telegram(f"📉 SHORT-сигнал по {symbol.upper()}! Ордер: {response}")
+                last_trade_time[symbol] = now
+        time.sleep(30)
 
-@app.route("/")
+@app.route('/')
 def home():
-    return "✅ Bitget Futures Trading Bot запущен!"
+    return "Bitget Futures Trading Bot is running!"
+
+def start_bot():
+    send_telegram("🤖 Бот запущен и ждёт сигнала по фьючерсам Bitget!")
+    trade_logic()
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=8080)
+    threading.Thread(target=start_bot).start()
+    app.run(host="0.0.0.0", port=10000)
