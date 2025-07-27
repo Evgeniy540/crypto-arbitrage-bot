@@ -4,8 +4,8 @@ import hashlib
 import base64
 import requests
 import json
-from flask import Flask, request
 import threading
+from flask import Flask
 
 # === НАСТРОЙКИ ===
 BITGET_API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
@@ -13,18 +13,38 @@ BITGET_API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0
 BITGET_API_PASSPHRASE = "Evgeniy84"
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
-TRADE_AMOUNT = 10  # в USDT
-SYMBOLS = [
-    "BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "SOLUSDT_UMCBL", "XRPUSDT_UMCBL", "TRXUSDT_UMCBL",
-    "APEUSDT_UMCBL", "ARBUSDT_UMCBL", "GALAUSDT_UMCBL", "DOGEUSDT_UMCBL", "SUIUSDT_UMCBL"
-]
-POSITIONS = {}
-PROFIT = 0
+TRADE_AMOUNT = 10
+SYMBOLS = ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "SOLUSDT_UMCBL", "XRPUSDT_UMCBL", "TRXUSDT_UMCBL"]
+
+app = Flask(__name__)
+last_no_signal = {}
+last_report_time = 0
 
 # === TELEGRAM ===
-def send_telegram(text):
+def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        requests.post(url, data=data)
+    except Exception as e:
+        print(f"Ошибка Telegram: {e}")
+
+# === GET CANDLES ===
+def get_candles(symbol):
+    url = "https://api.bitget.com/api/mix/v1/market/candles"
+    params = {
+        "symbol": symbol,
+        "granularity": "1min",
+        "limit": "100",
+        "productType": "umcbl"
+    }
+    try:
+        response = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+        data = response.json()
+        return data["data"] if "data" in data else None
+    except Exception as e:
+        print(f"Ошибка получения свечей {symbol}: {e}")
+        return None
 
 # === EMA ===
 def calculate_ema(prices, period):
@@ -40,29 +60,28 @@ def calculate_ema(prices, period):
             ema.append((price - ema[-1]) * k + ema[-1])
     return ema
 
-# === BITGET ===
-def get_candles(symbol):
-    try:
-        url = "https://api.bitget.com/api/mix/v1/market/candles"
-        params = {"symbol": symbol, "granularity": "1min", "limit": "100"}
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, params=params, headers=headers)
-        data = r.json()
-        return data["data"] if "data" in data else None
-    except Exception as e:
-        send_telegram(f"❌ Ошибка свечей {symbol}: {e}")
-        return None
+# === SIGN ===
+def generate_signature(timestamp, method, request_path, body=""):
+    prehash = f"{timestamp}{method}{request_path}{body}"
+    signature = hmac.new(BITGET_API_SECRET.encode(), prehash.encode(), hashlib.sha256).hexdigest()
+    return signature
 
-def get_price(symbol):
-    candles = get_candles(symbol)
-    if candles and len(candles) > 0:
-        return float(candles[0][4])
-    return None
+def get_headers(timestamp, method, path, body=""):
+    sign = generate_signature(timestamp, method, path, body)
+    return {
+        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-SIGN": sign,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
+        "Content-Type": "application/json"
+    }
 
+# === ORDER ===
 def place_order(symbol, side):
-    url = "https://api.bitget.com/api/mix/v1/order/placeOrder"
     timestamp = str(int(time.time() * 1000))
-    body = {
+    url_path = "/api/mix/v1/order/placeOrder"
+    method = "POST"
+    data = {
         "symbol": symbol,
         "marginCoin": "USDT",
         "size": str(TRADE_AMOUNT),
@@ -71,97 +90,66 @@ def place_order(symbol, side):
         "tradeSide": "long" if side == "buy" else "short",
         "productType": "umcbl"
     }
-    prehash = f"{timestamp}POST/api/mix/v1/order/placeOrder{json.dumps(body)}"
-    sign = hmac.new(BITGET_API_SECRET.encode(), prehash.encode(), hashlib.sha256).digest()
-    sign_b64 = base64.b64encode(sign).decode()
-    headers = {
-        "ACCESS-KEY": BITGET_API_KEY,
-        "ACCESS-SIGN": sign_b64,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
-        "Content-Type": "application/json"
-    }
+    body = json.dumps(data)
+    headers = get_headers(timestamp, method, url_path, body)
+    full_url = "https://api.bitget.com" + url_path
     try:
-        r = requests.post(url, headers=headers, data=json.dumps(body))
-        resp = r.json()
-        send_telegram(f"✅ Ордер {side.upper()} {symbol}: {resp}")
-        return get_price(symbol)
+        response = requests.post(full_url, headers=headers, data=body)
+        result = response.json()
+        if result.get("code") == "00000":
+            send_telegram_message(f"✅ Ордер {side.upper()} {symbol} выполнен")
+        else:
+            send_telegram_message(f"❌ Ошибка ордера {symbol}: {result}")
     except Exception as e:
-        send_telegram(f"❌ Ошибка ордера {symbol}: {e}")
-        return None
+        send_telegram_message(f"⚠️ Ошибка запроса ордера {symbol}: {e}")
 
-# === ОСНОВНАЯ ЛОГИКА ===
+# === STRATEGY ===
 def strategy():
-    global PROFIT
+    global last_report_time
+    one_time_report = ""
+
     while True:
         for symbol in SYMBOLS:
-            candles = get_candles(symbol)
-            if not candles or len(candles) < 21:
-                send_telegram(f"❗ Недостаточно данных по {symbol}")
-                continue
             try:
-                close_prices = [float(c[4]) for c in candles[::-1]]
+                candles = get_candles(symbol)
+                if not candles:
+                    send_telegram_message(f"⚠️ Нет свечей для {symbol}")
+                    continue
+
+                close_prices = [float(c[4]) for c in candles if c[4] is not None]
+                if len(close_prices) < 21:
+                    one_time_report += f"❗ {symbol}: только {len(close_prices)} свечей\n"
+                    continue
+
                 ema9 = calculate_ema(close_prices, 9)
                 ema21 = calculate_ema(close_prices, 21)
 
                 if ema9[-1] > ema21[-1]:
-                    if symbol not in POSITIONS:
-                        entry_price = place_order(symbol, "buy")
-                        if entry_price:
-                            POSITIONS[symbol] = {"entry": entry_price, "side": "long"}
-                    else:
-                        entry = POSITIONS[symbol]["entry"]
-                        current = get_price(symbol)
-                        if current >= entry * 1.015:
-                            PROFIT += (current - entry) * TRADE_AMOUNT / entry
-                            send_telegram(f"📈 TP {symbol} по LONG — +1.5%")
-                            del POSITIONS[symbol]
-                        elif current <= entry * 0.99:
-                            PROFIT -= (entry - current) * TRADE_AMOUNT / entry
-                            send_telegram(f"⚠️ SL {symbol} по LONG — -1%")
-                            del POSITIONS[symbol]
+                    place_order(symbol, "buy")
                 elif ema9[-1] < ema21[-1]:
-                    if symbol not in POSITIONS:
-                        entry_price = place_order(symbol, "sell")
-                        if entry_price:
-                            POSITIONS[symbol] = {"entry": entry_price, "side": "short"}
-                    else:
-                        entry = POSITIONS[symbol]["entry"]
-                        current = get_price(symbol)
-                        if current <= entry * 0.985:
-                            PROFIT += (entry - current) * TRADE_AMOUNT / entry
-                            send_telegram(f"📉 TP {symbol} по SHORT — +1.5%")
-                            del POSITIONS[symbol]
-                        elif current >= entry * 1.01:
-                            PROFIT -= (current - entry) * TRADE_AMOUNT / entry
-                            send_telegram(f"⚠️ SL {symbol} по SHORT — -1%")
-                            del POSITIONS[symbol]
+                    place_order(symbol, "sell")
                 else:
-                    send_telegram(f"ℹ️ По {symbol} сейчас нет сигнала")
+                    now = time.time()
+                    if symbol not in last_no_signal or now - last_no_signal[symbol] > 3600:
+                        send_telegram_message(f"ℹ️ По {symbol} сейчас нет сигнала")
+                        last_no_signal[symbol] = now
+
             except Exception as e:
-                send_telegram(f"❌ Ошибка анализа {symbol}: {e}")
-            time.sleep(5)
+                send_telegram_message(f"❌ Ошибка стратегии по {symbol}: {e}")
+
+        if one_time_report and time.time() - last_report_time > 3600:
+            send_telegram_message("📊 Статус свечей:\n" + one_time_report.strip())
+            last_report_time = time.time()
+            one_time_report = ""
+
         time.sleep(30)
 
-# === TELEGRAM HANDLER ===
-app = Flask(__name__)
-@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
-def webhook():
-    data = request.get_json()
-    if "message" in data and "text" in data["message"]:
-        chat_id = data["message"]["chat"]["id"]
-        text = data["message"]["text"]
-        if text == "/profit":
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                data={"chat_id": chat_id, "text": f"📊 Общая прибыль: {round(PROFIT, 2)} USDT"}
-            )
-    return "ok"
-
-@app.route("/")
+# === FLASK ===
+@app.route('/')
 def index():
-    return "🤖 Бот работает на Render!"
+    return "🤖 Bitget бот работает!"
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+    send_telegram_message("🤖 Бот запущен на Render!")
     threading.Thread(target=strategy).start()
     app.run(host="0.0.0.0", port=10000)
