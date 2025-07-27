@@ -61,7 +61,12 @@ def check_signal(symbol):
     closes = [c[1] for c in candles]
     ema_short = calculate_ema(closes[-EMA_SHORT:], EMA_SHORT)
     ema_long = calculate_ema(closes, EMA_LONG)
-    return ("long", closes[-1]) if ema_short > ema_long else ("short", closes[-1]) if ema_short < ema_long else (None, None)
+    print(f"{symbol} | EMA{EMA_SHORT}: {ema_short:.2f} | EMA{EMA_LONG}: {ema_long:.2f}")
+    if ema_short > ema_long:
+        return "long", closes[-1]
+    elif ema_short < ema_long:
+        return "short", closes[-1]
+    return None, None
 
 # === Размещение ордера ===
 def place_order(symbol, side):
@@ -87,6 +92,7 @@ def place_order(symbol, side):
     }
     url = "https://api.bitget.com" + path
     res = requests.post(url, headers=headers, data=body_json).json()
+    print(f"Bitget response for {symbol} [{side.upper()}]: {res}")
     return res
 
 # === Получение последней цены ===
@@ -107,16 +113,18 @@ def trade():
                 continue
 
             if symbol not in positions:
-                # Открытие позиции
+                print(f"{symbol}: signal {signal.upper()} | price: {price}")
                 res = place_order(symbol, signal)
-                if "code" in res and res["code"] == "00000":
-                    positions[symbol] = {
-                        "side": signal,
-                        "entry": price
-                    }
-                    send_telegram(f"📈 Открыта {signal.upper()} сделка по {symbol} по цене {price}")
+                if "code" in res:
+                    if res["code"] == "00000":
+                        positions[symbol] = {
+                            "side": signal,
+                            "entry": price
+                        }
+                        send_telegram(f"📈 Открыта {signal.upper()} сделка по {symbol} по цене {price}")
+                    else:
+                        send_telegram(f"❌ Ошибка при открытии сделки по {symbol}:\n{res}")
             else:
-                # Проверка TP/SL
                 current_price = get_price(symbol)
                 if not current_price:
                     continue
@@ -130,10 +138,13 @@ def trade():
                    (side == "short" and (current_price <= tp_price or current_price >= sl_price)):
                     close_side = "close_long" if side == "long" else "close_short"
                     res = place_order(symbol, close_side)
-                    if "code" in res and res["code"] == "00000":
-                        profit = round((current_price - entry) * TRADE_AMOUNT, 3)
-                        send_telegram(f"✅ Сделка {side.upper()} по {symbol} закрыта по цене {current_price} (вход {entry})\n📊 Прибыль: {profit} USDT")
-                        del positions[symbol]
+                    if "code" in res:
+                        if res["code"] == "00000":
+                            profit = round((current_price - entry) * TRADE_AMOUNT, 3)
+                            send_telegram(f"✅ Сделка {side.upper()} по {symbol} закрыта по цене {current_price} (вход {entry})\n📊 Прибыль: {profit} USDT")
+                            del positions[symbol]
+                        else:
+                            send_telegram(f"❌ Ошибка при закрытии сделки по {symbol}:\n{res}")
 
         time.sleep(60)
 
