@@ -1,19 +1,21 @@
 services:
   - type: web
-    name: crypto-trading-bot
+    name: bitget-trading-bot
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python main.py"
     autoDeploy: true
     envVars:
-      - key: KUCOIN_API_KEY
-        value: "687d0016c714e80001eecdbe"
-      - key: KUCOIN_API_SECRET
-        value: "d954b08b-7fbd-408e-a117-4e358a8a764d"
-      - key: KUCOIN_API_PASSPHRASE
-        value: "Evgeniy@84"
+      - key: BITGET_API_KEY
+        value: "bg_7bd202760f36727cedf11a481dbca611"
+      - key: BITGET_API_SECRET
+        value: "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
+      - key: BITGET_API_PASSPHRASE
+        value: "Evgeniy84"
       - key: TELEGRAM_TOKEN
         value: "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
       - key: TELEGRAM_CHAT_ID
         value: "5723086631"
+    build:
+      pythonVersion: 3.11
