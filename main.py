@@ -1,139 +1,95 @@
-import requests
 import time
 import hmac
 import hashlib
 import base64
+import requests
 import json
-import threading
 from flask import Flask
-import logging
+import threading
 
-# === КЛЮЧИ ===
+# === НАСТРОЙКИ ===
+TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
+TELEGRAM_CHAT_ID = "5723086631"
 API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
 API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
 API_PASSPHRASE = "Evgeniy84"
-TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
-TELEGRAM_CHAT_ID = "5723086631"
-
-# === НАСТРОЙКИ ===
+TRADE_AMOUNT = 10
 SYMBOLS = ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "SOLUSDT_UMCBL", "XRPUSDT_UMCBL", "TRXUSDT_UMCBL"]
-TRADE_AMOUNT = 10  # в USDT
-TP_PERCENT = 1.5
-SL_PERCENT = 1.0
-INTERVAL = "1min"
-LIMIT = 100
 
-# === Flask keep-alive ===
+# === Flask Keep-Alive ===
 app = Flask(__name__)
-
 @app.route('/')
 def home():
-    return "✅ Бот работает!"
+    return "Crypto Bot is running!"
+def run_flask():
+    app.run(host='0.0.0.0', port=10000)
 
+# === Telegram ===
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
     try:
         requests.post(url, data=payload)
     except Exception as e:
-        print("Ошибка Telegram:", e)
+        print(f"Ошибка при отправке сообщения в Telegram: {str(e)}")
 
-def bitget_request(method, path, params=None, body=None):
-    timestamp = str(int(time.time() * 1000))
-    pre_hash = timestamp + method + path
-    if body:
-        pre_hash += json.dumps(body)
-    sign = hmac.new(API_SECRET.encode(), pre_hash.encode(), hashlib.sha256).hexdigest()
-    headers = {
-        'ACCESS-KEY': API_KEY,
-        'ACCESS-SIGN': sign,
-        'ACCESS-TIMESTAMP': timestamp,
-        'ACCESS-PASSPHRASE': API_PASSPHRASE,
-        'Content-Type': 'application/json'
-    }
-    url = f"https://api.bitget.com{path}"
-    try:
-        if method == "GET":
-            res = requests.get(url, headers=headers, params=params)
-        elif method == "POST":
-            res = requests.post(url, headers=headers, json=body)
-        return res.json()
-    except Exception as e:
-        print("Ошибка Bitget API:", e)
-        return None
-
+# === Получение свечей с Bitget ===
 def get_klines(symbol):
-    url = f"https://api.bitget.com/api/mix/v1/market/history-candles"
+    url = "https://api.bitget.com/api/mix/v1/market/history-candles"
     params = {
         "symbol": symbol,
         "granularity": "1min",
-        "limit": str(LIMIT)
+        "limit": "100"
     }
+
     try:
-        res = requests.get(url, params=params)
-        data = res.json()
-        if isinstance(data, dict) and "data" in data:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
             return data["data"]
         else:
-            send_telegram_message(f"⚠️ Не удалось получить свечи по {symbol}")
+            message = f"⚠️ Не удалось получить свечи по {symbol}.
+Ответ API: {json.dumps(data)}"
+            print(message)
+            send_telegram_message(message)
             return None
+
     except Exception as e:
-        send_telegram_message(f"❌ Ошибка получения свечей {symbol}: {str(e)}")
+        message = f"❌ Ошибка при запросе свечей по {symbol}: {str(e)}"
+        print(message)
+        send_telegram_message(message)
         return None
 
-def calculate_ema(data, period):
-    prices = [float(candle[4]) for candle in data]
-    ema = []
-    k = 2 / (period + 1)
-    for i in range(len(prices)):
-        if i < period:
-            ema.append(None)
-        elif i == period:
-            sma = sum(prices[i-period+1:i+1]) / period
-            ema.append(sma)
-        else:
-            ema.append(prices[i] * k + ema[-1] * (1 - k))
-    return ema
-
-def place_order(symbol, side):
-    path = "/api/mix/v1/order/placeOrder"
-    order_data = {
-        "symbol": symbol,
-        "marginCoin": "USDT",
-        "size": str(TRADE_AMOUNT),
-        "side": side,
-        "orderType": "market",
-        "tradeSide": side.lower(),
-        "productType": "umcbl"
-    }
-    result = bitget_request("POST", path, body=order_data)
-    return result
-
-def strategy(symbol):
+# === Примерная торговая логика ===
+def analyze_and_trade(symbol):
     candles = get_klines(symbol)
-    if candles is None or len(candles) < 21:
+    if candles is None:
         return
-    ema9 = calculate_ema(candles, 9)
-    ema21 = calculate_ema(candles, 21)
-    if ema9[-1] and ema21[-1] and ema9[-1] > ema21[-1]:
-        send_telegram_message(f"🟢 Сигнал на покупку {symbol}")
-        order = place_order(symbol, "open_long")
-        send_telegram_message(f"🛒 КУПИТЬ {symbol}: {order}")
-    elif ema9[-1] and ema21[-1] and ema9[-1] < ema21[-1]:
-        send_telegram_message(f"🔴 Сигнал на продажу {symbol}")
-        order = place_order(symbol, "open_short")
-        send_telegram_message(f"📉 ПРОДАТЬ {symbol}: {order}")
 
-def run_bot():
+    closes = [float(c[4]) for c in candles]
+    ema9 = sum(closes[-9:]) / 9
+    ema21 = sum(closes[-21:]) / 21
+
+    if ema9 > ema21:
+        send_telegram_message(f"📈 Сигнал на покупку: {symbol}")
+    else:
+        print(f"Нет сигнала на {symbol}")
+
+# === Главный цикл ===
+def main_loop():
     while True:
         for symbol in SYMBOLS:
-            try:
-                strategy(symbol)
-            except Exception as e:
-                print(f"Ошибка по {symbol}:", e)
+            analyze_and_trade(symbol)
+            time.sleep(2)
         time.sleep(60)
 
-# Запуск
-send_telegram_message("🤖 Бот успешно запущен на Render!")
-threading.Thread(target=run_bot, daemon=True).start()
-app.run(host="0.0.0.0", port=10000)
+# === Старт ===
+if __name__ == "__main__":
+    send_telegram_message("🤖 Бот запущен на Render!")
+    threading.Thread(target=run_flask).start()
+    main_loop()
