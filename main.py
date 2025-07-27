@@ -20,6 +20,8 @@ SL_PERCENT = 0.01
 EMA_SHORT = 9
 EMA_LONG = 21
 
+positions = {}
+
 # === Telegram уведомления ===
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -55,15 +57,11 @@ def calculate_ema(prices, period):
 def check_signal(symbol):
     candles = get_candles(symbol)
     if len(candles) < EMA_LONG:
-        return None
+        return None, None
     closes = [c[1] for c in candles]
     ema_short = calculate_ema(closes[-EMA_SHORT:], EMA_SHORT)
     ema_long = calculate_ema(closes, EMA_LONG)
-    if ema_short > ema_long:
-        return "long"
-    elif ema_short < ema_long:
-        return "short"
-    return None
+    return ("long", closes[-1]) if ema_short > ema_long else ("short", closes[-1]) if ema_short < ema_long else (None, None)
 
 # === Размещение ордера ===
 def place_order(symbol, side):
@@ -91,17 +89,55 @@ def place_order(symbol, side):
     res = requests.post(url, headers=headers, data=body_json).json()
     return res
 
+# === Получение последней цены ===
+def get_price(symbol):
+    url = f"https://api.bitget.com/api/mix/v1/market/ticker?symbol={symbol}"
+    try:
+        res = requests.get(url).json()
+        return float(res["data"]["last"])
+    except:
+        return None
+
 # === Торговая логика ===
 def trade():
     while True:
         for symbol in SYMBOLS:
-            signal = check_signal(symbol)
-            if signal:
+            signal, price = check_signal(symbol)
+            if not signal or not price:
+                continue
+
+            if symbol not in positions:
+                # Открытие позиции
                 res = place_order(symbol, signal)
-                send_telegram(f"Открыта {signal.upper()} сделка по {symbol}:\n{res}")
+                if "code" in res and res["code"] == "00000":
+                    positions[symbol] = {
+                        "side": signal,
+                        "entry": price
+                    }
+                    send_telegram(f"📈 Открыта {signal.upper()} сделка по {symbol} по цене {price}")
+            else:
+                # Проверка TP/SL
+                current_price = get_price(symbol)
+                if not current_price:
+                    continue
+
+                entry = positions[symbol]["entry"]
+                side = positions[symbol]["side"]
+                tp_price = entry * (1 + TP_PERCENT) if side == "long" else entry * (1 - TP_PERCENT)
+                sl_price = entry * (1 - SL_PERCENT) if side == "long" else entry * (1 + SL_PERCENT)
+
+                if (side == "long" and (current_price >= tp_price or current_price <= sl_price)) or \
+                   (side == "short" and (current_price <= tp_price or current_price >= sl_price)):
+                    close_side = "close_long" if side == "long" else "close_short"
+                    res = place_order(symbol, close_side)
+                    if "code" in res and res["code"] == "00000":
+                        profit = round((current_price - entry) * TRADE_AMOUNT, 3)
+                        send_telegram(f"✅ Сделка {side.upper()} по {symbol} закрыта по цене {current_price} (вход {entry})\n📊 Прибыль: {profit} USDT")
+                        del positions[symbol]
+
         time.sleep(60)
 
-# === Flask сервер ===
+# === Flask-сервер ===
 app = Flask(__name__)
 @app.route("/")
 def home():
