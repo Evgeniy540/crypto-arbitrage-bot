@@ -1,150 +1,159 @@
-import requests
 import time
 import hmac
 import hashlib
 import base64
+import requests
 import json
-from datetime import datetime, timedelta
-from flask import Flask
 import threading
+from datetime import datetime
+from flask import Flask
+import schedule
 
-# === API КЛЮЧИ ===
-API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
-API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
-API_PASSPHRASE = "Evgeniy84"
-
+# === КЛЮЧИ ===
+BITGET_API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
+BITGET_API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
+BITGET_API_PASSPHRASE = "Evgeniy84"
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 
-# === НАСТРОЙКИ ===
+# === ПАРАМЕТРЫ ===
+TRADE_AMOUNT = 10.0
 SYMBOLS = ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "SOLUSDT_UMCBL", "XRPUSDT_UMCBL", "TRXUSDT_UMCBL"]
-TRADE_AMOUNT = 10
 CHECK_INTERVAL = 30  # секунд
 TP_PERCENT = 1.5
 SL_PERCENT = 1.0
-last_no_signal = {}
-last_report_time = None
+last_signal_time = {}
 
 app = Flask(__name__)
 
-def send_telegram(message):
+def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    try:
-        requests.post(url, data=data)
-    except Exception as e:
-        print("Ошибка Telegram:", e)
+    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
 
 def get_timestamp():
     return str(int(time.time() * 1000))
 
-def sign(params, secret):
-    sorted_params = sorted(params.items())
-    query = "&".join([f"{k}={v}" for k, v in sorted_params])
-    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+def sign_request(timestamp, method, path, body):
+    body = json.dumps(body) if body else ""
+    message = f"{timestamp}{method}{path}{body}"
+    mac = hmac.new(BITGET_API_SECRET.encode(), message.encode(), hashlib.sha256)
+    return mac.hexdigest()
+
+def get_headers(method, path, body=None):
+    timestamp = get_timestamp()
+    sign = sign_request(timestamp, method, path, body)
+    return {
+        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-SIGN": sign,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
+    }
 
 def get_candles(symbol):
     url = "https://api.bitget.com/api/mix/v1/market/history-candles"
     params = {
-        "symbol": symbol.replace("_", ""),
+        "symbol": symbol,
         "granularity": "1min",
-        "limit": "100",
+        "limit": 100,
         "productType": "umcbl"
     }
-    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        response = requests.get(url, params=params, headers=headers)
-        if response.status_code == 200:
-            data = response.json()
-            return [[float(x[1]) for x in data['data']]] if data.get("data") else None
-        else:
+        response = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+        if response.status_code != 200:
             send_telegram(f"❗Ошибка HTTP {response.status_code} для {symbol}")
-            return None
+            return []
+        data = response.json().get("data", [])
+        if not data:
+            send_telegram(f"❗Недостаточно данных для {symbol}")
+        return list(reversed(data))
     except Exception as e:
-        send_telegram(f"❗Ошибка получения свечей для {symbol}: {e}")
-        return None
+        send_telegram(f"Ошибка получения свечей {symbol}: {str(e)}")
+        return []
 
-def calculate_ema(prices, period):
-    if len(prices) < period:
-        return None
-    ema = prices[:period]
-    multiplier = 2 / (period + 1)
-    for price in prices[period:]:
-        ema.append((price - ema[-1]) * multiplier + ema[-1])
-    return ema[-1]
+def calculate_ema(data, period):
+    ema = []
+    k = 2 / (period + 1)
+    for i, candle in enumerate(data):
+        close = float(candle[4])
+        if i == 0:
+            ema.append(close)
+        else:
+            ema.append(close * k + ema[-1] * (1 - k))
+    return ema
 
 def place_order(symbol, side, size):
-    url = "https://api.bitget.com/api/mix/v1/order/placeOrder"
-    timestamp = get_timestamp()
+    path = "/api/mix/v1/order/placeOrder"
+    url = f"https://api.bitget.com{path}"
     body = {
-        "symbol": symbol.replace("_", ""),
+        "symbol": symbol,
         "marginCoin": "USDT",
         "size": str(size),
         "side": side,
         "orderType": "market",
-        "timeInForceValue": "normal",
-        "clientOid": str(int(time.time() * 1000)),
+        "tradeSide": "open",
         "productType": "umcbl"
     }
-    body_json = json.dumps(body)
-    message = timestamp + "POST" + "/api/mix/v1/order/placeOrder" + body_json
-    sign_header = base64.b64encode(hmac.new(API_SECRET.encode(), message.encode(), hashlib.sha256).digest()).decode()
-    headers = {
-        "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": sign_header,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": API_PASSPHRASE,
-        "Content-Type": "application/json"
-    }
-    response = requests.post(url, headers=headers, data=body_json)
-    if response.status_code == 200:
-        send_telegram(f"✅ Открыт ордер {side.upper()} {symbol} на {size} USDT")
-    else:
-        send_telegram(f"❗Ошибка при размещении ордера: {response.text}")
+    headers = get_headers("POST", path, body)
+    response = requests.post(url, headers=headers, json=body)
+    try:
+        res = response.json()
+        if res.get("code") == "00000":
+            send_telegram(f"✅ Открыта позиция {side.upper()} по {symbol}")
+            return True
+        else:
+            send_telegram(f"Ошибка открытия позиции {symbol}: {res}")
+    except:
+        send_telegram(f"Ошибка запроса при размещении ордера {symbol}")
+    return False
 
-def check_signal(symbol):
+def monitor():
     global TRADE_AMOUNT
-
-    candles = get_candles(symbol)
-    if not candles or len(candles[0]) < 21:
-        send_telegram(f"❗ Недостаточно данных для {symbol}")
-        return
-
-    closes = candles[0]
-    ema9 = calculate_ema(closes, 9)
-    ema21 = calculate_ema(closes, 21)
-
-    if ema9 is None or ema21 is None:
-        return
-
-    now = datetime.utcnow()
-    if ema9 > ema21:
-        place_order(symbol, "open_long", TRADE_AMOUNT)
-        entry_price = closes[-1]
-        tp_price = entry_price * (1 + TP_PERCENT / 100)
-        sl_price = entry_price * (1 - SL_PERCENT / 100)
-        send_telegram(f"🎯 Сигнал на LONG {symbol}\nЦена входа: {entry_price:.4f}\nTP: {tp_price:.4f}\nSL: {sl_price:.4f}")
-        TRADE_AMOUNT += round(TRADE_AMOUNT * 0.015, 2)
-    else:
-        last = last_no_signal.get(symbol, datetime.min)
-        if (now - last).seconds >= 3600:
-            send_telegram(f"ℹ️ По {symbol} сейчас нет сигнала")
-            last_no_signal[symbol] = now
-
-def run_bot():
-    send_telegram("🤖 Бот запущен и работает на Render!")
     while True:
         for symbol in SYMBOLS:
-            check_signal(symbol)
+            candles = get_candles(symbol)
+            send_telegram(f"📊 Пришло свечей для {symbol}: {len(candles)}")
+            if len(candles) < 21:
+                send_telegram(f"❗Недостаточно данных для {symbol}")
+                continue
+            closes = candles[-21:]
+            ema9 = calculate_ema(closes[-9:], 9)[-1]
+            ema21 = calculate_ema(closes, 21)[-1]
+            now = datetime.now()
+            last_time = last_signal_time.get(symbol)
+            time_diff = (now - last_time).total_seconds() / 3600 if last_time else 999
+
+            if ema9 > ema21:
+                if place_order(symbol, "buy", TRADE_AMOUNT):
+                    last_signal_time[symbol] = now
+                    TRADE_AMOUNT *= 1 + (TP_PERCENT / 100)
+            elif ema9 < ema21:
+                if place_order(symbol, "sell", TRADE_AMOUNT):
+                    last_signal_time[symbol] = now
+                    TRADE_AMOUNT *= 1 + (TP_PERCENT / 100)
+            else:
+                if time_diff > 1:
+                    send_telegram(f"ℹ️ По {symbol} сейчас нет сигнала")
+                    last_signal_time[symbol] = now
         time.sleep(CHECK_INTERVAL)
 
-@app.route('/')
-def home():
-    return "Бот работает!"
+def daily_profit_report():
+    send_telegram(f"📈 Ежедневный отчёт: сумма сделки сейчас {round(TRADE_AMOUNT, 2)} USDT")
 
-def start_flask():
-    app.run(host="0.0.0.0", port=10000)
+@app.route("/")
+def home():
+    return "✅ Бот работает!"
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot).start()
-    threading.Thread(target=start_flask).start()
+    send_telegram("🤖 Бот запущен и работает на Render!")
+    threading.Thread(target=monitor).start()
+    schedule.every().day.at("20:47").do(daily_profit_report)
+
+    def schedule_runner():
+        while True:
+            schedule.run_pending()
+            time.sleep(10)
+
+    threading.Thread(target=schedule_runner).start()
+    app.run(host="0.0.0.0", port=10000)
