@@ -56,6 +56,11 @@ def calculate_ema(prices, period):
 
 def check_signal(symbol):
     candles = get_candles(symbol)
+    if not candles:
+        msg = f"⚠️ Не удалось получить свечи по {symbol}"
+        print(msg)
+        send_telegram(msg)
+        return None, None
     if len(candles) < EMA_LONG:
         return None, None
     closes = [c[1] for c in candles]
@@ -102,10 +107,13 @@ def get_price(symbol):
         res = requests.get(url).json()
         return float(res["data"]["last"])
     except:
+        print(f"⚠️ Не удалось получить цену для {symbol}")
+        send_telegram(f"⚠️ Ошибка получения цены {symbol}")
         return None
 
 # === Торговая логика ===
 def trade():
+    print("🔁 trade() запущен...")
     while True:
         for symbol in SYMBOLS:
             signal, price = check_signal(symbol)
@@ -113,7 +121,7 @@ def trade():
                 continue
 
             if symbol not in positions:
-                print(f"{symbol}: signal {signal.upper()} | price: {price}")
+                print(f"{symbol}: сигнал {signal.upper()} | цена: {price}")
                 res = place_order(symbol, signal)
                 if "code" in res:
                     if res["code"] == "00000":
