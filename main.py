@@ -154,10 +154,10 @@ def home():
     return "🤖 Bitget Futures Trading Bot работает!"
 
 # === Запуск ===
-def start_bot():
-    send_telegram("🤖 Бот запущен и готов к торговле!")
-    trade()
+def run_all():
+    threading.Thread(target=trade).start()
+    app.run(host="0.0.0.0", port=8080)
 
 if __name__ == "__main__":
-    threading.Thread(target=app.run, kwargs={"host": "0.0.0.0", "port": 8080}, daemon=True).start()
-    start_bot()
+    send_telegram("🤖 Бот запущен и готов к торговле!")
+    run_all()
