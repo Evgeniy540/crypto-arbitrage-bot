@@ -145,7 +145,6 @@ def trade():
                             del positions[symbol]
                         else:
                             send_telegram(f"❌ Ошибка при закрытии сделки по {symbol}:\n{res}")
-
         time.sleep(60)
 
 # === Flask-сервер ===
@@ -159,7 +158,6 @@ def start_bot():
     send_telegram("🤖 Бот запущен и готов к торговле!")
     trade()
 
-threading.Thread(target=start_bot).start()
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    threading.Thread(target=app.run, kwargs={"host": "0.0.0.0", "port": 8080}, daemon=True).start()
+    start_bot()
