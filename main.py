@@ -1,132 +1,125 @@
-import requests
 import time
 import hmac
-import base64
 import hashlib
+import base64
+import requests
 import json
+from flask import Flask
 import threading
 import logging
-import math
-from flask import Flask
-import datetime
+import numpy as np
+import telegram
 
-# === Настройки ===
-API_KEY = "68855c7628335c0001f5d42e"
-API_SECRET = "0c475ab6-4588-4301-9eb3-77c493b7e621"
-API_PASSPHRASE = "Evgeniy@84"
+# === НАСТРОЙКИ ===
+API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
+API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
+API_PASSPHRASE = "Evgeniy84"
+
+SYMBOLS = ["BTCUSDTUMCBL", "ETHUSDTUMCBL", "SOLUSDTUMCBL"]
+TRADE_AMOUNT = 10
+EMA_FAST = 9
+EMA_SLOW = 21
+CHECK_INTERVAL = 60  # секунд между проверками
+
+# === TELEGRAM ===
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
-TRADE_AMOUNT = 50
-SYMBOLS = ["BTCUSDTM", "ETHUSDTM", "SOLUSDTM", "GALAUSDTM", "TRXUSDTM"]
+bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
+# === FLASK ===
 app = Flask(__name__)
-last_trade_time = {}
+@app.route("/")
+def home():
+    return "✅ Bitget Futures Bot is running"
 
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+def send_telegram(message):
     try:
-        requests.post(url, data=data)
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
     except Exception as e:
-        print(f"Ошибка Telegram: {e}")
+        print("Ошибка Telegram:", e)
 
-def kucoin_request(method, endpoint, payload=None):
-    url = "https://api-futures.kucoin.com" + endpoint
-    now = int(time.time() * 1000)
-    str_to_sign = str(now) + method.upper() + endpoint
-    if payload:
-        body = json.dumps(payload)
-        str_to_sign += body
-    else:
-        body = ""
+def sign_request(timestamp, method, path, body):
+    message = f"{timestamp}{method}{path}{body}"
+    signature = hmac.new(API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
+    return signature
 
-    signature = base64.b64encode(
-        hmac.new(API_SECRET.encode("utf-8"), str_to_sign.encode("utf-8"), hashlib.sha256).digest()
-    )
-    passphrase = base64.b64encode(
-        hmac.new(API_SECRET.encode("utf-8"), API_PASSPHRASE.encode("utf-8"), hashlib.sha256).digest()
-    )
-
-    headers = {
-        "KC-API-KEY": API_KEY,
-        "KC-API-SIGN": signature.decode(),
-        "KC-API-TIMESTAMP": str(now),
-        "KC-API-PASSPHRASE": passphrase.decode(),
-        "KC-API-KEY-VERSION": "2",
+def get_headers(method, path, body=""):
+    timestamp = str(int(time.time() * 1000))
+    signature = sign_request(timestamp, method, path, body)
+    return {
+        "ACCESS-KEY": API_KEY,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": API_PASSPHRASE,
         "Content-Type": "application/json"
     }
 
+def get_candles(symbol):
+    url = f"https://api.bitget.com/api/mix/v1/market/candles?symbol={symbol}&granularity=60&productType=umcbl"
     try:
-        if method.upper() == "GET":
-            response = requests.get(url, headers=headers)
-        elif method.upper() == "POST":
-            response = requests.post(url, headers=headers, data=body)
-        return response.json()
-    except Exception as e:
-        return {"code": "error", "msg": str(e)}
+        response = requests.get(url)
+        data = response.json()
+        closes = [float(c[4]) for c in data['data']][-EMA_SLOW:]
+        return closes
+    except:
+        return []
 
-def get_ema(prices, period):
-    if len(prices) < period:
-        return None
-    k = 2 / (period + 1)
-    ema = prices[0]
-    for price in prices[1:]:
-        ema = price * k + ema * (1 - k)
-    return ema
-
-def fetch_klines(symbol):
-    endpoint = f"/api/v1/kline/query?symbol={symbol}&granularity=5"
-    data = kucoin_request("GET", endpoint)
-    if "data" in data and data["data"]:
-        return [float(candle[2]) for candle in data["data"]][-21:]
-    return []
+def calculate_ema(prices, period):
+    weights = np.exp(np.linspace(-1., 0., period))
+    weights /= weights.sum()
+    a = np.convolve(prices, weights, mode='full')[:len(prices)]
+    a[:period] = a[period]
+    return a
 
 def place_order(symbol, side):
-    endpoint = "/api/v1/orders"
-    price_data = kucoin_request("GET", f"/api/v1/mark-price/{symbol}")
-    if "data" not in price_data:
-        send_telegram_message(f"❌ Не удалось получить цену для {symbol}")
-        return
-    price = float(price_data["data"]["markPrice"])
-    size = round(TRADE_AMOUNT / price, 3)
-    order = {
+    path = "/api/mix/v1/order/placeOrder"
+    url = "https://api.bitget.com" + path
+    body = {
         "symbol": symbol,
+        "marginCoin": "USDT",
         "side": side,
-        "type": "market",
-        "size": size,
-        "leverage": 5
+        "orderType": "market",
+        "size": str(TRADE_AMOUNT),
+        "price": "",  # Market order
+        "tradeSide": "open",
+        "productType": "umcbl"
     }
-    response = kucoin_request("POST", endpoint, order)
-    if response.get("code") == "200000":
-        send_telegram_message(f"✅ Открыт {side.upper()} по {symbol} на {TRADE_AMOUNT} USDT")
-    else:
-        send_telegram_message(f"⚠️ Ошибка при открытии {side.upper()} на {symbol}: {response}")
+    body_json = json.dumps(body)
+    headers = get_headers("POST", path, body_json)
+    try:
+        res = requests.post(url, headers=headers, data=body_json)
+        res_json = res.json()
+        if res_json["code"] == "00000":
+            send_telegram(f"✅ Открыта {side.upper()} по {symbol}")
+        else:
+            send_telegram(f"⚠️ Ошибка при открытии {side.upper()} на {symbol}: {res_json}")
+    except Exception as e:
+        send_telegram(f"❌ Ошибка запроса: {e}")
 
-def strategy_loop():
-    send_telegram_message("🤖 Бот запущен на KuCoin Futures!")
+def strategy():
     while True:
         for symbol in SYMBOLS:
-            if symbol in last_trade_time and time.time() - last_trade_time[symbol] < 3600:
+            closes = get_candles(symbol)
+            if len(closes) < EMA_SLOW:
+                print(f"Недостаточно данных для {symbol}")
                 continue
-            prices = fetch_klines(symbol)
-            if len(prices) < 21:
-                continue
-            ema9 = get_ema(prices[-9:], 9)
-            ema21 = get_ema(prices, 21)
-            if ema9 and ema21:
-                if ema9 > ema21:
-                    place_order(symbol, "buy")
-                    last_trade_time[symbol] = time.time()
-                elif ema9 < ema21:
-                    place_order(symbol, "sell")
-                    last_trade_time[symbol] = time.time()
-        time.sleep(300)
+            ema_fast = calculate_ema(closes, EMA_FAST)[-1]
+            ema_slow = calculate_ema(closes, EMA_SLOW)[-1]
 
-threading.Thread(target=strategy_loop, daemon=True).start()
+            print(f"{symbol}: EMA{EMA_FAST}={ema_fast:.2f}, EMA{EMA_SLOW}={ema_slow:.2f}")
 
-@app.route("/")
-def home():
-    return "KuCoin Futures бот работает!"
+            if ema_fast > ema_slow:
+                place_order(symbol, "buy")   # LONG
+            elif ema_fast < ema_slow:
+                place_order(symbol, "sell")  # SHORT
+
+        time.sleep(CHECK_INTERVAL)
+
+# === ЗАПУСК ===
+def start_bot():
+    send_telegram("🤖 Бот Bitget фьючерсы запущен и готов к торговле!")
+    strategy()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    threading.Thread(target=start_bot).start()
+    app.run(host="0.0.0.0", port=8080)
