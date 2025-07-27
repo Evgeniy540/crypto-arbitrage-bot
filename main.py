@@ -11,6 +11,7 @@ import threading
 BITGET_API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
 BITGET_API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
 BITGET_API_PASSPHRASE = "Evgeniy84"
+
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 TRADE_AMOUNT = 10
@@ -18,55 +19,49 @@ SYMBOLS = ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "SOLUSDT_UMCBL", "XRPUSDT_UMCBL", "
 
 app = Flask(__name__)
 
-def send_telegram_message(text):
+def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+        requests.post(url, data=data)
     except Exception as e:
-        print("Ошибка Telegram:", e)
+        print(f"Ошибка Telegram: {e}")
 
 def get_bitget_candles(symbol):
-    url = f"https://api.bitget.com/api/mix/v1/market/history-candles?symbol={symbol}&granularity=1min&limit=100"
     try:
-        response = requests.get(url)
+        url = f"https://api.bitget.com/api/mix/v1/market/history-candles"
+        params = {
+            "symbol": symbol,
+            "granularity": "1min",
+            "limit": "100"
+        }
+        response = requests.get(url, params=params)
         data = response.json()
-        if "data" in data and isinstance(data["data"], list):
-            candles = data["data"]
-            closes = [float(c[4]) for c in candles][::-1]
-            return closes
+        return data["data"] if "data" in data else None
     except Exception as e:
-        print("Ошибка при получении свечей:", e)
-    return None
-
-def calculate_ema(data, period):
-    if len(data) < period:
+        print(f"Ошибка свечей Bitget: {e}")
         return None
-    ema = sum(data[:period]) / period
-    k = 2 / (period + 1)
-    for price in data[period:]:
-        ema = price * k + ema * (1 - k)
-    return ema
 
-def bitget_signature(timestamp, method, path, body, secret_key):
-    message = f"{timestamp}{method}{path}{body}"
-    return base64.b64encode(hmac.new(secret_key.encode(), message.encode(), hashlib.sha256).digest()).decode()
+def generate_signature(timestamp, method, request_path, body=""):
+    prehash = f"{timestamp}{method}{request_path}{body}"
+    signature = hmac.new(BITGET_API_SECRET.encode(), prehash.encode(), hashlib.sha256).hexdigest()
+    return signature
 
-def place_bitget_order(symbol, side):
+def place_order(symbol, side):
     timestamp = str(int(time.time() * 1000))
-    path = "/api/mix/v1/order/placeOrder"
-    url = "https://api.bitget.com" + path
-    body = {
+    url = "/api/mix/v1/order/placeOrder"
+    method = "POST"
+    body_dict = {
         "symbol": symbol,
         "marginCoin": "USDT",
         "size": str(TRADE_AMOUNT),
         "side": side,
         "orderType": "market",
-        "timeInForceValue": "normal",
-        "tradeSide": "open",
+        "tradeSide": "long" if side == "buy" else "short",
         "productType": "umcbl"
     }
-    body_json = json.dumps(body)
-    sign = bitget_signature(timestamp, "POST", path, body_json, BITGET_API_SECRET)
+    body = json.dumps(body_dict)
+    sign = generate_signature(timestamp, method, url, body)
     headers = {
         "ACCESS-KEY": BITGET_API_KEY,
         "ACCESS-SIGN": sign,
@@ -74,44 +69,60 @@ def place_bitget_order(symbol, side):
         "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
         "Content-Type": "application/json"
     }
+    full_url = "https://api.bitget.com" + url
+    response = requests.post(full_url, headers=headers, data=body)
     try:
-        response = requests.post(url, headers=headers, data=body_json)
-        res_data = response.json()
-        return res_data
-    except Exception as e:
-        print("Ошибка при размещении ордера:", e)
+        result = response.json()
+        send_telegram_message(f"✅ Ордер {side.upper()} {symbol}: {result}")
+    except:
+        send_telegram_message(f"⚠️ Ошибка ордера {side.upper()} {symbol}: {response.text}")
+
+def ema(values, period):
+    weights = []
+    alpha = 2 / (period + 1)
+    for i in range(len(values)):
+        weights.append((1 - alpha) ** i)
+    weights = list(reversed(weights[-period:]))
+    if len(values) < period:
         return None
+    weighted_values = [v * w for v, w in zip(values[-period:], weights)]
+    return sum(weighted_values) / sum(weights)
 
-def check_and_trade():
-    while True:
-        for symbol in SYMBOLS:
-            closes = get_bitget_candles(symbol)
-            if not closes:
-                send_telegram_message(f"⚠️ Не удалось получить свечи по {symbol}.")
-                continue
-            ema9 = calculate_ema(closes, 9)
-            ema21 = calculate_ema(closes, 21)
-            if not ema9 or not ema21:
-                continue
-            if ema9 > ema21:
-                side = "buy"
-                result = place_bitget_order(symbol, side)
-                send_telegram_message(f"✅ LONG: {symbol} по стратегии EMA\\nОтвет: {result}")
-            elif ema9 < ema21:
-                side = "sell"
-                result = place_bitget_order(symbol, side)
-                send_telegram_message(f"🔻 SHORT: {symbol} по стратегии EMA\\nОтвет: {result}")
-            time.sleep(2)
-        time.sleep(60)
+def check_signal(symbol):
+    candles = get_bitget_candles(symbol)
+    if not candles:
+        send_telegram_message(f"⚠️ Не удалось получить свечи по {symbol}.")
+        return
 
-@app.route("/")
-def home():
-    return "🤖 Crypto bot is running on Render!"
+    try:
+        close_prices = [float(c[4]) for c in candles[::-1]]
+        ema9 = ema(close_prices, 9)
+        ema21 = ema(close_prices, 21)
+
+        if ema9 is None or ema21 is None:
+            return
+
+        if ema9 > ema21:
+            place_order(symbol, "buy")
+        elif ema9 < ema21:
+            place_order(symbol, "sell")
+    except Exception as e:
+        send_telegram_message(f"⚠️ Ошибка анализа {symbol}: {e}")
 
 def start_bot():
     send_telegram_message("🤖 Бот успешно запущен на Render!")
-    check_and_trade()
+    while True:
+        for symbol in SYMBOLS:
+            check_signal(symbol)
+            time.sleep(5)
+        time.sleep(30)
 
-if __name__ == "__main__":
-    threading.Thread(target=start_bot).start()
+@app.route('/')
+def index():
+    return "🚀 Crypto bot is running on Render!"
+
+if __name__ == '__main__':
+    t = threading.Thread(target=start_bot)
+    t.daemon = True
+    t.start()
     app.run(host="0.0.0.0", port=10000)
