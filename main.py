@@ -1,83 +1,71 @@
+import requests
 import time
 import hmac
 import hashlib
 import base64
-import requests
 import json
+from datetime import datetime
 from flask import Flask
 import threading
-import logging
-import datetime
-import statistics
 
-# === Bitget API Ключи ===
+# === КЛЮЧИ ===
 BITGET_API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
 BITGET_API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
 BITGET_API_PASSPHRASE = "Evgeniy84"
-
-# === Telegram ===
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 
-# === Настройки ===
-TRADE_AMOUNT = 10  # USDT
+TRADE_AMOUNT = 10
 SYMBOLS = ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "SOLUSDT_UMCBL", "XRPUSDT_UMCBL", "TRXUSDT_UMCBL"]
-BASE_URL = "https://api.bitget.com"
-COOLDOWN = 60 * 60 * 3  # 3 часа
-last_trade_time = {}
 
-# === Telegram уведомление ===
-def send_telegram_message(message):
+app = Flask(__name__)
+
+def send_telegram_message(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        requests.post(url, data=payload)
+        requests.post(url, data=data)
     except Exception as e:
-        print("Ошибка Telegram:", e)
+        print("Ошибка отправки сообщения в Telegram:", e)
 
-# === Подпись Bitget запроса ===
-def sign_request(timestamp, method, path, body=""):
-    msg = f"{timestamp}{method}{path}{body}"
-    mac = hmac.new(BITGET_API_SECRET.encode(), msg.encode(), hashlib.sha256)
-    return mac.hexdigest()
+def get_timestamp():
+    return str(int(time.time() * 1000))
 
-# === Получение свечей ===
+def sign_request(timestamp, method, endpoint, params):
+    query = f"{timestamp}{method}{endpoint}{params}"
+    signature = hmac.new(BITGET_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    return signature
+
 def get_candles(symbol):
     try:
-        url = f"{BASE_URL}/api/mix/v1/market/history-candles?symbol={symbol}&granularity=1min&limit=100"
-        resp = requests.get(url)
-        data = resp.json()
-        if "data" in data and data["data"]:
-            candles = data["data"]
-            return list(reversed(candles))
+        url = f"https://api.bitget.com/api/mix/v1/market/history-candles"
+        params = f"symbol={symbol}&granularity=1min&limit=100"
+        response = requests.get(f"{url}?{params}")
+        data = response.json()
+        if "data" in data and isinstance(data["data"], list):
+            return list(reversed(data["data"]))
         else:
             return None
-    except Exception as e:
-        print(f"Ошибка получения свечей для {symbol}:", e)
+    except:
         return None
 
-# === EMA Расчёт ===
-def calculate_ema(prices, period):
-    return statistics.mean(prices[-period:])
-
-# === Размещение ордера ===
 def place_order(symbol, side):
-    timestamp = str(int(time.time() * 1000))
-    path = "/api/mix/v1/order/placeOrder"
-    url = BASE_URL + path
-    client_oid = f"bot_{timestamp}"
-    direction = "open_long" if side == "buy" else "open_short"
+    timestamp = get_timestamp()
+    endpoint = "/api/mix/v1/order/placeOrder"
+    method = "POST"
+    margin_coin = "USDT"
+    size = str(TRADE_AMOUNT)
     body = {
-        "symbol": symbol,
-        "marginCoin": "USDT",
-        "size": str(TRADE_AMOUNT),
-        "side": "open",
+        "symbol": symbol.replace("_UMCBL", ""),
+        "marginCoin": margin_coin,
+        "size": size,
+        "side": side,
         "orderType": "market",
-        "tradeSide": direction,
-        "clientOid": client_oid
+        "tradeSide": "open",
+        "productType": "umcbl"
     }
-    body_json = json.dumps(body)
-    sign = sign_request(timestamp, "POST", path, body_json)
+    body_json = json.dumps(body, separators=(",", ":"))
+    sign = sign_request(timestamp, method, endpoint, body_json)
     headers = {
         "ACCESS-KEY": BITGET_API_KEY,
         "ACCESS-SIGN": sign,
@@ -85,51 +73,38 @@ def place_order(symbol, side):
         "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
         "Content-Type": "application/json"
     }
+    url = f"https://api.bitget.com{endpoint}"
     response = requests.post(url, headers=headers, data=body_json)
     return response.json()
 
-# === Торговая логика ===
-def trade():
+def strategy_loop():
+    send_telegram_message("🤖 Бот запущен и работает на Render!")
     while True:
         for symbol in SYMBOLS:
-            now = time.time()
-            if symbol in last_trade_time and now - last_trade_time[symbol] < COOLDOWN:
-                continue
-
             candles = get_candles(symbol)
             if not candles:
                 send_telegram_message(f"⚠️ Не удалось получить свечи по {symbol}")
                 continue
 
-            try:
-                closes = [float(c[4]) for c in candles]
-                ema9 = calculate_ema(closes, 9)
-                ema21 = calculate_ema(closes, 21)
+            closes = [float(c[4]) for c in candles]
+            ema9 = sum(closes[-9:]) / 9
+            ema21 = sum(closes[-21:]) / 21
 
-                if ema9 > ema21:
-                    response = place_order(symbol, "buy")
-                    send_telegram_message(f"🟢 BUY {symbol}
+            if ema9 > ema21:
+                response = place_order(symbol, "buy")
+                send_telegram_message(f"🟢 КУПИТЬ {symbol}
 Ответ: {response}")
-                    last_trade_time[symbol] = now
-                elif ema9 < ema21:
-                    response = place_order(symbol, "sell")
-                    send_telegram_message(f"🔴 SELL {symbol}
+            elif ema9 < ema21:
+                response = place_order(symbol, "sell")
+                send_telegram_message(f"🔴 ПРОДАТЬ {symbol}
 Ответ: {response}")
-                    last_trade_time[symbol] = now
-            except Exception as e:
-                send_telegram_message(f"❌ Ошибка анализа или размещения ордера по {symbol}: {e}")
 
         time.sleep(60)
 
-# === Flask для Render ===
-app = Flask(__name__)
-
-@app.route('/')
+@app.route("/")
 def home():
-    return "🤖 Бот успешно запущен на Render!"
+    return "Bot is running!"
 
-# === Запуск ===
-if __name__ == '__main__':
-    send_telegram_message("🤖 Бот успешно запущен на Render!")
-    threading.Thread(target=trade, daemon=True).start()
-    app.run(host='0.0.0.0', port=10000)
+if __name__ == "__main__":
+    threading.Thread(target=strategy_loop).start()
+    app.run(host="0.0.0.0", port=10000)
