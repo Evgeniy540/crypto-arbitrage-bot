@@ -14,7 +14,7 @@ BITGET_API_PASSPHRASE = "Evgeniy84"
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 TRADE_AMOUNT = 10
-SYMBOLS = ["btcusdt_UMCBL", "ethusdt_UMCBL", "solusdt_UMCBL", "xrpusdt_UMCBL", "trxusdt_UMCBL"]
+SYMBOLS = ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "SOLUSDT_UMCBL", "XRPUSDT_UMCBL", "TRXUSDT_UMCBL"]
 TP_PERCENT = 0.015
 SL_PERCENT = 0.01
 EMA_SHORT = 9
@@ -39,7 +39,7 @@ def sign_request(timestamp, method, path, body=""):
 
 # === Получение свечей ===
 def get_candles(symbol):
-    url = f"https://api.bitget.com/api/mix/v1/market/candles?symbol={symbol}&granularity=60"
+    url = f"https://api.bitget.com/api/mix/v1/market/candles?symbol={symbol.upper()}&granularity=60"
     try:
         res = requests.get(url).json()
         return [[float(x[1]), float(x[4])] for x in res.get("data", [])][-EMA_LONG:]
@@ -102,7 +102,7 @@ def place_order(symbol, side):
 
 # === Получение последней цены ===
 def get_price(symbol):
-    url = f"https://api.bitget.com/api/mix/v1/market/ticker?symbol={symbol}"
+    url = f"https://api.bitget.com/api/mix/v1/market/ticker?symbol={symbol.upper()}"
     try:
         res = requests.get(url).json()
         return float(res["data"]["last"])
