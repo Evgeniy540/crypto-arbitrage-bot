@@ -1,28 +1,32 @@
-import requests
-import time
+ import time
 import hmac
 import hashlib
+import base64
 import json
-import schedule
-from datetime import datetime
-from flask import Flask
+import requests
 import threading
+from flask import Flask
+import datetime
+import schedule
 
-# === КЛЮЧИ И НАСТРОЙКИ ===
-BITGET_API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
-BITGET_API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
-BITGET_API_PASSPHRASE = "Evgeniy84"
+# === НАСТРОЙКИ ===
+API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
+API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
+API_PASSPHRASE = "Evgeniy84"
+
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
-SYMBOLS = ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "SOLUSDT_UMCBL", "XRPUSDT_UMCBL", "TRXUSDT_UMCBL"]
-TRADE_AMOUNT = 10.0  # начальная сумма сделки
-TP_PERCENT = 1.5
-SL_PERCENT = 1.0
-last_signal_time = {}
-last_profit = 0
-no_signal_log_time = {}
 
-# === ФУНКЦИИ ===
+TRADE_AMOUNT = 10.0
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]
+TP_PERCENT = 0.015
+SL_PERCENT = 0.01
+
+checked_pairs = {}
+last_signal_time = {}
+
+app = Flask(__name__)
+
 def send_telegram(text):
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -30,120 +34,160 @@ def send_telegram(text):
     except:
         pass
 
-def get_server_time():
-    try:
-        res = requests.get("https://api.bitget.com/api/mix/v1/market/time")
-        return int(res.json()["data"])
-    except:
-        return int(time.time() * 1000)
+def get_timestamp():
+    return str(int(time.time() * 1000))
 
-def get_candles(symbol):
-    url = f"https://api.bitget.com/api/mix/v1/market/history-candles"
-    params = {
-        "symbol": symbol.replace("_UMCBL", ""),
-        "granularity": "60",
-        "limit": "100",
-        "productType": "umcbl"
-    }
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res = requests.get(url, params=params, headers=headers)
-        data = res.json()
-        if 'data' in data and isinstance(data['data'], list):
-            return [list(map(float, candle)) for candle in data['data']]
-        else:
-            return []
-    except:
-        return []
+def sign_request(timestamp, method, request_path, body=""):
+    body_str = json.dumps(body) if body else ""
+    message = f"{timestamp}{method}{request_path}{body_str}"
+    signature = hmac.new(API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
+    return signature
 
-def calculate_ema(prices, period):
-    multiplier = 2 / (period + 1)
-    ema = prices[0]
-    for price in prices[1:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
-
-def place_order(symbol, side):
-    global TRADE_AMOUNT
-    timestamp = str(get_server_time())
-    body = {
-        "symbol": symbol,
-        "marginCoin": "USDT",
-        "size": str(TRADE_AMOUNT),
-        "side": side,
-        "orderType": "market",
-        "productType": "umcbl"
-    }
-    body_json = json.dumps(body)
-    message = timestamp + "POST" + "/api/mix/v1/order/placeOrder" + body_json
-    signature = hmac.new(BITGET_API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
-    headers = {
-        "ACCESS-KEY": BITGET_API_KEY,
-        "ACCESS-SIGN": signature,
+def get_headers(timestamp, method, path, body=""):
+    return {
+        "ACCESS-KEY": API_KEY,
+        "ACCESS-SIGN": sign_request(timestamp, method, path, body),
         "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
+        "ACCESS-PASSPHRASE": API_PASSPHRASE,
         "Content-Type": "application/json"
     }
-    res = requests.post("https://api.bitget.com/api/mix/v1/order/placeOrder", headers=headers, data=body_json)
-    send_telegram(f"📈 Открыта позиция {side} по {symbol} на {TRADE_AMOUNT} USDT\n\nОтвет: {res.text}")
 
-def check_signal(symbol):
-    global last_signal_time, last_profit, TRADE_AMOUNT
-    candles = get_candles(symbol)
-    if len(candles) < 21:
-        send_telegram(f"❗ Недостаточно данных для {symbol} ({len(candles)} свечей)")
-        return
+def get_klines(symbol):
+    url = f"https://api.bitget.com/api/spot/v1/market/candles?symbol={symbol}&period=1m&limit=100"
+    try:
+        response = requests.get(url)
+        data = response.json()
+        if "data" in data:
+            return [float(c[4]) for c in data["data"]][::-1]
+    except:
+        return None
+    return None
 
-    closes = [c[4] for c in candles][-100:]
-    ema9 = calculate_ema(closes[-9:], 9)
-    ema21 = calculate_ema(closes[-21:], 21)
+def calculate_ema(data, period):
+    if len(data) < period:
+        return None
+    ema = sum(data[:period]) / period
+    k = 2 / (period + 1)
+    for price in data[period:]:
+        ema = price * k + ema * (1 - k)
+    return ema
 
-    now = time.time()
-    if symbol in last_signal_time and now - last_signal_time[symbol] < 3600:
-        return  # Cooldown 1 час
+def get_balance(symbol):
+    timestamp = get_timestamp()
+    path = "/api/spot/v1/account/assets"
+    headers = get_headers(timestamp, "GET", path)
+    try:
+        r = requests.get("https://api.bitget.com" + path, headers=headers)
+        assets = r.json().get("data", [])
+        for asset in assets:
+            if asset["coin"].upper() == symbol:
+                return float(asset["available"])
+    except:
+        return 0.0
+    return 0.0
 
-    if ema9 > ema21:
-        place_order(symbol, "open_long")
-        last_signal_time[symbol] = now
-        entry_price = closes[-1]
-        tp_price = entry_price * (1 + TP_PERCENT / 100)
-        sl_price = entry_price * (1 - SL_PERCENT / 100)
-        send_telegram(f"🎯 EMA сигнал для {symbol}\nЦена входа: {entry_price:.4f}\nTP: {tp_price:.4f} (+{TP_PERCENT}%)\nSL: {sl_price:.4f} (-{SL_PERCENT}%)")
-        TRADE_AMOUNT = round(TRADE_AMOUNT * 1.015, 2)
-        last_profit += TRADE_AMOUNT * 0.015
-    else:
-        last_hour = no_signal_log_time.get(symbol, 0)
-        if now - last_hour > 3600:
-            send_telegram(f"ℹ️ По {symbol} сейчас нет сигнала")
-            no_signal_log_time[symbol] = now
+def place_order(symbol, side, size):
+    timestamp = get_timestamp()
+    path = "/api/spot/v1/trade/orders"
+    price = get_klines(symbol)[-1]
+    body = {
+        "symbol": symbol,
+        "side": side.lower(),
+        "orderType": "market",
+        "force": "gtc",
+        "size": str(size)
+    }
+    headers = get_headers(timestamp, "POST", path, body)
+    try:
+        response = requests.post("https://api.bitget.com" + path, headers=headers, json=body)
+        send_telegram(f"🟢 Открыта сделка {side.upper()} по {symbol} на {size} USDT")
+        return response.json()
+    except Exception as e:
+        send_telegram(f"Ошибка при открытии ордера: {e}")
+        return None
 
-def run_strategy():
+def trade_loop():
+    global TRADE_AMOUNT
     for symbol in SYMBOLS:
-        check_signal(symbol)
+        usdt_balance = get_balance("USDT")
+        if usdt_balance < TRADE_AMOUNT:
+            send_telegram(f"Недостаточно USDT для торговли по {symbol}")
+            continue
 
-def send_daily_report():
-    global last_profit
-    send_telegram(f"📊 Ежедневный отчёт:\nСумма сделки: {TRADE_AMOUNT} USDT\nПрибыль: {last_profit:.2f} USDT")
+        klines = get_klines(symbol)
+        if not klines or len(klines) < 21:
+            continue
 
-# === FLASK СЕРВЕР ===
-app = Flask(__name__)
+        ema9 = calculate_ema(klines, 9)
+        ema21 = calculate_ema(klines, 21)
+        price = klines[-1]
 
-@app.route('/')
-def home():
-    return '✅ Бот запущен и работает на Render!'
+        if ema9 is None or ema21 is None:
+            continue
 
-def start_flask():
-    app.run(host='0.0.0.0', port=10000)
+        # Проверка на уже открытые сделки
+        if checked_pairs.get(symbol, False):
+            continue
 
-# === ЗАПУСК ===
-def main():
-    send_telegram("🤖 Бот успешно запущен на Render!")
-    schedule.every(30).seconds.do(run_strategy)
-    schedule.every().day.at("20:47").do(send_daily_report)
-    threading.Thread(target=start_flask).start()
+        if ema9 > ema21:
+            checked_pairs[symbol] = True
+            order = place_order(symbol, "buy", TRADE_AMOUNT / price)
+
+            target_price = price * (1 + TP_PERCENT)
+            stop_price = price * (1 - SL_PERCENT)
+
+            while True:
+                time.sleep(30)
+                klines_new = get_klines(symbol)
+                if not klines_new:
+                    continue
+                current_price = klines_new[-1]
+                if current_price >= target_price:
+                    balance = get_balance(symbol.replace("USDT", ""))
+                    place_order(symbol, "sell", balance)
+                    TRADE_AMOUNT *= 1 + TP_PERCENT
+                    send_telegram(f"✅ TP достигнут по {symbol}, новая сумма сделки: {round(TRADE_AMOUNT, 2)} USDT")
+                    checked_pairs[symbol] = False
+                    break
+                elif current_price <= stop_price:
+                    balance = get_balance(symbol.replace("USDT", ""))
+                    place_order(symbol, "sell", balance)
+                    TRADE_AMOUNT *= 1 - SL_PERCENT
+                    send_telegram(f"❌ SL сработал по {symbol}, новая сумма сделки: {round(TRADE_AMOUNT, 2)} USDT")
+                    checked_pairs[symbol] = False
+                    break
+        else:
+            now = time.time()
+            if symbol not in last_signal_time or now - last_signal_time[symbol] > 3600:
+                send_telegram(f"По {symbol} сейчас нет сигнала")
+                last_signal_time[symbol] = now
+
+def start_bot():
+    while True:
+        try:
+            trade_loop()
+            time.sleep(30)
+        except Exception as e:
+            send_telegram(f"Ошибка в боте: {e}")
+            time.sleep(60)
+
+def send_daily_summary():
+    msg = f"📊 Сводка {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}:\n"
+    msg += f"Текущая сумма сделки: {round(TRADE_AMOUNT, 2)} USDT"
+    send_telegram(msg)
+
+schedule.every().day.at("20:47").do(send_daily_summary)
+
+def scheduler():
     while True:
         schedule.run_pending()
-        time.sleep(1)
+        time.sleep(10)
+
+@app.route("/")
+def home():
+    return "Spot EMA Trading Bot is running!"
 
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=start_bot).start()
+    threading.Thread(target=scheduler).start()
+    app.run(host="0.0.0.0", port=8080)
