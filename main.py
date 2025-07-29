@@ -1,14 +1,15 @@
+# === main.py ===
 import time
 import hmac
 import hashlib
 import base64
 import requests
 import json
-import os
 from datetime import datetime
 from flask import Flask
 import threading
 import numpy as np
+import os
 
 # === Bitget API keys ===
 API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
@@ -22,6 +23,11 @@ TELEGRAM_CHAT_ID = "5723086631"
 # === Настройки торговли ===
 TRADE_AMOUNT = 5
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT", "PEPEUSDT", "BGBUSDT"]
+POSITION_FILE = "position.json"
+POSITION = None
+ENTRY_PRICE = None
+IN_POSITION_SYMBOL = None
+LAST_NO_SIGNAL_TIME = 0
 HEADERS = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
 
 # === Flask для Render ===
@@ -31,22 +37,10 @@ app = Flask(__name__)
 def home():
     return '✅ Crypto Bot is running!'
 
-# === Глобальные переменные ===
-POSITION = None
-ENTRY_PRICE = None
-IN_POSITION_SYMBOL = None
-LAST_NO_SIGNAL_TIME = 0
-LAST_POSITION_ALERT = 0
-TOTAL_PROFIT = 0
-TRADES_COUNT = 0
-POSITION_FILE = "position.json"
-
-# === Telegram ===
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
 
-# === Подпись запроса Bitget ===
 def sign_request(timestamp, method, request_path, body=""):
     message = str(timestamp) + method + request_path + body
     signature = hmac.new(API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
@@ -63,7 +57,6 @@ def get_headers(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-# === Баланс USDT ===
 def get_balance():
     url = "https://api.bitget.com/api/spot/v1/account/assets"
     headers = get_headers("GET", "/api/spot/v1/account/assets")
@@ -73,7 +66,6 @@ def get_balance():
             return float(asset["available"])
     return 0
 
-# === Свечи ===
 def get_candles(symbol):
     url = f"https://api.bitget.com/api/spot/v1/market/candles?symbol={symbol}&granularity=60"
     try:
@@ -87,7 +79,6 @@ def get_candles(symbol):
 def calculate_ema(prices, period):
     return np.convolve(prices, np.ones(period)/period, mode='valid')
 
-# === Ордер ===
 def place_order(symbol, side, size):
     url = "https://api.bitget.com/api/spot/v1/trade/orders"
     body = {
@@ -102,59 +93,47 @@ def place_order(symbol, side, size):
     response = requests.post(url, headers=headers, data=body_json).json()
     return response
 
-# === Сохранение позиции ===
-def save_position():
-    global POSITION, ENTRY_PRICE, IN_POSITION_SYMBOL
+def save_position(symbol, qty, price):
     with open(POSITION_FILE, "w") as f:
         json.dump({
-            "symbol": IN_POSITION_SYMBOL,
-            "entry": ENTRY_PRICE,
-            "qty": POSITION
+            "symbol": symbol,
+            "qty": qty,
+            "price": price
         }, f)
 
 def load_position():
     global POSITION, ENTRY_PRICE, IN_POSITION_SYMBOL
     if os.path.exists(POSITION_FILE):
         with open(POSITION_FILE, "r") as f:
-            pos = json.load(f)
-            IN_POSITION_SYMBOL = pos["symbol"]
-            ENTRY_PRICE = pos["entry"]
-            POSITION = pos["qty"]
+            data = json.load(f)
+            POSITION = data.get("qty")
+            ENTRY_PRICE = data.get("price")
+            IN_POSITION_SYMBOL = data.get("symbol")
 
-# === Основная логика ===
+def clear_position():
+    global POSITION, ENTRY_PRICE, IN_POSITION_SYMBOL
+    POSITION = None
+    ENTRY_PRICE = None
+    IN_POSITION_SYMBOL = None
+    if os.path.exists(POSITION_FILE):
+        os.remove(POSITION_FILE)
+
 def check_signal():
-    global POSITION, ENTRY_PRICE, IN_POSITION_SYMBOL, LAST_NO_SIGNAL_TIME
-    global LAST_POSITION_ALERT, TOTAL_PROFIT, TRADES_COUNT, TRADE_AMOUNT
-
+    global POSITION, ENTRY_PRICE, IN_POSITION_SYMBOL, TRADE_AMOUNT, LAST_NO_SIGNAL_TIME
     if POSITION:
         url = f"https://api.bitget.com/api/spot/v1/market/ticker?symbol={IN_POSITION_SYMBOL}"
         data = requests.get(url).json().get("data", {})
         last_price = float(data.get("last", 0))
         if last_price >= ENTRY_PRICE * 1.015:
-            sell_resp = place_order(IN_POSITION_SYMBOL, "sell", POSITION)
-            order_id = sell_resp.get("data", {}).get("orderId")
+            place_order(IN_POSITION_SYMBOL, "sell", POSITION)
+            send_telegram(f"✅ TP: {IN_POSITION_SYMBOL} продано по {last_price:.4f}")
             profit = (last_price - ENTRY_PRICE) * POSITION
             TRADE_AMOUNT += profit
-            TOTAL_PROFIT += profit
-            TRADES_COUNT += 1
-            send_telegram(f"✅ TP: {IN_POSITION_SYMBOL} продано по {last_price:.4f}
-💰 +{profit:.4f} USDT
-🆔 Ордер: {order_id}
-📊 Сделок: {TRADES_COUNT}, Всего: {TOTAL_PROFIT:.4f} USDT")
-            POSITION = None
-            IN_POSITION_SYMBOL = None
-            os.remove(POSITION_FILE)
+            clear_position()
         elif last_price <= ENTRY_PRICE * 0.99:
-            sell_resp = place_order(IN_POSITION_SYMBOL, "sell", POSITION)
-            order_id = sell_resp.get("data", {}).get("orderId")
-            send_telegram(f"🛑 SL: {IN_POSITION_SYMBOL} продано по {last_price:.4f}
-🆔 Ордер: {order_id}")
-            POSITION = None
-            IN_POSITION_SYMBOL = None
-            os.remove(POSITION_FILE)
-        elif time.time() - LAST_POSITION_ALERT > 1800:
-            send_telegram(f"📍 В позиции: {IN_POSITION_SYMBOL} @ {ENTRY_PRICE:.4f}, объём: {POSITION}")
-            LAST_POSITION_ALERT = time.time()
+            place_order(IN_POSITION_SYMBOL, "sell", POSITION)
+            send_telegram(f"🛑 SL: {IN_POSITION_SYMBOL} продано по {last_price:.4f}")
+            clear_position()
         return
 
     for symbol in SYMBOLS:
@@ -177,10 +156,8 @@ def check_signal():
                 POSITION = qty
                 ENTRY_PRICE = price
                 IN_POSITION_SYMBOL = symbol
-                order_id = resp.get("data", {}).get("orderId")
-                save_position()
-                send_telegram(f"📈 Покупка {symbol} по {price:.4f} на {TRADE_AMOUNT} USDT
-🆔 Ордер: {order_id}")
+                save_position(symbol, qty, price)
+                send_telegram(f"📈 Покупка {symbol} по цене {price:.4f} на сумму {TRADE_AMOUNT} USDT")
             else:
                 send_telegram(f"❌ Ошибка покупки {symbol}: {resp}")
             return
@@ -202,4 +179,4 @@ def run_bot():
 # === Запуск ===
 if __name__ == '__main__':
     threading.Thread(target=run_bot).start()
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=10000)
