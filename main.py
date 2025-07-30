@@ -100,7 +100,7 @@ def clear_position():
     if os.path.exists(POSITION_FILE):
         os.remove(POSITION_FILE)
 
-def save_profit(amount, symbol):
+def save_profit(amount):
     profit_data = {"total_profit": 0, "deals": 0}
     if os.path.exists(PROFIT_FILE):
         with open(PROFIT_FILE, "r") as f:
@@ -114,9 +114,7 @@ def send_profit_report():
     if os.path.exists(PROFIT_FILE):
         with open(PROFIT_FILE, "r") as f:
             d = json.load(f)
-            profit = d.get("total_profit", 0)
-            deals = d.get("deals", 0)
-            send_telegram(f"📊 Сделок: {deals}\n💰 Прибыль: {profit:.4f} USDT")
+            send_telegram(f"📊 Сделок: {d.get('deals', 0)}\n💰 Прибыль: {d.get('total_profit', 0):.4f} USDT")
     else:
         send_telegram("Нет данных о прибыли.")
 
@@ -128,8 +126,8 @@ def check_signal():
         if last_price >= ENTRY_PRICE * 1.015:
             place_order(IN_POSITION_SYMBOL, "sell", POSITION)
             profit = (last_price - ENTRY_PRICE) * POSITION
-            send_telegram(f"✅ TP: {IN_POSITION_SYMBOL} {last_price:.4f} | Прибыль: {profit:.4f}")
-            save_profit(profit, IN_POSITION_SYMBOL)
+            send_telegram(f"✅ TP: {IN_POSITION_SYMBOL} {last_price:.4f} | Прибыль: {profit:.4f} USDT")
+            save_profit(profit)
             clear_position()
         elif last_price <= ENTRY_PRICE * 0.99:
             place_order(IN_POSITION_SYMBOL, "sell", POSITION)
@@ -176,4 +174,3 @@ def run_bot():
 
 if __name__ == '__main__':
     threading.Thread(target=run_bot).start()
-    app.run(host="0.0.0.0", port=8080)
