@@ -1,4 +1,4 @@
 flask
-schedule
+schedule==1.2.0
 requests
 python-telegram-bot
