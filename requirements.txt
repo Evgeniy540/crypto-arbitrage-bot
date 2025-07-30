@@ -1,4 +1,4 @@
-requests
 flask
+schedule
+requests
 python-telegram-bot
-numpy
