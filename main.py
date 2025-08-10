@@ -28,7 +28,7 @@ MAX_HOLD_MINUTES    = 30
 
 # ----- Anti-spam / throttling -----
 GLOBAL_BUY_COOLDOWN_SEC = 25     # между любыми покупками
-BALANCE_THROTTLE_SEC    = 15     # не дёргать баланс слишком часто
+BALANCE_THROTTLE_SEC    = 15     # кэшировать баланс
 _last_global_buy_ts     = 0
 _last_balance_ts        = 0
 _last_balance_cached    = 0.0
@@ -526,7 +526,7 @@ def pnl_view():
     data = load_json(PNL_FILE, {"trades":[], "total_pct":0.0})
     return jsonify(data)
 
-# webhook-заглушка чтобы не было 404
+# webhook-заглушка чтобы не было 404 в логах
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
     try:
