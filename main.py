@@ -1,4 +1,4 @@
-# === main.py v2.9 (Bitget SPOT V2, EMA 9/21, LONG/SHORT, TP 0.5% / SL 0.4%, exit notifier + rich logs) ===
+# === main.py v2.10 (Bitget SPOT V2, EMA 9/21, LONG/SHORT, TP 0.5% / SL 0.4%, precise TP/SL + logs) ===
 import os, time, threading, logging, requests, json
 from datetime import datetime, timezone
 from flask import Flask
@@ -52,7 +52,44 @@ TICKER_V1  = "https://api.bitget.com/api/spot/v1/market/ticker"   # запасн
 
 # ====== LOGGING ======
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("signals-v2.9")
+log = logging.getLogger("signals-v2.10")
+
+# ----------------- helpers -----------------
+def pct(x): return f"{x*100:.2f}%"
+
+def fmt_price(x: float) -> str:
+    # Больше знаков для дешёвых монет
+    if x >= 1:
+        return f"{x:.6f}"
+    elif x >= 0.01:
+        return f"{x:.8f}"
+    else:
+        return f"{x:.10f}"
+
+def _should_log_symbol(sym: str) -> bool:
+    now = time.time()
+    last = _last_tp_sl_log_ts.get(sym, 0)
+    if now - last >= LOG_TPSL_EVERY_SEC:
+        _last_tp_sl_log_ts[sym] = now
+        return True
+    return False
+
+def _progress_to_tp(side: str, entry: float, price: float, tp: float) -> float:
+    """Сколько % пути к TP пройдено (может быть отрицательным)."""
+    if side == "LONG":
+        span = tp - entry
+        return 0.0 if span == 0 else (price - entry) / span * 100.0
+    else:  # SHORT
+        span = entry - tp
+        return 0.0 if span == 0 else (entry - price) / span * 100.0
+
+def price_levels(price, direction):
+    # ВАЖНО: не округляем TP/SL в расчётах!
+    if direction=="long":
+        tp = price*(1+TP_PCT); sl = price*(1-SL_PCT)
+    else:
+        tp = price*(1-TP_PCT); sl = price*(1+SL_PCT)
+    return float(tp), float(sl)
 
 # ----------------- indicators -----------------
 def ema(values, period):
@@ -126,33 +163,6 @@ def get_last_price(symbol: str) -> float:
         raise RuntimeError(f"No last price for {symbol}")
     return float(last)
 
-# ----------------- helpers -----------------
-def pct(x): return f"{x*100:.2f}%"
-
-def _should_log_symbol(sym: str) -> bool:
-    now = time.time()
-    last = _last_tp_sl_log_ts.get(sym, 0)
-    if now - last >= LOG_TPSL_EVERY_SEC:
-        _last_tp_sl_log_ts[sym] = now
-        return True
-    return False
-
-def _progress_to_tp(side: str, entry: float, price: float, tp: float) -> float:
-    """Сколько % пути к TP пройдено (может быть отрицательным)."""
-    if side == "LONG":
-        span = tp - entry
-        return 0.0 if span == 0 else (price - entry) / span * 100.0
-    else:  # SHORT
-        span = entry - tp
-        return 0.0 if span == 0 else (entry - price) / span * 100.0
-
-def price_levels(price, direction):
-    if direction=="long":
-        tp = price*(1+TP_PCT); sl = price*(1-SL_PCT)
-    else:
-        tp = price*(1-TP_PCT); sl = price*(1+SL_PCT)
-    return round(tp,6), round(sl,6)
-
 # ----------------- хранение открытых сигналов (для выхода по TP/SL) -----------------
 def load_positions() -> dict:
     if not os.path.exists(POSITIONS_FILE):
@@ -180,13 +190,13 @@ def register_signal(symbol: str, side: str, entry: float, tp: float, sl: float, 
         "symbol": symbol,
         "side": side,
         "entry": float(entry),
-        "tp": float(tp),
-        "sl": float(sl),
+        "tp": float(tp),       # сохраняем точные float
+        "sl": float(sl),       # сохраняем точные float
         "opened_at": datetime.utcnow().isoformat(timespec="seconds"),
         "source": source
     }
     save_positions(pos)
-    log.info(f"[OPEN] {symbol} {side} | entry={entry} tp={tp} sl={sl} | src={source}")
+    log.info(f"[OPEN] {symbol} {side} | entry={fmt_price(entry)} tp={fmt_price(tp)} sl={fmt_price(sl)} | src={source}")
 
 def _pnl_pct(side: str, entry: float, close: float) -> float:
     if side == "LONG":
@@ -218,8 +228,8 @@ def check_positions_once():
             dist_tp = (abs(tp - price) / price) * 100.0
             dist_sl = (abs(price - sl) / price) * 100.0
             log.info(
-                f"[WATCH] {symbol} {side} | price={price:.6f} | "
-                f"TP={tp:.6f} (dist ~{dist_tp:.3f}%) | SL={sl:.6f} (dist ~{dist_sl:.3f}%) | "
+                f"[WATCH] {symbol} {side} | price={fmt_price(price)} | "
+                f"TP={fmt_price(tp)} (dist ~{dist_tp:.3f}%) | SL={fmt_price(sl)} (dist ~{dist_sl:.3f}%) | "
                 f"progress_to_TP={prog:.2f}%"
             )
 
@@ -242,11 +252,11 @@ def check_positions_once():
             pl = _pnl_pct(side, entry, price)
             tg_send(
                 f"{close_reason} по {symbol}\n"
-                f"Цена закрытия: {price}\n"
+                f"Цена закрытия: {fmt_price(price)}\n"
                 f"P/L: {pl:.3f}%\n"
                 f"Открыто: {p['opened_at']}\nЗакрыто: {p['closed_at']}"
             )
-            log.info(f"[CLOSE] {symbol} {side} @ {price} | {close_reason} | P/L={pl:.3f}%")
+            log.info(f"[CLOSE] {symbol} {side} @ {fmt_price(price)} | {close_reason} | P/L={pl:.3f}%")
 
     if changed:
         save_positions(pos)
@@ -308,7 +318,7 @@ def analyze_symbol(sym: str):
     tp, sl = price_levels(price, direction)
     return {
         "symbol": sym, "direction": direction, "confidence": conf,
-        "price": round(price,6), "tp": tp, "sl": sl,
+        "price": float(price), "tp": float(tp), "sl": float(sl),  # сохраняем точные float
         "tp_pct": TP_PCT, "sl_pct": SL_PCT,
         "ema5": (round(f_cur,6), round(s_cur,6)),
         "ema1h": (round(t_fast,6), round(t_slow,6)),
@@ -317,7 +327,7 @@ def analyze_symbol(sym: str):
 
 def run_loop():
     global last_no_signal_sent
-    tg_send("🤖 Signals v2.9 запущен (Bitget SPOT V2). TF: 5m/1h. TP 0.5% / SL 0.4%. Полный цикл TP/SL и логи включены.")
+    tg_send("🤖 Signals v2.10 запущен (Bitget SPOT V2). TF: 5m/1h. TP 0.5% / SL 0.4%. Точная математика TP/SL и логи включены.")
 
     # sanity check
     for s in SYMBOLS:
@@ -346,8 +356,8 @@ def run_loop():
                 conf = "✅ A" if res["confidence"]=="A" else "✔️ B"
                 tg_send(
                     f"{arrow} сигнал {res['symbol']}\n"
-                    f"Цена: ~ {res['price']}\n"
-                    f"TP: {res['tp']} ({pct(TP_PCT)}) | SL: {res['sl']} ({pct(SL_PCT)})\n"
+                    f"Цена: ~ {fmt_price(res['price'])}\n"
+                    f"TP: {fmt_price(res['tp'])} ({pct(TP_PCT)}) | SL: {fmt_price(res['sl'])} ({pct(SL_PCT)})\n"
                     f"RSI(5m): {res['rsi']} | Объём спайк: {'да' if res['vol_spike'] else 'нет'} | Уверенность: {conf}\n"
                     f"EMA5m 9/21: {res['ema5'][0]} / {res['ema5'][1]} | Тренд 1h: {res['ema1h'][0]} / {res['ema1h'][1]}"
                 )
@@ -369,7 +379,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Signals v2.9 running (SPOT V2 + TP/SL notifier). UTC: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return "Signals v2.10 running (SPOT V2 + precise TP/SL notifier). UTC: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 @app.route("/positions")
 def positions_view():
