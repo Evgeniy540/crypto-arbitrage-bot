@@ -1,4 +1,4 @@
-# === main.py (SPOT SPBL symbols) — Bitget SPOT, EMA 9/21, TP +1.5%, SL -1.0% ===
+# === main.py (SPOT, history-candles fix) — EMA 9/21, TP +1.5%, SL -1.0% ===
 import os, time, hmac, hashlib, base64, json, threading, logging
 from flask import Flask
 import requests
@@ -12,7 +12,6 @@ TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 
 # -------- SETTINGS --------
-# ВАЖНО: используем SPBL-формат для спота
 SYMBOLS = ["BTCUSDT_SPBL","ETHUSDT_SPBL","SOLUSDT_SPBL","XRPUSDT_SPBL","TRXUSDT_SPBL"]
 TIMEFRAME_SEC = 300   # 5m
 EMA_FAST = 9
@@ -110,31 +109,19 @@ def ema(series, period):
         out.append(e)
     return out
 
-def base_coin_from_symbol(sym_spbl):
-    # BTCUSDT_SPBL -> BTC
-    core = sym_spbl.replace("_SPBL","")
-    return core.replace("USDT","")
-
-# ---- Market data (SPBL) ----
+# ---- Market data (SPOT with history-candles) ----
 def get_candles(symbol_spbl, limit=120):
-    resp = _get("/api/spot/v1/market/candles",
+    resp = _get("/api/spot/v1/market/history-candles",
                 params={"symbol": symbol_spbl, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
     if resp.get("code") != "00000":
-        # fallback на period
-        resp2 = _get("/api/spot/v1/market/candles",
-                     params={"symbol": symbol_spbl, "period": "5min", "limit": str(max(limit, EMA_SLOW+1))})
-        if resp2.get("code") != "00000":
-            raise Exception(f"{resp} | {resp2}")
-        rows = resp2.get("data", [])
-    else:
-        rows = resp.get("data", [])
+        raise Exception(resp.get("msg", resp))
+    rows = resp.get("data", [])
     rows.reverse()
     return [float(r[4]) for r in rows]
 
 def get_price(symbol_spbl):
     resp = _get("/api/spot/v1/market/ticker", params={"symbol": symbol_spbl})
     if resp.get("code") != "00000":
-        # fallback
         r2 = _get("/api/spot/v1/market/tickers", params={"symbol": symbol_spbl})
         if r2.get("code") != "00000" or not r2.get("data"):
             raise Exception(f"{resp} | {r2}")
@@ -152,7 +139,7 @@ def get_balance(coin="USDT"):
         return 0.0
     return float(arr[0].get("available", 0.0))
 
-# ---- Trading (SPBL symbol in orders) ----
+# ---- Trading (SPBL) ----
 def market_buy(symbol_spbl, quote_usdt):
     payload = {
         "symbol": symbol_spbl,
@@ -181,6 +168,8 @@ def market_sell(symbol_spbl, size):
 
 # ---- Strategy ----
 last_no_signal = {s: 0 for s in SYMBOLS}
+TP_PCT_F = TP_PCT
+SL_PCT_F = SL_PCT
 
 def ema_signal(symbol_spbl):
     closes = get_candles(symbol_spbl, limit=max(EMA_SLOW+10, 60))
@@ -203,8 +192,8 @@ def monitor_positions():
             continue
         buy = pos["buy_price"]; qty = pos["qty"]
         pnl = (price - buy) / buy
-        if pnl >= TP_PCT or pnl <= -SL_PCT:
-            side = "TP" if pnl >= TP_PCT else "SL"
+        if pnl >= TP_PCT_F or pnl <= -SL_PCT_F:
+            side = "TP" if pnl >= TP_PCT_F else "SL"
             try:
                 market_sell(symbol, qty)
                 pnl_usdt = price*qty - pos["spent_usdt"]
@@ -225,7 +214,7 @@ def monitor_positions():
         save_json(POSITIONS_FILE, positions)
 
 def trade_loop():
-    tg("🤖 Бот запущен (Bitget SPOT SPBL, EMA 9/21, TP +1.5%, SL -1.0%).")
+    tg("🤖 Бот запущен (Bitget SPOT history-candles, EMA 9/21, TP +1.5%, SL -1.0%).")
     while True:
         start = time.time()
         try:
@@ -279,7 +268,7 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bitget SPOT bot (SPBL) is running", 200
+    return "Bitget SPOT bot (history-candles) is running", 200
 
 @app.route("/profit", methods=["GET"])
 def profit_status():
