@@ -1,4 +1,4 @@
-# === main.py (SPOT auto-symbol discovery) — EMA 9/21, TP +1.5%, SL -1.0% ===
+# === main.py (SPOT candles endpoint fix) — EMA 9/21, TP +1.5%, SL -1.0% ===
 import os, time, hmac, hashlib, base64, json, threading, logging
 from flask import Flask
 import requests
@@ -12,9 +12,7 @@ TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 
 # -------- SETTINGS --------
-# Желаемые пары в привычном виде (без суффиксов) — бот сам найдёт правильные символы Bitget SPOT
 DESIRED = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT"]
-
 TIMEFRAME_SEC = 300   # 5m
 EMA_FAST = 9
 EMA_SLOW = 21
@@ -111,12 +109,13 @@ def ema(series, period):
         out.append(e)
     return out
 
+def period_str(sec):
+    m = int(sec/60)
+    mapping = {1:"1min",3:"3min",5:"5min",15:"15min",30:"30min",60:"1hour",240:"4hour",1440:"1day"}
+    return mapping.get(m, "5min")
+
 # ---- Discover spot symbols ----
 def fetch_spot_symbols():
-    """Return dicts:
-       - symbols: set of valid spot symbol strings (e.g., 'BTCUSDT')
-       - by_pair: map 'BASEQUOTE' -> symbol from API (exact) for convenience
-    """
     resp = _get("/api/spot/v1/market/symbols")
     if resp.get("code") != "00000":
         raise Exception("cannot fetch spot symbols: " + str(resp))
@@ -135,10 +134,9 @@ def fetch_spot_symbols():
     return symbols, by_pair
 
 def resolve_symbols(desired_list):
-    """Map desired ['BTCUSDT', ...] to actual API symbols. Fallback tries simple and _SPBL."""
     symbols, by_pair = fetch_spot_symbols()
     resolved = []
-    errors = []
+    missed = []
     for want in desired_list:
         key = want.upper()
         sym = None
@@ -147,28 +145,35 @@ def resolve_symbols(desired_list):
         elif key in by_pair:
             sym = by_pair[key]
         else:
-            # last resort, try price ticker to see what works
+            # try direct ticker
             try:
                 r = _get("/api/spot/v1/market/ticker", params={"symbol": key})
                 if r.get("code") == "00000":
                     sym = key
             except Exception:
                 pass
-        if not sym:
-            errors.append(want)
-        else:
+        if sym:
             resolved.append(sym)
-    if errors:
-        tg("⚠️ Не удалось найти SPOT символы: " + ", ".join(errors))
+        else:
+            missed.append(want)
+    if missed:
+        tg("⚠️ Не найдено в SPOT: " + ", ".join(missed))
     return resolved
 
-# ---- Market data (use resolved API symbol) ----
+# ---- Market data (use /candles with period) ----
 def get_candles(symbol_api, limit=120):
-    resp = _get("/api/spot/v1/market/history-candles",
-                params={"symbol": symbol_api, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
+    p = period_str(TIMEFRAME_SEC)
+    resp = _get("/api/spot/v1/market/candles",
+                params={"symbol": symbol_api, "period": p, "limit": str(max(limit, EMA_SLOW+1))})
     if resp.get("code") != "00000":
-        raise Exception(resp.get("msg", resp))
-    rows = resp.get("data", [])
+        # fallback: try granularity in seconds
+        r2 = _get("/api/spot/v1/market/candles",
+                  params={"symbol": symbol_api, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
+        if r2.get("code") != "00000":
+            raise Exception(f"{resp} | {r2}")
+        rows = r2.get("data", [])
+    else:
+        rows = resp.get("data", [])
     rows.reverse()
     return [float(r[4]) for r in rows]
 
@@ -221,7 +226,7 @@ def market_sell(symbol_api, size):
 
 # ---- Strategy ----
 last_no_signal = {}
-SYMBOLS = []  # will be resolved at runtime
+SYMBOLS = []
 
 def ema_signal(symbol_api):
     closes = get_candles(symbol_api, limit=max(EMA_SLOW+10, 60))
@@ -267,13 +272,12 @@ def monitor_positions():
 
 def trade_loop():
     global SYMBOLS, last_no_signal
-    # Resolve symbols at startup
     SYMBOLS = resolve_symbols(DESIRED)
     if not SYMBOLS:
         tg("❗ Не нашёл ни одной спотовой пары на Bitget. Останавливаюсь.")
         return
     last_no_signal = {s: 0 for s in SYMBOLS}
-    tg("🤖 Бот запущен (Bitget SPOT auto-symbols). Пары: " + ", ".join(SYMBOLS))
+    tg("🤖 Бот запущен (Bitget SPOT, candles/period). Пары: " + ", ".join(SYMBOLS))
 
     while True:
         start = time.time()
@@ -328,7 +332,7 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bitget SPOT bot (auto-symbols) is running", 200
+    return "Bitget SPOT bot (candles/period) is running", 200
 
 @app.route("/profit", methods=["GET"])
 def profit_status():
