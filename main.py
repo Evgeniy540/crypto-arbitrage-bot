@@ -1,4 +1,4 @@
-# === main.py v4.6 (SPOT • fast scalps • TP 0.3% / SL 0.6% • EMA9/21 • reinvest • one-pos • anti-spam • Flask) ===
+# === main.py v4.6 (SPOT • fast scalps • TP 0.3% / SL 0.6% • EMA9/21 • reinvest • one-pos • anti-spam • confirm buy • Flask) ===
 import os, time, json, hmac, hashlib, base64, logging, threading, requests
 from datetime import datetime, timezone
 from urllib.parse import urlencode
@@ -27,8 +27,8 @@ GLOBAL_OK_COOLDOWN  = 60*5
 MAX_HOLD_MINUTES    = 30
 
 # ----- Anti-spam / throttling -----
-GLOBAL_BUY_COOLDOWN_SEC = 25
-BALANCE_THROTTLE_SEC    = 15
+GLOBAL_BUY_COOLDOWN_SEC = 25     # между любыми покупками
+BALANCE_THROTTLE_SEC    = 15     # не дёргать баланс слишком часто
 _last_global_buy_ts     = 0
 _last_balance_ts        = 0
 _last_balance_cached    = 0.0
@@ -67,8 +67,10 @@ app = Flask(__name__)
 def tg_send(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10
+        )
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
@@ -102,23 +104,33 @@ def _sign(ts, method, path, query, body):
     h = hmac.new(BITGET_API_SECRET.encode(), presign.encode(), hashlib.sha256).digest()
     return base64.b64encode(h).decode()
 def _headers(ts, sign):
-    return {"ACCESS-KEY":BITGET_API_KEY,"ACCESS-SIGN":sign,"ACCESS-TIMESTAMP":ts,
-            "ACCESS-PASSPHRASE":BITGET_API_PASSPHRASE,"Content-Type":"application/json",
-            "locale":"en-US","User-Agent":"Mozilla/5.0"}
+    return {
+        "ACCESS-KEY":BITGET_API_KEY,"ACCESS-SIGN":sign,"ACCESS-TIMESTAMP":ts,
+        "ACCESS-PASSPHRASE":BITGET_API_PASSPHRASE,"Content-Type":"application/json",
+        "locale":"en-US","User-Agent":"Mozilla/5.0"
+    }
 
 def _raise_api_error(resp):
-    try: j = resp.json()
+    """
+    Поднимает исключение с подробностями Bitget.
+    Если код != 00000 — шлём текстовую причину.
+    """
+    try:
+        j = resp.json()
     except Exception:
-        resp.raise_for_status(); return
-    code = str(j.get("code",""))
+        resp.raise_for_status()
+        return
+    code = str(j.get("code", ""))
     if code and code != "00000":
-        msg = j.get("msg","")
+        msg = j.get("msg", "") or j.get("message", "")
         hint = ""
         if code == "40006": hint = "Invalid ACCESS_KEY"
         elif code == "40005": hint = "Invalid SIGN (SECRET/PASSPHRASE)"
         elif code == "40015": hint = "IP not allowed (whitelist)"
         elif code == "40741": hint = "No spot permission"
-        raise RuntimeError(f"Ошибка Bitget {code}: {msg}. {hint}".strip())
+        elif code == "40014": hint = "Insufficient permissions (need place-order permission)"
+        elif code == "45110": hint = "Min trade amount not met"
+        raise RuntimeError(f"Bitget error {code}: {msg}. {hint}".strip())
 
 def priv_get(path, query=None, timeout=12):
     ts=_ts_ms(); sign=_sign(ts,"GET",path,query,None)
@@ -208,64 +220,73 @@ def get_usdt_available() -> float:
     _last_balance_ts = now
     return val
 
-def place_market_buy(symbol, spend_usdt, tries=3):
-    """Market BUY (spot): используем quoteSize (сумма в USDT)"""
-    payload_base = {
-        "symbol": symbol,
-        "side": "buy",
-        "orderType": "market",
-        "force": "normal",
+ORDER_WAIT_SEC = 8
+ORDER_POLL_SEC = 0.4
+
+def _fetch_order(symbol, order_id):
+    info = priv_get("/api/v2/spot/trade/orderInfo", {"orderId": order_id, "symbol": symbol})
+    return info.get("data") or {}
+
+def _wait_filled_or_accepted(symbol, order_id):
+    t0 = time.time()
+    last = {}
+    while time.time() - t0 < ORDER_WAIT_SEC:
+        try:
+            last = _fetch_order(symbol, order_id)
+            status = (last.get("status") or "").lower()
+            if status in ("filled", "partial-filled", "success", "full-fill"):
+                break
+        except Exception as e:
+            log.warning(f"[ORDER POLL] {symbol} {order_id}: {e}")
+        time.sleep(ORDER_POLL_SEC)
+    return (
+        (last.get("status") or "").lower(),
+        float(last.get("baseVolume") or 0),
+        float(last.get("priceAvg") or 0)
+    )
+
+def place_market_buy(symbol, spend_usdt, tries=2):
+    payload = {
+        "symbol":symbol,"side":"buy","orderType":"market",
+        "size": qfmt(symbol, spend_usdt, "quote"),
         "clientOid": f"buy-{symbol}-{int(time.time()*1000)}"
     }
     last_err=None
     for i in range(tries):
         try:
-            payload = dict(payload_base)
-            payload["quoteSize"] = qfmt(symbol, spend_usdt, "quote")  # ВАЖНО
             res = priv_post("/api/v2/spot/trade/place-order", payload)
-            if res.get("code") != "00000": raise RuntimeError(res)
+            if res.get("code") != "00000":
+                raise RuntimeError(f"Bitget place-order non-OK: {res}")
             oid = (res.get("data") or {}).get("orderId")
-            time.sleep(0.7)
-            info = priv_get("/api/v2/spot/trade/orderInfo", {"orderId": oid, "symbol": symbol})
-            od = info.get("data") or {}
-            base_qty  = float(od.get("baseVolume") or 0)
-            avg_price = float(od.get("priceAvg") or 0)
+            if not oid:
+                raise RuntimeError("No orderId returned from Bitget")
+            status, base_qty, avg_price = _wait_filled_or_accepted(symbol, oid)
             if base_qty <= 0:
-                time.sleep(0.5)
-                info = priv_get("/api/v2/spot/trade/orderInfo", {"orderId": oid, "symbol": symbol})
-                od = info.get("data") or {}
-                base_qty  = float(od.get("baseVolume") or 0)
-                avg_price = float(od.get("priceAvg") or 0)
+                raise RuntimeError(f"Order {oid} not filled: status={status or 'unknown'}")
             return {"orderId": oid, "baseQty": base_qty, "avgPrice": avg_price}
         except Exception as e:
             last_err=e; time.sleep(0.6*(i+1))
     raise RuntimeError(f"Buy failed after {tries} tries: {last_err}")
 
 def place_market_sell(symbol, qty_base, tries=3):
-    """Market SELL (spot): используем size (кол-во базовой монеты)"""
-    payload_base = {
-        "symbol": symbol,
-        "side": "sell",
-        "orderType": "market",
-        "force": "normal",
+    payload = {
+        "symbol":symbol,"side":"sell","orderType":"market",
+        "size": qfmt(symbol, qty_base, "base"),
         "clientOid": f"sell-{symbol}-{int(time.time()*1000)}"
     }
     last_err=None
     for i in range(tries):
         try:
-            payload = dict(payload_base)
-            payload["size"] = qfmt(symbol, qty_base, "base")  # ВАЖНО
             res = priv_post("/api/v2/spot/trade/place-order", payload)
             if res.get("code") != "00000": raise RuntimeError(res)
             oid = (res.get("data") or {}).get("orderId")
-            time.sleep(0.7)
+            time.sleep(0.6)
             info = priv_get("/api/v2/spot/trade/orderInfo", {"orderId": oid, "symbol": symbol})
             od = info.get("data") or {}
-            quote_vol = float(od.get("quoteVolume") or 0)
-            avg_price = float(od.get("priceAvg") or 0)
-            return {"orderId": oid, "quoteVolume": quote_vol, "avgPrice": avg_price}
+            return {"orderId": oid, "quoteVolume": float(od.get("quoteVolume","0")),
+                    "avgPrice": float(od.get("priceAvg","0") or "0")}
         except Exception as e:
-            last_err=e; time.sleep(0.6*(i+1))
+            last_err=e; time.sleep(0.5*(i+1))
     raise RuntimeError(f"Sell failed after {tries} tries: {last_err}")
 
 def price_levels(price):
@@ -320,7 +341,7 @@ def calc_spend_usdt(symbol: str) -> float:
         return float(spend)
     return float(max(TRADE_USDT, min_usdt(symbol)))
 
-# ----- Buy flow -----
+# ----- Buy flow (with confirmation) -----
 def try_autobuy(symbol, price_hint, tp_hint, sl_hint):
     global _last_global_buy_ts
     if not AUTO_TRADE: return
@@ -336,19 +357,25 @@ def try_autobuy(symbol, price_hint, tp_hint, sl_hint):
         bal = get_usdt_available()
     except Exception as e:
         tg_send(f"⚠️ Ошибка баланса: {e}"); return
-    if bal < spend:
-        tg_send(f"⚠️ Недостаточно USDT ({bal:.2f}) для покупки {symbol} на {spend:.2f} USDT")
+
+    min_allowed = min_usdt(symbol)
+    if spend < min_allowed:
+        tg_send(f"⚠️ Мин. сумма ордера по {symbol}: {min_allowed:.2f} USDT. Рассчитано {spend:.2f} USDT.")
+        return
+
+    if bal + 1e-9 < spend:
+        tg_send(f"⚠️ Недостаточно USDT: доступно {bal:.2f}, нужно {spend:.2f} для {symbol}.")
         return
 
     try:
         info = place_market_buy(symbol, spend)
         base_qty  = float(info["baseQty"])
-        avg_price = float(info["avgPrice"]) or float(price_hint)
-        if base_qty <= 0:
-            tg_send(f"❌ BITGET вернул нулевой объём по {symbol}. Покупка отменена.")
-            return
+        avg_price = float(info["avgPrice"] or price_hint)
     except Exception as e:
-        tg_send(f"❌ Покупка не выполнена {symbol}: {e}"); return
+        msg = str(e)
+        log.error(f"[BUY FAIL] {symbol}: {msg}")
+        tg_send(f"❌ Покупка {symbol} ОТКЛОНЕНА: {msg}")
+        return
 
     _last_global_buy_ts = time.time()
     tp_new, sl_new = price_levels(avg_price)
@@ -357,8 +384,9 @@ def try_autobuy(symbol, price_hint, tp_hint, sl_hint):
                    "opened_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                    "orderId_buy": info["orderId"], "baseQty": base_qty}
     save_positions(pos)
-    tg_send(f"🟢 BUY {symbol}\nСумма: {spend:.2f} USDT → {base_qty:.8f}\n"
-            f"Средняя: {fmt_price(avg_price)} | TP: {fmt_price(tp_new)} ({pct(TP_PCT)}) | SL: {fmt_price(sl_new)} ({pct(SL_PCT)})")
+    tg_send(f"🟢 BUY подтверждён\n{symbol} на {spend:.2f} USDT → {base_qty:.8f}\n"
+            f"Средняя: {fmt_price(avg_price)} | TP: {fmt_price(tp_new)} ({pct(TP_PCT)}) | "
+            f"SL: {fmt_price(sl_new)} ({pct(SL_PCT)})\nOrderID: {info['orderId']}")
 
 # ----- Close loop -----
 _last_watch = {}
@@ -378,6 +406,8 @@ def check_positions_once():
         # timeout
         try:
             opened_dt = datetime.fromisoformat(p["opened_at"])
+            if opened_dt.tzinfo is None:
+                opened_dt = opened_dt.replace(tzinfo=timezone.utc)
             age_min = (datetime.now(timezone.utc) - opened_dt).total_seconds()/60
             if age_min >= MAX_HOLD_MINUTES: reason = "⏱️ TIMEOUT"
         except: pass
@@ -401,6 +431,7 @@ def check_positions_once():
         if reason is None: continue
 
         # SELL market
+        sell_info=None
         if AUTO_TRADE and p.get("baseQty"):
             try:
                 sell_info = place_market_sell(symbol, float(p["baseQty"]))
@@ -544,7 +575,7 @@ def pnl_view():
     data = load_json(PNL_FILE, {"trades":[], "total_pct":0.0})
     return jsonify(data)
 
-# webhook-заглушка чтобы не было 404 в логах
+# webhook-заглушка чтобы не было 404 от сторонних пингов
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
     try:
