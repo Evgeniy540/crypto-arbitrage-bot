@@ -1,4 +1,4 @@
-# === main.py v2.1 (Bitget SPOT signals: LONG/SHORT, TP 0.5% / SL 0.4%) ===
+# === main.py v2.2 (Bitget SPOT: LONG/SHORT signals, TP 0.5% / SL 0.4%) ===
 import time, threading, os, logging, requests
 from datetime import datetime, timezone
 from flask import Flask
@@ -14,15 +14,15 @@ def tg_send(text: str):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-# ---------- НАСТРОЙКИ ----------
+# ---------- ПАРАМЕТРЫ ----------
+# Только проверенные спотовые пары Bitget (с суффиксом _SPBL)
 SYMBOLS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT",
-    "DOGEUSDT","PEPEUSDT","BGBUSDT","TONUSDT","ADAUSDT","APTUSDT","ARBUSDT"
+    "BTCUSDT_SPBL","ETHUSDT_SPBL","SOLUSDT_SPBL","XRPUSDT_SPBL",
+    "TRXUSDT_SPBL","DOGEUSDT_SPBL","PEPEUSDT_SPBL","BGBUSDT_SPBL"
 ]
 
-# Таймфреймы (для SPOT: period строкой!)
-PERIOD_5M  = "5min"
-PERIOD_1H  = "1hour"
+PERIOD_5M = "5min"
+PERIOD_1H = "1hour"
 
 EMA_FAST = 9
 EMA_SLOW = 21
@@ -42,7 +42,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("signals-v2.1")
+log = logging.getLogger("signals-v2.2")
 
 # ---------- ИНДИКАТОРЫ ----------
 def ema(values, period):
@@ -74,12 +74,9 @@ def rsi(values, period=14):
         rsis.append(100 - (100/(1+rs)))
     return rsis
 
-# ---------- ДАННЫЕ (SPOT требует period, не granularity) ----------
+# ---------- ДАННЫЕ ----------
 def fetch_spot_candles(symbol: str, period: str, limit: int = 300):
-    """
-    Возвращает (closes, base_volumes) по времени (старые -> новые).
-    Bitget SPOT candles: [ts, open, high, low, close, baseVol, quoteVol]
-    """
+    """Возвращает (closes, base_volumes) по времени (старые -> новые)."""
     try:
         params = {"symbol": symbol, "period": period, "limit": str(limit)}
         r = requests.get(BITGET_SPOT_CANDLES, params=params, headers=HEADERS, timeout=15)
@@ -117,6 +114,7 @@ def analyze_symbol(sym: str):
     closes5, vols5 = fetch_spot_candles(sym, PERIOD_5M, limit=300)
     if len(closes5) < max(EMA_SLOW+2, RSI_PERIOD+2, VOL_MA+2):
         return None
+
     ema9_5, ema21_5, rsi5 = ema(closes5, EMA_FAST), ema(closes5, EMA_SLOW), rsi(closes5, RSI_PERIOD)
     f_prev, s_prev, f_cur, s_cur = ema9_5[-2], ema21_5[-2], ema9_5[-1], ema21_5[-1]
     rsi_cur, price = rsi5[-1], closes5[-1]
@@ -130,21 +128,22 @@ def analyze_symbol(sym: str):
     else:
         vol_spike = False
 
+    # 5m кроссы (по закрытой свече)
     bull_cross = (f_prev <= s_prev) and (f_cur > s_cur)
     bear_cross = (f_prev >= s_prev) and (f_cur < s_cur)
 
-    # 1h тренд
+    # 1h тренд-фильтр
     closes1h, _ = fetch_spot_candles(sym, PERIOD_1H, limit=200)
     if len(closes1h) < EMA_SLOW + 1: return None
     ema9_1h, ema21_1h = ema(closes1h, EMA_FAST), ema(closes1h, EMA_SLOW)
     t_fast, t_slow = ema9_1h[-1], ema21_1h[-1]
     if any(v is None for v in (t_fast, t_slow)): return None
-    uptrend, downtrend = t_fast > t_slow, t_fast < t_slow
 
+    uptrend, downtrend = t_fast > t_slow, t_fast < t_slow
     long_ok, short_ok = (45 <= rsi_cur <= 65), (35 <= rsi_cur <= 55)
+
     long_signal  = bull_cross and uptrend and long_ok
     short_signal = bear_cross and downtrend and short_ok
-
     if not (long_signal or short_signal):
         return None
 
@@ -162,7 +161,7 @@ def analyze_symbol(sym: str):
 
 def run_loop():
     global last_no_signal_sent
-    tg_send("🤖 Signals v2.1 запущен (Bitget SPOT). Фильтры: 5m EMA9/21 + тренд 1h + RSI + объём. TP 0.5% / SL 0.4%.")
+    tg_send("🤖 Signals v2.2 запущен (Bitget SPOT). Периоды: 5min/1hour. TP 0.5% / SL 0.4%.")
 
     while True:
         try:
@@ -176,11 +175,14 @@ def run_loop():
                 if last_signal_side.get(sym) == direction and (now - last_signal_ts.get(sym,0) < PER_SYMBOL_COOLDOWN):
                     continue
 
-                last_signal_side[sym] = direction; last_signal_ts[sym] = now; any_signal = True
+                last_signal_side[sym] = direction
+                last_signal_ts[sym] = now
+                any_signal = True
+
                 arrow = "🟢 LONG" if direction=="long" else "🔴 SHORT"
                 conf = "✅ A" if res["confidence"]=="A" else "✔️ B"
                 msg = (
-                    f"{arrow} сигнал {sym}\n"
+                    f"{arrow} сигнал {res['symbol']}\n"
                     f"Цена: ~ {res['price']}\n"
                     f"TP: {res['tp']} ({pct(res['tp_pct'])}) | SL: {res['sl']} ({pct(res['sl_pct'])})\n"
                     f"RSI(5m): {res['rsi']} | Объём спайк: {'да' if res['vol_spike'] else 'нет'} | Уверенность: {conf}\n"
@@ -202,7 +204,7 @@ def run_loop():
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "Signals v2.1 running (SPOT). UTC: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return "Signals v2.2 running (SPOT). UTC: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 def start_loop():
     t = threading.Thread(target=run_loop, daemon=True); t.start()
 if __name__ == "__main__":
