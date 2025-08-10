@@ -1,4 +1,4 @@
-# === main.py v2.4 (Bitget SPOT, granularity-only, _SPBL) ===
+# === main.py v2.6 (Bitget SPOT: history-candles + fallback, LONG/SHORT signals) ===
 import time, threading, os, logging, requests
 from datetime import datetime, timezone
 from flask import Flask
@@ -17,12 +17,13 @@ def tg_send(text: str):
         log.error(f"Telegram error: {e}")
 
 # ----- ПАРАМЕТРЫ -----
-SYMBOLS = [
-    "BTCUSDT_SPBL","ETHUSDT_SPBL","SOLUSDT_SPBL","XRPUSDT_SPBL",
-    "TRXUSDT_SPBL","DOGEUSDT_SPBL","PEPEUSDT_SPBL","BGBUSDT_SPBL"
-]
-G_5M = 300       # 5 минут
-G_1H = 3600      # 1 час
+# Базовые тикеры БЕЗ _SPBL для SPOT
+SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","DOGEUSDT","PEPEUSDT","BGBUSDT"]
+
+PERIOD_5M = "5min"
+PERIOD_1H = "1hour"
+G_5M = 300
+G_1H = 3600
 
 EMA_FAST = 9
 EMA_SLOW = 21
@@ -37,61 +38,95 @@ CHECK_EVERY_SEC = 30
 PER_SYMBOL_COOLDOWN = 60 * 20
 GLOBAL_OK_COOLDOWN  = 60 * 60
 
-BITGET_SPOT_CANDLES = "https://api.bitget.com/api/spot/v1/market/candles"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+SPOT_HISTORY = "https://api.bitget.com/api/spot/v1/market/history-candles"
+SPOT_CANDLES = "https://api.bitget.com/api/spot/v1/market/candles"
 
 # ----- ЛОГИ -----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("signals-v2.4")
+log = logging.getLogger("signals-v2.6")
 
 # ----- ИНДИКАТОРЫ -----
 def ema(values, period):
     if len(values) < period: return []
-    k = 2 / (period + 1)
+    k = 2/(period+1)
     out = [None]*(period-1)
-    sma = sum(values[:period]) / period
+    sma = sum(values[:period])/period
     out.append(sma)
-    val = sma
+    v = sma
     for x in values[period:]:
-        val = x*k + val*(1-k)
-        out.append(val)
+        v = x*k + v*(1-k)
+        out.append(v)
     return out
 
 def rsi(values, period=14):
-    if len(values) < period + 1: return []
+    if len(values) < period+1: return []
     gains, losses = [], []
     for i in range(1, period+1):
-        ch = values[i] - values[i-1]
+        ch = values[i]-values[i-1]
         gains.append(max(ch,0.0)); losses.append(abs(min(ch,0.0)))
-    avg_gain = sum(gains)/period; avg_loss = sum(losses)/period
-    rsis = [None]*period
+    ag = sum(gains)/period; al = sum(losses)/period
+    out = [None]*period
     for i in range(period+1, len(values)):
-        ch = values[i] - values[i-1]
-        gain = max(ch,0.0); loss = abs(min(ch,0.0))
-        avg_gain = (avg_gain*(period-1)+gain)/period
-        avg_loss = (avg_loss*(period-1)+loss)/period
-        rs = float('inf') if avg_loss==0 else avg_gain/avg_loss
-        rsis.append(100 - (100/(1+rs)))
-    return rsis
+        ch = values[i]-values[i-1]
+        g = max(ch,0.0); l = abs(min(ch,0.0))
+        ag = (ag*(period-1)+g)/period
+        al = (al*(period-1)+l)/period
+        rs = float('inf') if al==0 else ag/al
+        out.append(100 - 100/(1+rs))
+    return out
 
-# ----- ДАННЫЕ: ТОЛЬКО granularity -----
-def fetch_spot_candles(symbol: str, granularity: int, limit: int = 300):
-    """Возвращает (closes, base_volumes) старые->новые. Использует только granularity."""
-    params = {"symbol": symbol, "granularity": str(granularity), "limit": str(limit)}
-    r = requests.get(BITGET_SPOT_CANDLES, params=params, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    data = r.json().get("data", [])
+# ----- ФЕТЧ СВЕЧЕЙ: history-candles + фолбэки -----
+def _norm(data):
     rows = []
     for row in data:
-        # [ts, open, high, low, close, baseVol, quoteVol]
         try:
             rows.append((int(row[0]), float(row[4]), float(row[5]) if len(row)>5 else 0.0))
-        except Exception:
-            pass
-    rows.sort(key=lambda x: x[0])
+        except: pass
+    rows.sort(key=lambda x: x[0])  # старые -> новые
     closes = [c for _,c,_ in rows]
     vols   = [v for *_,v in rows]
     return closes, vols
+
+def fetch_spot_candles(symbol: str, period_str: str, gran: int, limit: int = 300):
+    # 1) history-candles (рекомендовано для спота, не требует after/before для последнего окна)
+    try:
+        r = requests.get(SPOT_HISTORY, params={"symbol": symbol, "period": period_str, "limit": str(limit)},
+                         headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        c,v = _norm(data)
+        if c:
+            return c,v
+    except Exception as e:
+        log.error(f"{symbol} history error: {e}")
+
+    # 2) обычные candles с period
+    try:
+        r = requests.get(SPOT_CANDLES, params={"symbol": symbol, "period": period_str, "limit": str(limit)},
+                         headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        c,v = _norm(r.json().get("data", []))
+        if c:
+            log.info(f"{symbol}: fallback OK on candles(period={period_str})")
+            return c,v
+    except Exception as e:
+        log.error(f"{symbol} candles(period) error: {e}")
+
+    # 3) candles с granularity (секунды)
+    try:
+        r = requests.get(SPOT_CANDLES, params={"symbol": symbol, "granularity": str(gran), "limit": str(limit)},
+                         headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        c,v = _norm(r.json().get("data", []))
+        if c:
+            log.info(f"{symbol}: fallback OK on candles(granularity={gran})")
+            return c,v
+    except Exception as e:
+        log.error(f"{symbol} candles(gran) error: {e}")
+
+    log.warning(f"{symbol}: пустые свечи после всех попыток")
+    return [], []
 
 # ----- ЛОГИКА СИГНАЛОВ -----
 last_signal_side = {s: None for s in SYMBOLS}
@@ -108,7 +143,7 @@ def price_levels(price, direction):
     return round(tp,6), round(sl,6)
 
 def analyze_symbol(sym: str):
-    closes5, vols5 = fetch_spot_candles(sym, G_5M, 300)
+    closes5, vols5 = fetch_spot_candles(sym, PERIOD_5M, G_5M, 300)
     if len(closes5) < max(EMA_SLOW+2, RSI_PERIOD+2, VOL_MA+2): return None
 
     ema9_5  = ema(closes5, EMA_FAST)
@@ -128,12 +163,12 @@ def analyze_symbol(sym: str):
     else:
         vol_spike = False
 
-    # кроссы по ЗАКРЫТОЙ свече
+    # кроссы 5m (по закрытой)
     bull_cross = (f_prev <= s_prev) and (f_cur > s_cur)
     bear_cross = (f_prev >= s_prev) and (f_cur < s_cur)
 
-    # тренд по 1h
-    closes1h, _ = fetch_spot_candles(sym, G_1H, 200)
+    # тренд 1h
+    closes1h, _ = fetch_spot_candles(sym, PERIOD_1H, G_1H, 200)
     if len(closes1h) < EMA_SLOW + 1: return None
     ema9_1h  = ema(closes1h, EMA_FAST)
     ema21_1h = ema(closes1h, EMA_SLOW)
@@ -161,15 +196,15 @@ def analyze_symbol(sym: str):
 
 def run_loop():
     global last_no_signal_sent
-    tg_send("🤖 Signals v2.4 запущен (SPOT, granularity). TF: 5m/1h. TP 0.5% / SL 0.4%.")
+    tg_send("🤖 Signals v2.6 запущен (SPOT history-candles). TF 5m/1h. TP 0.5% / SL 0.4%.")
 
-    # быстрая проверка данных на старте
+    # быстрая проверка на старте
     for s in SYMBOLS:
         try:
-            c,_ = fetch_spot_candles(s, G_5M, 50)
-            log.info(f"{s}: свечей(5m)={len(c)} пример={c[-3:]}")  # должно быть > 0
+            c,_ = fetch_spot_candles(s, PERIOD_5M, G_5M, 50)
+            logging.info(f"{s}: стартовых свечей(5m) = {len(c)}")
         except Exception as e:
-            log.error(f"{s} start fetch error: {e}")
+            logging.error(f"{s} start fetch error: {e}")
 
     while True:
         try:
@@ -202,9 +237,8 @@ def run_loop():
             if not any_signal and now - last_no_signal_sent >= GLOBAL_OK_COOLDOWN:
                 last_no_signal_sent = now
                 tg_send("ℹ️ Пока без новых сигналов. Проверяю рынок…")
-
         except Exception as e:
-            log.exception(f"Loop error: {e}")
+            logging.exception(f"Loop error: {e}")
 
         time.sleep(CHECK_EVERY_SEC)
 
@@ -212,7 +246,7 @@ def run_loop():
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "Signals v2.4 running (SPOT). UTC: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return "Signals v2.6 running (SPOT). UTC: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 def start_loop():
     threading.Thread(target=run_loop, daemon=True).start()
