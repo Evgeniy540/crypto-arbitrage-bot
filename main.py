@@ -1,4 +1,4 @@
-# === main.py (Bitget SPOT final: products + candles) — EMA 9/21, TP +1.5%, SL -1.0% ===
+# === main.py (Bitget SPOT — strip _SPBL) ===
 import os, time, hmac, hashlib, base64, json, threading, logging
 from flask import Flask
 import requests
@@ -32,20 +32,18 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
 
 BASE_URL = "https://api.bitget.com"
 
-def _ts():
-    return str(int(time.time() * 1000))
+def _ts(): return str(int(time.time()*1000))
 
 def _sign(timestamp, method, path, body=""):
-    message = f"{timestamp}{method}{path}{body}"
-    mac = hmac.new(BITGET_API_SECRET.encode(), message.encode(), hashlib.sha256).digest()
+    msg = f"{timestamp}{method}{path}{body}"
+    mac = hmac.new(BITGET_API_SECRET.encode(), msg.encode(), hashlib.sha256).digest()
     return base64.b64encode(mac).decode()
 
 def _headers(method, path, body=""):
     ts = _ts()
-    sign = _sign(ts, method, path, body)
     return {
         "ACCESS-KEY": BITGET_API_KEY,
-        "ACCESS-SIGN": sign,
+        "ACCESS-SIGN": _sign(ts, method, path, body),
         "ACCESS-TIMESTAMP": ts,
         "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
         "Content-Type": "application/json",
@@ -75,35 +73,26 @@ def _post(path, payload):
         raise Exception(f"HTTP {r.status_code}: {r.text}")
     return r.json()
 
-# ---- Telegram ----
 def tg(msg):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-        requests.post(url, data=data, timeout=10)
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
         logging.error("Telegram error: %s", e)
 
-# ---- Files ----
 def load_json(path, default):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return default
+        with open(path, "r", encoding="utf-8") as f: return json.load(f)
+    except: return default
 
 def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    with open(path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
 
 positions = load_json(POSITIONS_FILE, {})
 profit = load_json(PROFIT_FILE, {"total_usdt": 0.0, "trades": []})
 
-# ---- Helpers ----
 def ema(series, period):
-    k = 2/(period+1)
-    e = None
-    out = []
+    k = 2/(period+1); e=None; out=[]
     for v in series:
         e = v if e is None else v*k + e*(1-k)
         out.append(e)
@@ -111,42 +100,40 @@ def ema(series, period):
 
 def period_str(sec):
     m = int(sec/60)
-    mapping = {1:"1min",3:"3min",5:"5min",15:"15min",30:"30min",60:"1hour",240:"4hour",1440:"1day"}
-    return mapping.get(m, "5min")
+    return {1:"1min",3:"3min",5:"5min",15:"15min",30:"30min",60:"1hour",240:"4hour",1440:"1day"}.get(m, "5min")
 
-# ---- Discover spot symbols via /public/products ----
+# ---- Symbol helpers ----
+def strip_spbl(sym: str) -> str:
+    return sym.replace("_SPBL", "")
+
 def fetch_spot_products():
     resp = _get("/api/spot/v1/public/products")
     if resp.get("code") != "00000":
         raise Exception("cannot fetch products: " + str(resp))
     return resp.get("data", [])
 
-def resolve_symbols(desired_list):
+def resolve_symbols(desired):
     products = fetch_spot_products()
-    by_symbol = {p.get("symbol","").upper(): p for p in products}
-    by_pair = {( (p.get("baseCoin","")+p.get("quoteCoin","")).upper() ): p for p in products}
-    resolved = []
-    missed = []
-    for want in desired_list:
+    by_symbol = { (p.get("symbol","") or "").upper(): p for p in products }
+    by_pair = { ((p.get("baseCoin","")+p.get("quoteCoin","")).upper()): p for p in products }
+    resolved=[]; missed=[]
+    for want in desired:
         key = want.upper()
-        p = by_symbol.get(key) or by_pair.get(key)
+        p = by_symbol.get(key) or by_pair.get(key) or None
         if p and p.get("symbol"):
-            resolved.append(p["symbol"].upper())
+            resolved.append(strip_spbl(p["symbol"].upper()))
         else:
             missed.append(want)
-    if missed:
-        tg("⚠️ Не нашёл пары в SPOT: " + ", ".join(missed))
+    if missed: tg("⚠️ Не нашёл пары в SPOT: " + ", ".join(missed))
     return resolved
 
-# ---- Market data ----
-def get_candles(symbol_api, limit=120):
-    p = period_str(TIMEFRAME_SEC)
+# ---- Market data (SPOT expects plain symbol) ----
+def get_candles(symbol_plain, limit=120):
     resp = _get("/api/spot/v1/market/candles",
-                params={"symbol": symbol_api, "period": p, "limit": str(max(limit, EMA_SLOW+1))})
+                params={"symbol": symbol_plain, "period": period_str(TIMEFRAME_SEC), "limit": str(max(limit, EMA_SLOW+1))})
     if resp.get("code") != "00000":
-        # fallback to granularity seconds
         r2 = _get("/api/spot/v1/market/candles",
-                  params={"symbol": symbol_api, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
+                  params={"symbol": symbol_plain, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
         if r2.get("code") != "00000":
             raise Exception(f"{resp} | {r2}")
         rows = r2.get("data", [])
@@ -155,162 +142,113 @@ def get_candles(symbol_api, limit=120):
     rows.reverse()
     return [float(r[4]) for r in rows]
 
-def get_price(symbol_api):
-    resp = _get("/api/spot/v1/market/ticker", params={"symbol": symbol_api})
-    if resp.get("code") != "00000":
-        r2 = _get("/api/spot/v1/market/tickers", params={"symbol": symbol_api})
+def get_price(symbol_plain):
+    r = _get("/api/spot/v1/market/ticker", params={"symbol": symbol_plain})
+    if r.get("code") != "00000":
+        r2 = _get("/api/spot/v1/market/tickers", params={"symbol": symbol_plain})
         if r2.get("code") != "00000" or not r2.get("data"):
-            raise Exception(f"{resp} | {r2}")
-        d = r2["data"][0]
-        return float(d.get("lastPr") or d.get("last"))
-    d = resp.get("data", {})
-    return float(d.get("lastPr") or d.get("last"))
+            raise Exception(f"{r} | {r2}")
+        d = r2["data"][0]; return float(d.get("lastPr") or d.get("last"))
+    d = r.get("data", {}); return float(d.get("lastPr") or d.get("last"))
 
 def get_balance(coin="USDT"):
     resp = _get("/api/spot/v1/account/assets", params={"coin": coin}, auth=True)
-    if resp.get("code") != "00000":
-        raise Exception(resp.get("msg","unknown"))
-    arr = resp.get("data", [])
-    if not arr:
-        return 0.0
-    return float(arr[0].get("available", 0.0))
+    if resp.get("code") != "00000": raise Exception(resp.get("msg","unknown"))
+    arr = resp.get("data", []); 
+    return float(arr[0].get("available", 0.0)) if arr else 0.0
 
-# ---- Trading ----
-def market_buy(symbol_api, quote_usdt):
-    payload = {
-        "symbol": symbol_api,
-        "side": "buy",
-        "orderType": "market",
-        "force": "normal",
-        "quoteOrderQty": f"{quote_usdt:.6f}"
-    }
+# ---- Trading (plain symbol!) ----
+def market_buy(symbol_plain, quote_usdt):
+    payload = {"symbol": symbol_plain, "side": "buy", "orderType": "market", "force": "normal",
+               "quoteOrderQty": f"{quote_usdt:.6f}"}
     resp = _post("/api/spot/v1/trade/orders", payload)
-    if resp.get("code") != "00000":
-        raise Exception(resp.get("msg", "order buy failed"))
+    if resp.get("code") != "00000": raise Exception(resp.get("msg","order buy failed"))
     return resp.get("data", {})
 
-def market_sell(symbol_api, size):
-    payload = {
-        "symbol": symbol_api,
-        "side": "sell",
-        "orderType": "market",
-        "force": "normal",
-        "size": f"{size:.8f}"
-    }
+def market_sell(symbol_plain, size):
+    payload = {"symbol": symbol_plain, "side": "sell", "orderType": "market", "force": "normal",
+               "size": f"{size:.8f}"}
     resp = _post("/api/spot/v1/trade/orders", payload)
-    if resp.get("code") != "00000":
-        raise Exception(resp.get("msg", "order sell failed"))
+    if resp.get("code") != "00000": raise Exception(resp.get("msg","order sell failed"))
     return resp.get("data", {})
 
 # ---- Strategy ----
-last_no_signal = {}
-SYMBOLS = []
+last_no_signal = {}; SYMBOLS=[]
 
-def ema_signal(symbol_api):
-    closes = get_candles(symbol_api, limit=max(EMA_SLOW+10, 60))
-    if len(closes) < EMA_SLOW+1:
-        return {"signal": None, "reason": "Недостаточно данных"}
-    ef = ema(closes, EMA_FAST)
-    es = ema(closes, EMA_SLOW)
+def ema_signal(symbol_plain):
+    closes = get_candles(symbol_plain, limit=max(EMA_SLOW+10, 60))
+    if len(closes) < EMA_SLOW+1: return {"signal": None, "reason": "Недостаточно данных"}
+    ef=ema(closes, EMA_FAST); es=ema(closes, EMA_SLOW)
     if ef[-1] > es[-1] and ef[-2] <= es[-2]:
-        return {"signal": "LONG", "price": closes[-1], "ema": (ef[-1], es[-1])}
-    return {"signal": None, "reason": "Нет сигнала", "ema": (ef[-1], es[-1])}
+        return {"signal":"LONG","price":closes[-1],"ema":(ef[-1],es[-1])}
+    return {"signal":None,"reason":"Нет сигнала","ema":(ef[-1],es[-1])}
 
-# ---- Core loops ----
 def monitor_positions():
-    changed = False
+    changed=False
     for symbol, pos in list(positions.items()):
-        try:
-            price = get_price(symbol)
-        except Exception as e:
-            logging.warning("price check failed %s: %s", symbol, e)
-            continue
-        buy = pos["buy_price"]; qty = pos["qty"]
-        pnl = (price - buy) / buy
-        if pnl >= TP_PCT or pnl <= -SL_PCT:
-            side = "TP" if pnl >= TP_PCT else "SL"
+        try: price=get_price(symbol)
+        except Exception as e: logging.warning("price check failed %s: %s", symbol, e); continue
+        pnl=(price-pos["buy_price"])/pos["buy_price"]
+        if pnl>=TP_PCT or pnl<=-SL_PCT:
+            side="TP" if pnl>=TP_PCT else "SL"
             try:
-                market_sell(symbol, qty)
-                pnl_usdt = price*qty - pos["spent_usdt"]
+                market_sell(symbol, pos["qty"])
+                pnl_usdt = price*pos["qty"] - pos["spent_usdt"]
                 profit["total_usdt"] += pnl_usdt
-                profit["trades"].append({
-                    "symbol": symbol, "side": side,
-                    "buy_price": buy, "sell_price": price,
-                    "qty": qty, "pnl_pct": round(pnl*100,4),
-                    "pnl_usdt": round(pnl_usdt,6), "ts_close": int(time.time()*1000)
-                })
+                profit["trades"].append({"symbol":symbol,"side":side,"buy_price":pos["buy_price"],
+                                         "sell_price":price,"qty":pos["qty"],
+                                         "pnl_pct":round(pnl*100,4),"pnl_usdt":round(pnl_usdt,6),
+                                         "ts_close":int(time.time()*1000)})
                 save_json(PROFIT_FILE, profit)
                 tg(f"✅ {side} по {symbol}\nПродажа ~{price:.6f}\nP/L: {pnl*100:.3f}% ({pnl_usdt:.4f} USDT)\nСумм. прибыль: {profit['total_usdt']:.4f} USDT")
-                positions.pop(symbol, None); changed = True
+                positions.pop(symbol,None); changed=True
             except Exception as e:
-                tg(f"❗ Ошибка продажи {symbol}: {e}")
-                logging.error("sell failed %s: %s", symbol, e)
-    if changed:
-        save_json(POSITIONS_FILE, positions)
+                tg(f"❗ Ошибка продажи {symbol}: {e}"); logging.error("sell failed %s: %s", symbol, e)
+    if changed: save_json(POSITIONS_FILE, positions)
 
 def trade_loop():
     global SYMBOLS, last_no_signal
     SYMBOLS = resolve_symbols(DESIRED)
-    if not SYMBOLS:
-        tg("❗ Не нашёл ни одной спотовой пары на Bitget. Останавливаюсь.")
-        return
-    last_no_signal = {s: 0 for s in SYMBOLS}
-    tg("🤖 Бот запущен (Bitget SPOT, products+candles). Пары: " + ", ".join(SYMBOLS))
+    if not SYMBOLS: tg("❗ Не нашёл ни одной спотовой пары на Bitget."); return
+    last_no_signal = {s:0 for s in SYMBOLS}
+    tg("🤖 Бот запущен (Bitget SPOT, strip _SPBL). Пары: " + ", ".join(SYMBOLS))
 
     while True:
-        start = time.time()
-        try:
-            monitor_positions()
-        except Exception as e:
-            logging.error("monitor error: %s", e)
-
+        start=time.time()
+        try: monitor_positions()
+        except Exception as e: logging.error("monitor error: %s", e)
         for symbol in SYMBOLS:
             try:
-                if symbol in positions:
-                    continue
-                sig = ema_signal(symbol)
-                if sig["signal"] == "LONG":
-                    try:
-                        usdt = get_balance("USDT")
-                    except Exception as e:
-                        tg(f"❗ Ошибка баланса USDT: {e}")
-                        continue
-                    need = TRADE_AMOUNT_USDT
+                if symbol in positions: continue
+                sig=ema_signal(symbol)
+                if sig["signal"]=="LONG":
+                    try: usdt=get_balance("USDT")
+                    except Exception as e: tg(f"❗ Ошибка баланса USDT: {e}"); continue
+                    need=TRADE_AMOUNT_USDT
                     if usdt < need + MIN_BALANCE_BUFFER:
-                        tg(f"ℹ️ Недостаточно USDT для {symbol}. Баланс: {usdt:.4f}, нужно: {need:.2f}.")
-                        continue
+                        tg(f"ℹ️ Недостаточно USDT для {symbol}. Баланс: {usdt:.4f}, нужно: {need:.2f}."); continue
                     try:
-                        market_buy(symbol, need)
-                        time.sleep(0.5)
-                        price = get_price(symbol)
-                        est_qty = (need * (1 - 0.001)) / price
-                        positions[symbol] = {
-                            "qty": float(f"{est_qty:.8f}"),
-                            "buy_price": price,
-                            "spent_usdt": need,
-                            "ts": int(time.time()*1000)
-                        }
+                        market_buy(symbol, need); time.sleep(0.5)
+                        price=get_price(symbol); est_qty=(need*(1-0.001))/price
+                        positions[symbol] = {"qty":float(f\"{est_qty:.8f}\"),"buy_price":price,"spent_usdt":need,"ts":int(time.time()*1000)}
                         save_json(POSITIONS_FILE, positions)
                         tg(f"🟢 Покупка {symbol}\nСумма: {need:.2f} USDT\nЦена ~ {price:.6f}\nEMA9/21: {sig['ema'][0]:.6f} / {sig['ema'][1]:.6f}")
                     except Exception as e:
-                        tg(f"❗ Ошибка покупки {symbol}: {e}")
-                        logging.error("buy failed %s: %s", symbol, e)
+                        tg(f"❗ Ошибка покупки {symbol}: {e}"); logging.error("buy failed %s: %s", symbol, e)
                 else:
-                    now = time.time()
-                    if now - last_no_signal.get(symbol, 0) > NO_SIGNAL_INTERVAL:
-                        last_no_signal[symbol] = now
+                    now=time.time()
+                    if now - last_no_signal.get(symbol,0) > NO_SIGNAL_INTERVAL:
+                        last_no_signal[symbol]=now
                         tg(f"ℹ️ По {symbol} сейчас нет сигнала. EMA9/21: {sig['ema'][0]:.6f} / {sig['ema'][1]:.6f}")
             except Exception as e:
                 logging.error("loop symbol %s error: %s", symbol, e)
-
         time.sleep(max(1, CHECK_INTERVAL - int(time.time()-start)))
 
 # ---- Flask ----
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
-def home():
-    return "Bitget SPOT bot (products + candles) is running", 200
+def home(): return "Bitget SPOT bot (strip _SPBL) is running", 200
 
 @app.route("/profit", methods=["GET"])
 def profit_status():
@@ -318,10 +256,7 @@ def profit_status():
     return {"total_usdt": p.get("total_usdt", 0.0), "trades": p.get("trades", [])}, 200
 
 def run_flask():
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    port=int(os.getenv("PORT","8000")); app.run(host="0.0.0.0", port=port)
 
-if __name__ == "__main__":
-    t = threading.Thread(target=trade_loop, daemon=True)
-    t.start()
-    run_flask()
+if __name__=="__main__":
+    t=threading.Thread(target=trade_loop, daemon=True); t.start(); run_flask()
