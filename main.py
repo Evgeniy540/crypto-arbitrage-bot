@@ -1,4 +1,4 @@
-# === main.py (SPOT candles endpoint fix) — EMA 9/21, TP +1.5%, SL -1.0% ===
+# === main.py (Bitget SPOT final: products + candles) — EMA 9/21, TP +1.5%, SL -1.0% ===
 import os, time, hmac, hashlib, base64, json, threading, logging
 from flask import Flask
 import requests
@@ -114,59 +114,37 @@ def period_str(sec):
     mapping = {1:"1min",3:"3min",5:"5min",15:"15min",30:"30min",60:"1hour",240:"4hour",1440:"1day"}
     return mapping.get(m, "5min")
 
-# ---- Discover spot symbols ----
-def fetch_spot_symbols():
-    resp = _get("/api/spot/v1/market/symbols")
+# ---- Discover spot symbols via /public/products ----
+def fetch_spot_products():
+    resp = _get("/api/spot/v1/public/products")
     if resp.get("code") != "00000":
-        raise Exception("cannot fetch spot symbols: " + str(resp))
-    arr = resp.get("data", [])
-    symbols = set()
-    by_pair = {}
-    for d in arr:
-        sym = d.get("symbol") or ""
-        base = d.get("baseCoin") or ""
-        quote = d.get("quoteCoin") or ""
-        if sym:
-            symbols.add(sym)
-        key = (base + quote).upper()
-        if key and sym:
-            by_pair[key] = sym
-    return symbols, by_pair
+        raise Exception("cannot fetch products: " + str(resp))
+    return resp.get("data", [])
 
 def resolve_symbols(desired_list):
-    symbols, by_pair = fetch_spot_symbols()
+    products = fetch_spot_products()
+    by_symbol = {p.get("symbol","").upper(): p for p in products}
+    by_pair = {( (p.get("baseCoin","")+p.get("quoteCoin","")).upper() ): p for p in products}
     resolved = []
     missed = []
     for want in desired_list:
         key = want.upper()
-        sym = None
-        if key in symbols:
-            sym = key
-        elif key in by_pair:
-            sym = by_pair[key]
-        else:
-            # try direct ticker
-            try:
-                r = _get("/api/spot/v1/market/ticker", params={"symbol": key})
-                if r.get("code") == "00000":
-                    sym = key
-            except Exception:
-                pass
-        if sym:
-            resolved.append(sym)
+        p = by_symbol.get(key) or by_pair.get(key)
+        if p and p.get("symbol"):
+            resolved.append(p["symbol"].upper())
         else:
             missed.append(want)
     if missed:
-        tg("⚠️ Не найдено в SPOT: " + ", ".join(missed))
+        tg("⚠️ Не нашёл пары в SPOT: " + ", ".join(missed))
     return resolved
 
-# ---- Market data (use /candles with period) ----
+# ---- Market data ----
 def get_candles(symbol_api, limit=120):
     p = period_str(TIMEFRAME_SEC)
     resp = _get("/api/spot/v1/market/candles",
                 params={"symbol": symbol_api, "period": p, "limit": str(max(limit, EMA_SLOW+1))})
     if resp.get("code") != "00000":
-        # fallback: try granularity in seconds
+        # fallback to granularity seconds
         r2 = _get("/api/spot/v1/market/candles",
                   params={"symbol": symbol_api, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
         if r2.get("code") != "00000":
@@ -277,7 +255,7 @@ def trade_loop():
         tg("❗ Не нашёл ни одной спотовой пары на Bitget. Останавливаюсь.")
         return
     last_no_signal = {s: 0 for s in SYMBOLS}
-    tg("🤖 Бот запущен (Bitget SPOT, candles/period). Пары: " + ", ".join(SYMBOLS))
+    tg("🤖 Бот запущен (Bitget SPOT, products+candles). Пары: " + ", ".join(SYMBOLS))
 
     while True:
         start = time.time()
@@ -332,7 +310,7 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bitget SPOT bot (candles/period) is running", 200
+    return "Bitget SPOT bot (products + candles) is running", 200
 
 @app.route("/profit", methods=["GET"])
 def profit_status():
