@@ -1,9 +1,9 @@
-# === main.py v2.3 (Bitget SPOT: авто-тикеры + устойчивый фетч свечей) ===
+# === main.py v2.4 (Bitget SPOT, granularity-only, _SPBL) ===
 import time, threading, os, logging, requests
 from datetime import datetime, timezone
 from flask import Flask
 
-# ---------- TELEGRAM ----------
+# ----- TELEGRAM -----
 TELEGRAM_TOKEN   = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 
@@ -11,39 +11,40 @@ def tg_send(text: str):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=10
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10
         )
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-# ---------- ЛОГИ ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("signals-v2.3")
+# ----- ПАРАМЕТРЫ -----
+SYMBOLS = [
+    "BTCUSDT_SPBL","ETHUSDT_SPBL","SOLUSDT_SPBL","XRPUSDT_SPBL",
+    "TRXUSDT_SPBL","DOGEUSDT_SPBL","PEPEUSDT_SPBL","BGBUSDT_SPBL"
+]
+G_5M = 300       # 5 минут
+G_1H = 3600      # 1 час
 
-# ---------- ЖЕЛАЕМЫЕ ПАРЫ (базовые названия) ----------
-WANTED = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","DOGEUSDT","PEPEUSDT","BGBUSDT"]
-
-# ---------- НАСТРОЙКИ СТРАТЕГИИ ----------
-PERIOD_5M = "5min"
-PERIOD_1H = "1hour"
 EMA_FAST = 9
 EMA_SLOW = 21
 RSI_PERIOD = 14
 VOL_MA = 20
 VOL_SPIKE_K = 1.2
+
 TP_PCT = 0.005   # 0.5%
 SL_PCT = 0.004   # 0.4%
+
 CHECK_EVERY_SEC = 30
 PER_SYMBOL_COOLDOWN = 60 * 20
 GLOBAL_OK_COOLDOWN  = 60 * 60
 
-# ---------- ENDPOINTS ----------
+BITGET_SPOT_CANDLES = "https://api.bitget.com/api/spot/v1/market/candles"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-SPOT_CANDLES = "https://api.bitget.com/api/spot/v1/market/candles"
-SPOT_PRODUCTS = "https://api.bitget.com/api/spot/v1/public/products"
 
-# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
+# ----- ЛОГИ -----
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("signals-v2.4")
+
+# ----- ИНДИКАТОРЫ -----
 def ema(values, period):
     if len(values) < period: return []
     k = 2 / (period + 1)
@@ -67,136 +68,34 @@ def rsi(values, period=14):
     for i in range(period+1, len(values)):
         ch = values[i] - values[i-1]
         gain = max(ch,0.0); loss = abs(min(ch,0.0))
-        avg_gain = (avg_gain*(period-1) + gain)/period
-        avg_loss = (avg_loss*(period-1) + loss)/period
+        avg_gain = (avg_gain*(period-1)+gain)/period
+        avg_loss = (avg_loss*(period-1)+loss)/period
         rs = float('inf') if avg_loss==0 else avg_gain/avg_loss
         rsis.append(100 - (100/(1+rs)))
     return rsis
 
-# ---------- АВТО-СПИСОК СИМВОЛОВ ----------
-def load_spot_symbols():
-    """Возвращает dict { 'BTCUSDT': 'BTCUSDT_SPBL', ... } на основе публичного списка продуктов."""
-    try:
-        r = requests.get(SPOT_PRODUCTS, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        items = r.json().get("data", [])
-        # В products Bitget поле symbol уже содержит правильное имя, часто с _SPBL
-        all_symbols = {row["symbol"]: row for row in items if "symbol" in row}
-        mapping = {}
-        for base in WANTED:
-            # точное совпадение
-            if base in all_symbols:
-                mapping[base] = base
-                continue
-            # вариант с _SPBL
-            spbl = f"{base}_SPBL"
-            if spbl in all_symbols:
-                mapping[base] = spbl
-                continue
-            # fallback: ищем первым совпадением по префиксу (например BGBUSDT…)
-            hit = next((s for s in all_symbols.keys() if s.startswith(base)), None)
-            if hit:
-                mapping[base] = hit
-        return mapping
-    except Exception as e:
-        log.error(f"load_spot_symbols error: {e}")
-        # на крайний случай вернём руками проверенные
-        return {
-            "BTCUSDT":"BTCUSDT_SPBL","ETHUSDT":"ETHUSDT_SPBL","SOLUSDT":"SOLUSDT_SPBL",
-            "XRPUSDT":"XRPUSDT_SPBL","TRXUSDT":"TRXUSDT_SPBL","DOGEUSDT":"DOGEUSDT_SPBL",
-            "PEPEUSDT":"PEPEUSDT_SPBL","BGBUSDT":"BGBUSDT_SPBL"
-        }
-
-SYMBOL_MAP = load_spot_symbols()
-SYMBOLS = list(SYMBOL_MAP.values())
-log.info(f"Используемые символы Bitget SPOT: {SYMBOLS}")
-
-# ---------- УСТОЙЧИВЫЙ ФЕТЧ СВЕЧЕЙ ----------
-def _candles_period(symbol: str, period: str, limit: int):
-    params = {"symbol": symbol, "period": period, "limit": str(limit)}
-    r = requests.get(SPOT_CANDLES, params=params, headers=HEADERS, timeout=15)
+# ----- ДАННЫЕ: ТОЛЬКО granularity -----
+def fetch_spot_candles(symbol: str, granularity: int, limit: int = 300):
+    """Возвращает (closes, base_volumes) старые->новые. Использует только granularity."""
+    params = {"symbol": symbol, "granularity": str(granularity), "limit": str(limit)}
+    r = requests.get(BITGET_SPOT_CANDLES, params=params, headers=HEADERS, timeout=15)
     r.raise_for_status()
-    return r.json().get("data", [])
-
-def _candles_granularity(symbol: str, gran: int, limit: int):
-    # На некоторых кластерах Bitget старый параметр granularity тоже работает
-    params = {"symbol": symbol, "granularity": str(gran), "limit": str(limit)}
-    r = requests.get(SPOT_CANDLES, params=params, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    return r.json().get("data", [])
-
-def fetch_spot_candles_smart(symbol: str, tf: str, limit: int = 300, log_once=True):
-    """
-    Пробуем несколько комбинаций:
-    1) symbol (как есть) + period
-    2) без _SPBL + period
-    3) с _SPBL + period
-    4) symbol + granularity (секунды)
-    Возвращает (closes, base_volumes) старые->новые. Если пусто — [].
-    """
-    tried = []
-    def norm(data):
-        rows = []
-        for row in data:
-            # [ts, open, high, low, close, baseVol, quoteVol]
-            try:
-                rows.append((int(row[0]), float(row[4]), float(row[5]) if len(row)>5 else 0.0))
-            except Exception:
-                pass
-        rows.sort(key=lambda x: x[0])
-        return [c for _,c,_ in rows], [v for *_,v in rows]
-
-    # 1) как есть
-    try:
-        d = _candles_period(symbol, tf, limit); tried.append(f"period({symbol})")
-        closes, vols = norm(d)
-        if closes: 
-            if log_once: log.info(f"{symbol}: OK period tf={tf}")
-            return closes, vols
-    except Exception as e:
-        if log_once: log.error(f"{symbol} period error: {e}")
-
-    # 2) без _SPBL
-    base = symbol.replace("_SPBL","")
-    if base != symbol:
+    data = r.json().get("data", [])
+    rows = []
+    for row in data:
+        # [ts, open, high, low, close, baseVol, quoteVol]
         try:
-            d = _candles_period(base, tf, limit); tried.append(f"period({base})")
-            closes, vols = norm(d)
-            if closes:
-                if log_once: log.info(f"{symbol}→{base}: OK period tf={tf}")
-                return closes, vols
-        except Exception as e:
-            if log_once: log.error(f"{base} period error: {e}")
+            rows.append((int(row[0]), float(row[4]), float(row[5]) if len(row)>5 else 0.0))
+        except Exception:
+            pass
+    rows.sort(key=lambda x: x[0])
+    closes = [c for _,c,_ in rows]
+    vols   = [v for *_,v in rows]
+    return closes, vols
 
-    # 3) c _SPBL
-    spbl = base + "_SPBL" if "_SPBL" not in symbol else symbol
-    try:
-        d = _candles_period(spbl, tf, limit); tried.append(f"period({spbl})")
-        closes, vols = norm(d)
-        if closes:
-            if log_once: log.info(f"{symbol}→{spbl}: OK period tf={tf}")
-            return closes, vols
-    except Exception as e:
-        if log_once: log.error(f"{spbl} period error: {e}")
-
-    # 4) granularity (секунды)
-    gran = 300 if tf=="5min" else 3600
-    try:
-        d = _candles_granularity(symbol, gran, limit); tried.append(f"gran({symbol})")
-        closes, vols = norm(d)
-        if closes:
-            if log_once: log.info(f"{symbol}: OK granularity={gran}")
-            return closes, vols
-    except Exception as e:
-        if log_once: log.error(f"{symbol} granularity error: {e}")
-
-    if log_once:
-        log.warning(f"{symbol}: пустые свечи, пробовали: {', '.join(tried)}")
-    return [], []
-
-# ---------- ЛОГИКА СИГНАЛОВ ----------
-last_signal_side = {}
-last_signal_ts   = {}
+# ----- ЛОГИКА СИГНАЛОВ -----
+last_signal_side = {s: None for s in SYMBOLS}
+last_signal_ts   = {s: 0 for s in SYMBOLS}
 last_no_signal_sent = 0
 
 def pct(x): return f"{x*100:.2f}%"
@@ -209,12 +108,17 @@ def price_levels(price, direction):
     return round(tp,6), round(sl,6)
 
 def analyze_symbol(sym: str):
-    closes5, vols5 = fetch_spot_candles_smart(sym, PERIOD_5M, 300)
+    closes5, vols5 = fetch_spot_candles(sym, G_5M, 300)
     if len(closes5) < max(EMA_SLOW+2, RSI_PERIOD+2, VOL_MA+2): return None
 
-    ema9_5, ema21_5, rsi5 = ema(closes5, EMA_FAST), ema(closes5, EMA_SLOW), rsi(closes5, RSI_PERIOD)
-    f_prev, s_prev, f_cur, s_cur = ema9_5[-2], ema21_5[-2], ema9_5[-1], ema21_5[-1]
-    rsi_cur, price = rsi5[-1], closes5[-1]
+    ema9_5  = ema(closes5, EMA_FAST)
+    ema21_5 = ema(closes5, EMA_SLOW)
+    rsi5    = rsi(closes5, RSI_PERIOD)
+
+    f_prev, s_prev = ema9_5[-2], ema21_5[-2]
+    f_cur,  s_cur  = ema9_5[-1], ema21_5[-1]
+    rsi_cur = rsi5[-1]
+    price   = closes5[-1]
     if any(v is None for v in (f_prev, s_prev, f_cur, s_cur, rsi_cur)): return None
 
     # объём
@@ -224,17 +128,21 @@ def analyze_symbol(sym: str):
     else:
         vol_spike = False
 
+    # кроссы по ЗАКРЫТОЙ свече
     bull_cross = (f_prev <= s_prev) and (f_cur > s_cur)
     bear_cross = (f_prev >= s_prev) and (f_cur < s_cur)
 
-    closes1h, _ = fetch_spot_candles_smart(sym, PERIOD_1H, 200, log_once=False)
+    # тренд по 1h
+    closes1h, _ = fetch_spot_candles(sym, G_1H, 200)
     if len(closes1h) < EMA_SLOW + 1: return None
-    ema9_1h, ema21_1h = ema(closes1h, EMA_FAST), ema(closes1h, EMA_SLOW)
+    ema9_1h  = ema(closes1h, EMA_FAST)
+    ema21_1h = ema(closes1h, EMA_SLOW)
     t_fast, t_slow = ema9_1h[-1], ema21_1h[-1]
     if any(v is None for v in (t_fast, t_slow)): return None
 
     uptrend, downtrend = t_fast > t_slow, t_fast < t_slow
     long_ok, short_ok = (45 <= rsi_cur <= 65), (35 <= rsi_cur <= 55)
+
     long_signal  = bull_cross and uptrend and long_ok
     short_signal = bear_cross and downtrend and short_ok
     if not (long_signal or short_signal): return None
@@ -252,12 +160,16 @@ def analyze_symbol(sym: str):
     }
 
 def run_loop():
-    global last_no_signal_sent, last_signal_side, last_signal_ts
-    last_signal_side = {s: None for s in SYMBOLS}
-    last_signal_ts   = {s: 0 for s in SYMBOLS}
+    global last_no_signal_sent
+    tg_send("🤖 Signals v2.4 запущен (SPOT, granularity). TF: 5m/1h. TP 0.5% / SL 0.4%.")
 
-    tg_send("🤖 Signals v2.3 запущен: авто-тикеры Bitget + устойчивые свечи. TP 0.5% / SL 0.4%.")
-    time.sleep(1)
+    # быстрая проверка данных на старте
+    for s in SYMBOLS:
+        try:
+            c,_ = fetch_spot_candles(s, G_5M, 50)
+            log.info(f"{s}: свечей(5m)={len(c)} пример={c[-3:]}")  # должно быть > 0
+        except Exception as e:
+            log.error(f"{s} start fetch error: {e}")
 
     while True:
         try:
@@ -290,16 +202,17 @@ def run_loop():
             if not any_signal and now - last_no_signal_sent >= GLOBAL_OK_COOLDOWN:
                 last_no_signal_sent = now
                 tg_send("ℹ️ Пока без новых сигналов. Проверяю рынок…")
+
         except Exception as e:
             log.exception(f"Loop error: {e}")
 
         time.sleep(CHECK_EVERY_SEC)
 
-# ---------- FLASK ----------
+# ----- FLASK -----
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "Signals v2.3 running (SPOT). UTC: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return "Signals v2.4 running (SPOT). UTC: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 def start_loop():
     threading.Thread(target=run_loop, daemon=True).start()
