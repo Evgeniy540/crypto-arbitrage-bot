@@ -1,4 +1,4 @@
-# === main.py (SPOT, history-candles fix) — EMA 9/21, TP +1.5%, SL -1.0% ===
+# === main.py (SPOT auto-symbol discovery) — EMA 9/21, TP +1.5%, SL -1.0% ===
 import os, time, hmac, hashlib, base64, json, threading, logging
 from flask import Flask
 import requests
@@ -12,7 +12,9 @@ TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 
 # -------- SETTINGS --------
-SYMBOLS = ["BTCUSDT_SPBL","ETHUSDT_SPBL","SOLUSDT_SPBL","XRPUSDT_SPBL","TRXUSDT_SPBL"]
+# Желаемые пары в привычном виде (без суффиксов) — бот сам найдёт правильные символы Bitget SPOT
+DESIRED = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT"]
+
 TIMEFRAME_SEC = 300   # 5m
 EMA_FAST = 9
 EMA_SLOW = 21
@@ -109,20 +111,71 @@ def ema(series, period):
         out.append(e)
     return out
 
-# ---- Market data (SPOT with history-candles) ----
-def get_candles(symbol_spbl, limit=120):
+# ---- Discover spot symbols ----
+def fetch_spot_symbols():
+    """Return dicts:
+       - symbols: set of valid spot symbol strings (e.g., 'BTCUSDT')
+       - by_pair: map 'BASEQUOTE' -> symbol from API (exact) for convenience
+    """
+    resp = _get("/api/spot/v1/market/symbols")
+    if resp.get("code") != "00000":
+        raise Exception("cannot fetch spot symbols: " + str(resp))
+    arr = resp.get("data", [])
+    symbols = set()
+    by_pair = {}
+    for d in arr:
+        sym = d.get("symbol") or ""
+        base = d.get("baseCoin") or ""
+        quote = d.get("quoteCoin") or ""
+        if sym:
+            symbols.add(sym)
+        key = (base + quote).upper()
+        if key and sym:
+            by_pair[key] = sym
+    return symbols, by_pair
+
+def resolve_symbols(desired_list):
+    """Map desired ['BTCUSDT', ...] to actual API symbols. Fallback tries simple and _SPBL."""
+    symbols, by_pair = fetch_spot_symbols()
+    resolved = []
+    errors = []
+    for want in desired_list:
+        key = want.upper()
+        sym = None
+        if key in symbols:
+            sym = key
+        elif key in by_pair:
+            sym = by_pair[key]
+        else:
+            # last resort, try price ticker to see what works
+            try:
+                r = _get("/api/spot/v1/market/ticker", params={"symbol": key})
+                if r.get("code") == "00000":
+                    sym = key
+            except Exception:
+                pass
+        if not sym:
+            errors.append(want)
+        else:
+            resolved.append(sym)
+    if errors:
+        tg("⚠️ Не удалось найти SPOT символы: " + ", ".join(errors))
+    return resolved
+
+# ---- Market data (use resolved API symbol) ----
+def get_candles(symbol_api, limit=120):
     resp = _get("/api/spot/v1/market/history-candles",
-                params={"symbol": symbol_spbl, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
+                params={"symbol": symbol_api, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
     if resp.get("code") != "00000":
         raise Exception(resp.get("msg", resp))
     rows = resp.get("data", [])
     rows.reverse()
     return [float(r[4]) for r in rows]
 
-def get_price(symbol_spbl):
-    resp = _get("/api/spot/v1/market/ticker", params={"symbol": symbol_spbl})
+def get_price(symbol_api):
+    resp = _get("/api/spot/v1/market/ticker", params={"symbol": symbol_api})
     if resp.get("code") != "00000":
-        r2 = _get("/api/spot/v1/market/tickers", params={"symbol": symbol_spbl})
+        r2 = _get("/api/spot/v1/market/tickers", params={"symbol": symbol_api})
         if r2.get("code") != "00000" or not r2.get("data"):
             raise Exception(f"{resp} | {r2}")
         d = r2["data"][0]
@@ -139,10 +192,10 @@ def get_balance(coin="USDT"):
         return 0.0
     return float(arr[0].get("available", 0.0))
 
-# ---- Trading (SPBL) ----
-def market_buy(symbol_spbl, quote_usdt):
+# ---- Trading ----
+def market_buy(symbol_api, quote_usdt):
     payload = {
-        "symbol": symbol_spbl,
+        "symbol": symbol_api,
         "side": "buy",
         "orderType": "market",
         "force": "normal",
@@ -153,9 +206,9 @@ def market_buy(symbol_spbl, quote_usdt):
         raise Exception(resp.get("msg", "order buy failed"))
     return resp.get("data", {})
 
-def market_sell(symbol_spbl, size):
+def market_sell(symbol_api, size):
     payload = {
-        "symbol": symbol_spbl,
+        "symbol": symbol_api,
         "side": "sell",
         "orderType": "market",
         "force": "normal",
@@ -167,12 +220,11 @@ def market_sell(symbol_spbl, size):
     return resp.get("data", {})
 
 # ---- Strategy ----
-last_no_signal = {s: 0 for s in SYMBOLS}
-TP_PCT_F = TP_PCT
-SL_PCT_F = SL_PCT
+last_no_signal = {}
+SYMBOLS = []  # will be resolved at runtime
 
-def ema_signal(symbol_spbl):
-    closes = get_candles(symbol_spbl, limit=max(EMA_SLOW+10, 60))
+def ema_signal(symbol_api):
+    closes = get_candles(symbol_api, limit=max(EMA_SLOW+10, 60))
     if len(closes) < EMA_SLOW+1:
         return {"signal": None, "reason": "Недостаточно данных"}
     ef = ema(closes, EMA_FAST)
@@ -192,8 +244,8 @@ def monitor_positions():
             continue
         buy = pos["buy_price"]; qty = pos["qty"]
         pnl = (price - buy) / buy
-        if pnl >= TP_PCT_F or pnl <= -SL_PCT_F:
-            side = "TP" if pnl >= TP_PCT_F else "SL"
+        if pnl >= TP_PCT or pnl <= -SL_PCT:
+            side = "TP" if pnl >= TP_PCT else "SL"
             try:
                 market_sell(symbol, qty)
                 pnl_usdt = price*qty - pos["spent_usdt"]
@@ -214,7 +266,15 @@ def monitor_positions():
         save_json(POSITIONS_FILE, positions)
 
 def trade_loop():
-    tg("🤖 Бот запущен (Bitget SPOT history-candles, EMA 9/21, TP +1.5%, SL -1.0%).")
+    global SYMBOLS, last_no_signal
+    # Resolve symbols at startup
+    SYMBOLS = resolve_symbols(DESIRED)
+    if not SYMBOLS:
+        tg("❗ Не нашёл ни одной спотовой пары на Bitget. Останавливаюсь.")
+        return
+    last_no_signal = {s: 0 for s in SYMBOLS}
+    tg("🤖 Бот запущен (Bitget SPOT auto-symbols). Пары: " + ", ".join(SYMBOLS))
+
     while True:
         start = time.time()
         try:
@@ -268,7 +328,7 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bitget SPOT bot (history-candles) is running", 200
+    return "Bitget SPOT bot (auto-symbols) is running", 200
 
 @app.route("/profit", methods=["GET"])
 def profit_status():
