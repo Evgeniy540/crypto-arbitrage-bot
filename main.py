@@ -1,10 +1,6 @@
-# === main.py (HARD-CODED KEYS) — Bitget SPOT, EMA 9/21, TP +1.5%, SL -1.0% ===
-# ВНИМАНИЕ: В этом файле ключи зашиты в коде по просьбе пользователя.
-# Не выкладывайте его публично. Рекомендуется хранить в приватном репозитории.
-
+# === main.py (HARD-CODED KEYS, SPOT FIX) — Bitget SPOT, EMA 9/21, TP +1.5%, SL -1.0% ===
 import os, time, hmac, hashlib, base64, json, threading, logging
-from datetime import datetime, timedelta
-from flask import Flask, request
+from flask import Flask
 import requests
 
 # -------- USER KEYS (HARD-CODED) --------
@@ -20,13 +16,12 @@ SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","PEPEUSDT","BGBUSDT
 TIMEFRAME_SEC = 300   # 5m candles
 EMA_FAST = 9
 EMA_SLOW = 21
-TP_PCT = 0.015     # +1.5%
-SL_PCT = 0.010     # -1.0%
-CHECK_INTERVAL = 30  # seconds between checks
-NO_SIGNAL_INTERVAL = 3600  # once per hour per symbol
-
-TRADE_AMOUNT_USDT = 10.0   # сумма сделки в USDT
-MIN_BALANCE_BUFFER = 0.5   # запас, чтобы не утыкаться в пыль
+TP_PCT = 0.015
+SL_PCT = 0.010
+CHECK_INTERVAL = 30
+NO_SIGNAL_INTERVAL = 3600
+TRADE_AMOUNT_USDT = 10.0
+MIN_BALANCE_BUFFER = 0.5
 
 POSITIONS_FILE = "positions.json"
 PROFIT_FILE = "profit.json"
@@ -35,7 +30,6 @@ LOG_LEVEL = "INFO"
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s | %(levelname)s | %(message)s")
 
-# -------- HTTP helpers --------
 BASE_URL = "https://api.bitget.com"
 
 def _ts():
@@ -82,7 +76,7 @@ def _post(path, payload):
         raise Exception(f"HTTP {r.status_code}: {r.text}")
     return r.json()
 
-# -------- Telegram --------
+# ---- Telegram ----
 def tg(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -91,7 +85,7 @@ def tg(msg):
     except Exception as e:
         logging.error("Telegram error: %s", e)
 
-# -------- Persistence --------
+# ---- Persistence ----
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -106,7 +100,7 @@ def save_json(path, data):
 positions = load_json(POSITIONS_FILE, {})
 profit = load_json(PROFIT_FILE, {"total_usdt": 0.0, "trades": []})
 
-# -------- Indicators --------
+# ---- Indicators ----
 def ema(series, period):
     k = 2/(period+1)
     ema_val = None
@@ -119,34 +113,96 @@ def ema(series, period):
         out.append(ema_val)
     return out
 
-# -------- Market data --------
-def get_candles(symbol, limit=100):
-    try:
-        resp = _get("/api/spot/v1/market/candles", params={"symbol": symbol, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
-        if resp.get("code") != "00000":
-            raise Exception(resp.get("msg", "unknown"))
-        rows = resp.get("data", [])
-        rows.reverse()  # oldest -> newest
-        closes = [float(r[4]) for r in rows]
-        return closes
-    except Exception as e:
-        raise Exception(f"candles error {symbol}: {e}")
+# ---- Symbol helpers (SPOT) ----
+def symbol_variants(symbol):
+    # Try plain and with _SPBL suffix
+    return [symbol, f"{symbol}_SPBL"]
+
+def period_string(sec):
+    m = int(sec/60)
+    mapping = {1:"1min",3:"3min",5:"5min",15:"15min",30:"30min",60:"1hour",240:"4hour",1440:"1day"}
+    return mapping.get(m, "5min")
+
+# ---- Market data (robust for SPOT) ----
+def get_candles(symbol, limit=120):
+    errors = []
+    for sym in symbol_variants(symbol):
+        # Try /candles with granularity
+        try:
+            resp = _get("/api/spot/v1/market/candles",
+                        params={"symbol": sym, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
+            if resp.get("code") == "00000":
+                rows = resp.get("data", [])
+                rows.reverse()
+                closes = [float(r[4]) for r in rows]
+                if closes:
+                    return closes
+            else:
+                errors.append(f"/candles granularity {sym}: {resp}")
+        except Exception as e:
+            errors.append(str(e))
+        # Try /candles with period
+        try:
+            resp = _get("/api/spot/v1/market/candles",
+                        params={"symbol": sym, "period": period_string(TIMEFRAME_SEC), "limit": str(max(limit, EMA_SLOW+1))})
+            if resp.get("code") == "00000":
+                rows = resp.get("data", [])
+                rows.reverse()
+                closes = [float(r[4]) for r in rows]
+                if closes:
+                    return closes
+            else:
+                errors.append(f"/candles period {sym}: {resp}")
+        except Exception as e:
+            errors.append(str(e))
+        # Try /history-candles
+        try:
+            resp = _get("/api/spot/v1/market/history-candles",
+                        params={"symbol": sym, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
+            if resp.get("code") == "00000":
+                rows = resp.get("data", [])
+                rows.reverse()
+                closes = [float(r[4]) for r in rows]
+                if closes:
+                    return closes
+            else:
+                errors.append(f"/history-candles {sym}: {resp}")
+        except Exception as e:
+            errors.append(str(e))
+    raise Exception("candles fetch failed: " + " | ".join(errors))
 
 def get_price(symbol):
-    try:
-        resp = _get("/api/spot/v1/market/ticker", params={"symbol": symbol})
-        if resp.get("code") != "00000":
-            raise Exception(resp.get("msg", "unknown"))
-        data = resp.get("data", {})
-        return float(data.get("lastPr") or data.get("last", 0.0))
-    except Exception as e:
-        raise Exception(f"price error {symbol}: {e}")
+    errors = []
+    for sym in symbol_variants(symbol):
+        try:
+            resp = _get("/api/spot/v1/market/ticker", params={"symbol": sym})
+            if resp.get("code") == "00000":
+                data = resp.get("data", {})
+                if isinstance(data, dict) and (data.get("lastPr") or data.get("last")):
+                    return float(data.get("lastPr") or data.get("last"))
+            else:
+                errors.append(f"/ticker {sym}: {resp}")
+        except Exception as e:
+            errors.append(str(e))
+        try:
+            resp = _get("/api/spot/v1/market/tickers", params={"symbol": sym})
+            if resp.get("code") == "00000":
+                arr = resp.get("data", [])
+                if arr:
+                    d = arr[0]
+                    if d.get("lastPr") or d.get("last"):
+                        return float(d.get("lastPr") or d.get("last"))
+            else:
+                errors.append(f"/tickers {sym}: {resp}")
+        except Exception as e:
+            errors.append(str(e))
+    raise Exception("price fetch failed: " + " | ".join(errors))
 
 def get_balance(coin="USDT"):
     try:
         resp = _get("/api/spot/v1/account/assets", params={"coin": coin}, auth=True)
         if resp.get("code") != "00000":
-            raise Exception(resp.get("msg", "unknown"))
+            raise Exception(resp.get("msg","unknown"))
         data = resp.get("data", [])
         if not data:
             return 0.0
@@ -154,10 +210,10 @@ def get_balance(coin="USDT"):
     except Exception as e:
         raise Exception(f"balance error {coin}: {e}")
 
-# -------- Trading --------
+# ---- Trading ----
 def market_buy(symbol, quote_usdt):
     payload = {
-        "symbol": symbol,
+        "symbol": symbol,  # plain symbol for orders
         "side": "buy",
         "orderType": "market",
         "force": "normal",
@@ -181,17 +237,7 @@ def market_sell(symbol, size):
         raise Exception(resp.get("msg", "order sell failed"))
     return resp.get("data", {})
 
-def get_base_coin(symbol):
-    return symbol.replace("USDT","")
-
-def get_base_balance(symbol):
-    coin = get_base_coin(symbol)
-    return get_balance(coin)
-
-# -------- Strategy --------
-last_no_signal = {s: 0 for s in SYMBOLS}
-
-def check_signal(symbol):
+def ema_signal(symbol):
     closes = get_candles(symbol, limit=max(EMA_SLOW+10, 60))
     if len(closes) < EMA_SLOW+1:
         return {"signal": None, "reason": "Недостаточно данных"}
@@ -199,12 +245,14 @@ def check_signal(symbol):
     es = ema(closes, EMA_SLOW)
     if ef[-1] > es[-1] and ef[-2] <= es[-2]:
         return {"signal": "LONG", "price": closes[-1], "ema": (ef[-1], es[-1])}
-    else:
-        return {"signal": None, "reason": "Нет сигнала", "ema": (ef[-1], es[-1])}
+    return {"signal": None, "reason": "Нет сигнала", "ema": (ef[-1], es[-1])}
+
+# ---- Logic ----
+last_no_signal = {s: 0 for s in SYMBOLS}
 
 def monitor_positions():
-    to_close = []
-    for symbol, pos in positions.items():
+    changed = False
+    for symbol, pos in list(positions.items()):
         try:
             price = get_price(symbol)
         except Exception as e:
@@ -221,24 +269,20 @@ def monitor_positions():
                 pnl_usdt = usdt_value - pos["spent_usdt"]
                 profit["total_usdt"] += pnl_usdt
                 profit["trades"].append({
-                    "symbol": symbol,
-                    "side": side,
+                    "symbol": symbol, "side": side,
                     "buy_price": buy_price, "sell_price": price,
-                    "qty": qty,
-                    "pnl_pct": round(pnl_pct*100, 4),
+                    "qty": qty, "pnl_pct": round(pnl_pct*100, 4),
                     "pnl_usdt": round(pnl_usdt, 6),
                     "ts_close": int(time.time()*1000)
                 })
                 save_json(PROFIT_FILE, profit)
-                tg(f"✅ {side} по {symbol}\nПродажа по ~{price:.6f}\nP/L: {pnl_pct*100:.3f}% ({pnl_usdt:.4f} USDT)\nСумм. прибыль: {profit['total_usdt']:.4f} USDT")
+                tg(f"✅ {side} по {symbol}\nПродажа ~{price:.6f}\nP/L: {pnl_pct*100:.3f}% ({pnl_usdt:.4f} USDT)\nСумм. прибыль: {profit['total_usdt']:.4f} USDT")
+                positions.pop(symbol, None)
+                changed = True
             except Exception as e:
                 tg(f"❗ Ошибка продажи {symbol}: {e}")
                 logging.error("sell failed %s: %s", symbol, e)
-                continue
-            to_close.append(symbol)
-    for s in to_close:
-        positions.pop(s, None)
-    if to_close:
+    if changed:
         save_json(POSITIONS_FILE, positions)
 
 def trade_loop():
@@ -254,7 +298,7 @@ def trade_loop():
             try:
                 if symbol in positions:
                     continue
-                sig = check_signal(symbol)
+                sig = ema_signal(symbol)
                 if sig["signal"] == "LONG":
                     try:
                         usdt = get_balance("USDT")
@@ -269,7 +313,7 @@ def trade_loop():
                         market_buy(symbol, need)
                         time.sleep(0.5)
                         price = get_price(symbol)
-                        est_qty = (need * (1 - 0.001)) / price  # приблизительно после комиссии
+                        est_qty = (need * (1 - 0.001)) / price
                         positions[symbol] = {
                             "qty": float(f"{est_qty:.8f}"),
                             "buy_price": price,
@@ -290,10 +334,9 @@ def trade_loop():
                 logging.error("loop symbol %s error: %s", symbol, e)
 
         elapsed = time.time() - start
-        to_sleep = max(1, CHECK_INTERVAL - int(elapsed))
-        time.sleep(to_sleep)
+        time.sleep(max(1, CHECK_INTERVAL - int(elapsed)))
 
-# -------- Flask (Render keep-alive & profit endpoint) --------
+# ---- Flask ----
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
