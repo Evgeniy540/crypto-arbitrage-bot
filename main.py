@@ -1,8 +1,8 @@
-# === main.py v4.4 (SPOT • fast scalps • TP 0.3% / SL 0.6% • EMA9/21 aggressive • reinvest • one-pos • anti-spam • PnL • selfcheck) ===
+# === main.py v4.4 (SPOT • fast scalps • TP 0.3% / SL 0.6% • EMA9/21 • reinvest • one-pos • anti-spam • Flask) ===
 import os, time, json, hmac, hashlib, base64, logging, threading, requests
 from datetime import datetime, timezone
 from urllib.parse import urlencode
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 # ----- KEYS (ENV приоритет, иначе — ниже) -----
 BITGET_API_KEY        = os.getenv("BITGET_API_KEY",        "bg_ec8a64de58248985f9817cbd3db16977")
@@ -22,9 +22,16 @@ SL_PCT = 0.0060    # -0.60%
 
 CHECK_EVERY_SEC     = 8
 POLL_SECONDS        = 6
-PER_SYMBOL_COOLDOWN = 40
+PER_SYMBOL_COOLDOWN = 40        # между сигналами по одному символу
 GLOBAL_OK_COOLDOWN  = 60*5
 MAX_HOLD_MINUTES    = 30
+
+# ----- Anti-spam / throttling -----
+GLOBAL_BUY_COOLDOWN_SEC = 25     # между любыми покупками
+BALANCE_THROTTLE_SEC    = 15     # не дёргать баланс слишком часто
+_last_global_buy_ts     = 0
+_last_balance_ts        = 0
+_last_balance_cached    = 0.0
 
 # ----- Sizing (REINVEST ON) -----
 TRADE_MODE = os.getenv("TRADE_MODE", "percent")         # "percent" | "fixed"
@@ -34,8 +41,7 @@ MAX_TRADE_USDT = float(os.getenv("MAX_TRADE_USDT", "100.0"))
 TRADE_USDT     = float(os.getenv("TRADE_USDT", "10.0")) # если fixed
 
 AUTO_TRADE = True
-ONLY_ONE_POSITION = True           # реально держим только 1 позицию
-MAX_CONCURRENT_BUYS = 1            # одновременно 1 покупка
+ONLY_ONE_POSITION = True
 
 # ----- Files -----
 POSITIONS_FILE = "positions.json"
@@ -52,31 +58,14 @@ HEADERS_PUB    = {"User-Agent":"Mozilla/5.0"}
 PRICE_FAILS_BEFORE_ALERT = 5
 _price_fail_cnt = {}
 
-# --- buy throttling / anti-spam ---
-BUY_BLOCK_UNTIL = {}   # { "BTCUSDT": 172..(ts) }
-GLOBAL_BUYING    = 0   # грубый счетчик параллельных покупок
-NOTIFY_TS        = {}  # анти-спам по типам сообщений
-
-def now_utc_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
 # ----- Logging / Flask -----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("spot-bot-v4.4")
 app = Flask(__name__)
 
 # ----- Utils -----
-def tg_send(text: str, key: str = None, min_gap_sec: int = 20):
-    """
-    anti-spam: если key указан – не слать одинаковые уведомления чаще, чем раз в min_gap_sec
-    """
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    if key:
-        last = NOTIFY_TS.get(key, 0)
-        if time.time() - last < min_gap_sec:
-            return
-        NOTIFY_TS[key] = time.time()
+def tg_send(text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                       data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
@@ -129,7 +118,6 @@ def _raise_api_error(resp):
         elif code == "40005": hint = "Invalid SIGN (SECRET/PASSPHRASE)"
         elif code == "40015": hint = "IP not allowed (whitelist)"
         elif code == "40741": hint = "No spot permission"
-        elif code == "40014": hint = "Permissions queue / требуется чтение/запись"
         raise RuntimeError(f"Ошибка Bitget {code}: {msg}. {hint}".strip())
 
 def priv_get(path, query=None, timeout=12):
@@ -209,9 +197,16 @@ def qfmt(symbol, x, kind):
 
 # ----- Account & Trading -----
 def get_usdt_available() -> float:
+    global _last_balance_ts, _last_balance_cached
+    now=time.time()
+    if now - _last_balance_ts < BALANCE_THROTTLE_SEC:
+        return _last_balance_cached
     j = priv_get("/api/v2/spot/account/assets", {"coin":"USDT"})
     arr = j.get("data") or []
-    return float(arr[0].get("available","0")) if arr else 0.0
+    val = float(arr[0].get("available","0")) if arr else 0.0
+    _last_balance_cached = val
+    _last_balance_ts = now
+    return val
 
 def place_market_buy(symbol, spend_usdt, tries=3):
     payload = {"symbol":symbol,"side":"buy","orderType":"market",
@@ -257,7 +252,9 @@ def price_levels(price):
 # ----- Positions & PnL -----
 def load_positions(): return load_json(POSITIONS_FILE, {})
 def save_positions(d): save_json(POSITIONS_FILE, d)
-def any_position_open(pos: dict) -> bool: return any(v.get("is_open") for v in pos.values())
+
+def any_position_open(pos: dict) -> bool:
+    return any(v.get("is_open") for v in pos.values())
 
 def register_signal(symbol, entry, tp, sl):
     pos=load_positions()
@@ -275,13 +272,27 @@ def pnl_append(record: dict):
     data["total_pct"] = round(data.get("total_pct",0.0) + record.get("pl_pct",0.0), 6)
     save_json(PNL_FILE, data)
 
-# ----- Buy throttle helpers -----
-def can_buy(symbol: str) -> bool:
-    return time.time() > BUY_BLOCK_UNTIL.get(symbol, 0)
-
-def block_buy(symbol: str, seconds: int):
-    global BUY_BLOCK_UNTIL
-    BUY_BLOCK_UNTIL[symbol] = time.time() + max(1, seconds)
+# ----- Signals (EMA9/21: cross OR trend) -----
+def ema_signal_aggressive(sym):
+    closes = fetch_spot_candles(sym, G5M, 220)
+    if len(closes) < EMA_SLOW+2: return None
+    def _ema(vals, period):
+        if len(vals) < period: return []
+        k=2/(period+1); out=[None]*(period-1)
+        sma=sum(vals[:period])/period; out.append(sma); v=sma
+        for x in vals[period:]: v = x*k + v*(1-k); out.append(v)
+        return out
+    e9, e21 = _ema(closes, EMA_FAST), _ema(closes, EMA_SLOW)
+    f_prev, s_prev, f_cur, s_cur = e9[-2], e21[-2], e9[-1], e21[-1]
+    price = closes[-1]
+    if any(v is None for v in (f_prev, s_prev, f_cur, s_cur)): return None
+    bull_cross = (f_prev <= s_prev) and (f_cur > s_cur)
+    trend_up   = (f_cur > s_cur) and (price > s_cur)
+    if not (bull_cross or trend_up): return None
+    tp, sl = price_levels(price)
+    return {"symbol":sym, "price":float(price), "tp":float(tp), "sl":float(sl),
+            "ema":(round(f_cur,6), round(s_cur,6)),
+            "mode":"cross" if bull_cross else "trend"}
 
 # ----- Sizing (reinvest) -----
 def calc_spend_usdt(symbol: str) -> float:
@@ -295,54 +306,40 @@ def calc_spend_usdt(symbol: str) -> float:
 
 # ----- Buy flow -----
 def try_autobuy(symbol, price_hint, tp_hint, sl_hint):
-    global GLOBAL_BUYING
+    global _last_global_buy_ts
     if not AUTO_TRADE: return
-    if not can_buy(symbol):  # защита от частых повторов по одной паре
-        return
-    if GLOBAL_BUYING >= MAX_CONCURRENT_BUYS:
-        return
-
     pos = load_positions()
-    if ONLY_ONE_POSITION and any_position_open(pos):
-        return
+    if ONLY_ONE_POSITION and any_position_open(pos): return
+
+    now=time.time()
+    if now - _last_global_buy_ts < GLOBAL_BUY_COOLDOWN_SEC:
+        return  # глобальный кулдаун между покупками
 
     spend = calc_spend_usdt(symbol)
     try:
         bal = get_usdt_available()
     except Exception as e:
-        tg_send(f"⚠️ Ошибка баланса: {e}", key="balance_err")
-        block_buy(symbol, 60)
-        return
-
+        tg_send(f"⚠️ Ошибка баланса: {e}"); return
     if bal < spend:
-        tg_send(f"⚠️ Недостаточно USDT ({bal:.2f}) для покупки {symbol} на {spend:.2f} USDT", key=f"nofunds-{symbol}", min_gap_sec=90)
-        # чтобы не засыпало смс — ставим таймаут подольше
-        block_buy(symbol, 180)
+        tg_send(f"⚠️ Недостаточно USDT ({bal:.2f}) для покупки {symbol} на {spend:.2f} USDT")
         return
 
-    GLOBAL_BUYING += 1
     try:
         info = place_market_buy(symbol, spend)
         base_qty  = float(info["baseQty"])
         avg_price = float(info["avgPrice"]) or float(price_hint)
-
-        tp_new, sl_new = price_levels(avg_price)
-        pos[symbol] = {"is_open": True, "symbol":symbol, "side":"LONG",
-                       "entry": float(avg_price), "tp": float(tp_new), "sl": float(sl_new),
-                       "opened_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                       "orderId_buy": info["orderId"], "baseQty": base_qty}
-        save_positions(pos)
-
-        tg_send(f"🟢 BUY {symbol}\nСумма: {spend:.2f} USDT → {base_qty:.8f}\n"
-                f"Средняя: {fmt_price(avg_price)} | TP: {fmt_price(tp_new)} ({pct(TP_PCT)}) | SL: {fmt_price(sl_new)} ({pct(SL_PCT)})")
-        # после реальной покупки — блок короткий, чтобы не схватить 2 подряд
-        block_buy(symbol, 60)
     except Exception as e:
-        tg_send(f"❌ Покупка не выполнена {symbol}: {e}", key=f"buyfail-{symbol}", min_gap_sec=60)
-        # если ошибка на покупку — блокируем дольше
-        block_buy(symbol, 180)
-    finally:
-        GLOBAL_BUYING = max(0, GLOBAL_BUYING - 1)
+        tg_send(f"❌ Покупка не выполнена {symbol}: {e}"); return
+
+    _last_global_buy_ts = time.time()
+    tp_new, sl_new = price_levels(avg_price)
+    pos[symbol] = {"is_open": True, "symbol":symbol, "side":"LONG",
+                   "entry": float(avg_price), "tp": float(tp_new), "sl": float(sl_new),
+                   "opened_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                   "orderId_buy": info["orderId"], "baseQty": base_qty}
+    save_positions(pos)
+    tg_send(f"🟢 BUY {symbol}\nСумма: {spend:.2f} USDT → {base_qty:.8f}\n"
+            f"Средняя: {fmt_price(avg_price)} | TP: {fmt_price(tp_new)} ({pct(TP_PCT)}) | SL: {fmt_price(sl_new)} ({pct(SL_PCT)})")
 
 # ----- Close loop -----
 _last_watch = {}
@@ -362,7 +359,7 @@ def check_positions_once():
         # timeout
         try:
             opened_dt = datetime.fromisoformat(p["opened_at"])
-            age_min = (datetime.now(timezone.utc) - opened_dt.replace(tzinfo=timezone.utc)).total_seconds()/60
+            age_min = (datetime.now(timezone.utc) - opened_dt).total_seconds()/60
             if age_min >= MAX_HOLD_MINUTES: reason = "⏱️ TIMEOUT"
         except: pass
 
@@ -372,7 +369,7 @@ def check_positions_once():
             except Exception as e:
                 cnt=_price_fail_cnt.get(symbol,0)+1; _price_fail_cnt[symbol]=cnt
                 if cnt % PRICE_FAILS_BEFORE_ALERT == 0:
-                    tg_send(f"⚠️ Не удаётся получить цену {symbol} уже {cnt} раз.", key=f"pricefail-{symbol}")
+                    tg_send(f"⚠️ Не удаётся получить цену {symbol} уже {cnt} раз.")
                 log.warning(f"[PRICE] {symbol}: fail({cnt}): {e}")
 
         if reason is None and price is not None:
@@ -392,7 +389,7 @@ def check_positions_once():
                 if sell_info.get("avgPrice"): price=float(sell_info["avgPrice"])
             except Exception as e:
                 log.error(f"[SELL ERR] {symbol}: {e}")
-                tg_send(f"⚠️ Ошибка продажи {symbol}: {e}", key=f"sellerr-{symbol}")
+                tg_send(f"⚠️ Ошибка продажи {symbol}: {e}")
 
         p["is_open"]=False
         p["closed_at"]=datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -429,24 +426,9 @@ last_signal_side = {s: None for s in SYMBOLS}
 last_signal_ts   = {s: 0 for s in SYMBOLS}
 last_no_signal_sent=0
 
-def ema_signal_aggressive(sym):
-    closes = fetch_spot_candles(sym, G5M, 220)
-    if len(closes) < EMA_SLOW+2: return None
-    e9, e21 = ema(closes, EMA_FAST), ema(closes, EMA_SLOW)
-    f_prev, s_prev, f_cur, s_cur = e9[-2], e21[-2], e9[-1], e21[-1]
-    price = closes[-1]
-    if any(v is None for v in (f_prev, s_prev, f_cur, s_cur)): return None
-    bull_cross = (f_prev <= s_prev) and (f_cur > s_cur)
-    trend_up   = (f_cur > s_cur) and (price > s_cur)
-    if not (bull_cross or trend_up): return None
-    tp, sl = price_levels(price)
-    return {"symbol":sym, "price":float(price), "tp":float(tp), "sl":float(sl),
-            "ema":(round(f_cur,6), round(s_cur,6)),
-            "mode":"cross" if bull_cross else "trend"}
-
 def run_loop():
     global last_no_signal_sent
-    tg_send("🤖 v4.4 запущен. SPOT. Агрессивные входы. TP+0.30% / SL-0.60%. One-position. Reinvest ON. Anti-spam ON.")
+    tg_send("🤖 v4.4 запущен. SPOT. EMA 9/21. TP +0.30% / SL -0.60%. One-position. Reinvest ON.")
     try: load_symbol_cfg()
     except Exception as e: log.error(f"symbols cfg error: {e}")
 
@@ -466,7 +448,7 @@ def run_loop():
                 now = time.time()
                 if now - last_no_signal_sent >= GLOBAL_OK_COOLDOWN:
                     last_no_signal_sent = now
-                    tg_send("ℹ️ Позиция открыта, мониторю TP/SL…", key="opened-info", min_gap_sec=120)
+                    tg_send("ℹ️ Позиция открыта, мониторю TP/SL…")
                 time.sleep(CHECK_EVERY_SEC); continue
 
             for sym in SYMBOLS:
@@ -489,7 +471,7 @@ def run_loop():
 
             now=time.time()
             if not any_signal and now-last_no_signal_sent>=GLOBAL_OK_COOLDOWN:
-                last_no_signal_sent=now; tg_send("ℹ️ Пока без новых сигналов. Сканирую рынок…", key="idle", min_gap_sec=120)
+                last_no_signal_sent=now; tg_send("ℹ️ Пока без новых сигналов. Сканирую рынок…")
         except Exception as e:
             log.exception(f"Loop error: {e}")
         time.sleep(CHECK_EVERY_SEC)
@@ -497,13 +479,13 @@ def run_loop():
 # ----- Flask -----
 @app.route("/")
 def home():
-    return "Signals v4.4 (SPOT) running. UTC: " + now_utc_str()
+    return "Signals v4.4 (SPOT) running. UTC: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 @app.route("/positions")
 def positions_view():
     try:
         pos = load_positions(); opened = {k:v for k,v in pos.items() if v.get("is_open")}
-        return jsonify({"opened": opened, "server_time_utc": now_utc_str()})
+        return jsonify({"opened": opened, "server_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -518,7 +500,7 @@ def panic_sell(symbol):
         entry = float(p.get("entry", 0))
         pl_pct = ((price - entry)/entry*100.0) if entry else 0.0
         p["is_open"]=False
-        p["closed_at"]=now_utc_str()
+        p["closed_at"]=datetime.now(timezone.utc).isoformat(timespec="seconds")
         p["close_price"]=price
         pos[symbol]=p; save_positions(pos)
         pnl_append({"symbol":symbol,"opened_at":p["opened_at"],"closed_at":p["closed_at"],
@@ -543,6 +525,15 @@ def selfcheck():
 def pnl_view():
     data = load_json(PNL_FILE, {"trades":[], "total_pct":0.0})
     return jsonify(data)
+
+# webhook-заглушка чтобы не было 404
+@app.route("/telegram", methods=["POST"])
+def telegram_webhook():
+    try:
+        _ = request.get_json(force=True, silent=True)
+    except Exception:
+        pass
+    return "ok", 200
 
 def start_loop():
     threading.Thread(target=run_loop, daemon=True).start()
