@@ -207,6 +207,8 @@ def get_balance(coin="USDT"):
     except: return 0.0
 
 def market_buy_quantity(plain, usdt):
+    """Place market buy using quantity. If Bitget returns 45110 (min notional),
+    we retry once with the required minimum notional parsed from the error text."""
     meta=prod(plain)
     if not meta: raise Exception(f"No product meta for {plain}")
     sym=meta["symbol"]; qprec=meta["quantityPrecision"]; minAmt=float(meta.get("minTradeAmount") or 0.0)
@@ -226,8 +228,27 @@ def market_buy_quantity(plain, usdt):
         "quantity": quantize(qty, qprec)
     }
     r=_post("/api/spot/v1/trade/orders", payload)
-    if r.get("code")!="00000": raise Exception(f"{r}")
-    return r.get("data",{}), qty
+    if r.get("code")=="00000":
+        return r.get("data",{}), qty
+    # handle min notional: {'code':'45110','msg':'less than the minimum amount 1 USDT'}
+    if r.get("code")=="45110":
+        import re
+        m=re.search(r"([0-9]+(?:\.[0-9]+)?)\s*USDT", str(r))
+        need=float(m.group(1)) if m else float(meta.get("minTradeAmount") or 1.0)
+        notional=max(usdt, need*1.05)
+        price=get_price(plain)
+        step=10**(-qprec)
+        qty=(int((notional/price)/step))*step
+        if qty<=0:
+            raise Exception(f"min retry computed qty=0 (need={need}, price={price})")
+        payload["quantity"]=quantize(qty, qprec)
+        payload["clientOid"]=str(uuid.uuid4())
+        r2=_post("/api/spot/v1/trade/orders", payload)
+        if r2.get("code")=="00000":
+            tg(f"↩️ Retry with min notional {notional:.4f} USDT accepted for {sym}")
+            return r2.get("data",{}), qty
+        raise Exception(f"retry failed: {r2}")
+    raise Exception(f"{r}")
 
 def market_sell_all(plain, qty):
     meta=prod(plain); sym=meta["symbol"]; qprec=meta["quantityPrecision"]
