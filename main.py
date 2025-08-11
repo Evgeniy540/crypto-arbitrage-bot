@@ -1,4 +1,4 @@
-# === main.py (Bitget SPOT — clean) ===
+# === main.py (Bitget SPOT — *_SPBL everywhere) ===
 import os, time, hmac, hashlib, base64, json, threading, logging
 from flask import Flask
 import requests
@@ -112,17 +112,17 @@ def period_str(sec):
     mapping = {1:"1min",3:"3min",5:"5min",15:"15min",30:"30min",60:"1hour",240:"4hour",1440:"1day"}
     return mapping.get(m, "5min")
 
-def strip_spbl(sym: str) -> str:
-    return sym.replace("_SPBL", "")
-
-# ---- Discover SPOT symbols ----
+# ---- Resolve to *_SPBL via products ----
 def fetch_spot_products():
     resp = _get("/api/spot/v1/public/products")
     if resp.get("code") != "00000":
         raise Exception("cannot fetch products: " + str(resp))
     return resp.get("data", [])
 
-def resolve_symbols(desired):
+def ensure_spbl(symbol: str) -> str:
+    return symbol if symbol.endswith("_SPBL") else (symbol + "_SPBL")
+
+def resolve_symbols_to_spbl(desired):
     products = fetch_spot_products()
     by_symbol = {(p.get("symbol","") or "").upper(): p for p in products}
     by_pair = {((p.get("baseCoin","")+p.get("quoteCoin","")).upper()): p for p in products}
@@ -132,20 +132,24 @@ def resolve_symbols(desired):
         key = want.upper()
         p = by_symbol.get(key) or by_pair.get(key)
         if p and p.get("symbol"):
-            resolved.append(strip_spbl(p["symbol"].upper()))
+            sym = p["symbol"].upper()
+            if not sym.endswith("_SPBL"):
+                sym = ensure_spbl(sym)
+            resolved.append(sym)
         else:
-            missed.append(want)
+            # last resort: attach _SPBL to wanted
+            resolved.append(ensure_spbl(key))
     if missed:
         tg("⚠️ Не нашёл пары в SPOT: " + ", ".join(missed))
     return resolved
 
-# ---- Market data (Spot expects plain symbol, e.g., BTCUSDT) ----
-def get_candles(symbol_plain, limit=120):
+# ---- Market data / trading with *_SPBL ----
+def get_candles(symbol_spbl, limit=120):
     resp = _get("/api/spot/v1/market/candles",
-                params={"symbol": symbol_plain, "period": period_str(TIMEFRAME_SEC), "limit": str(max(limit, EMA_SLOW+1))})
+                params={"symbol": symbol_spbl, "period": period_str(TIMEFRAME_SEC), "limit": str(max(limit, EMA_SLOW+1))})
     if resp.get("code") != "00000":
         r2 = _get("/api/spot/v1/market/candles",
-                  params={"symbol": symbol_plain, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
+                  params={"symbol": symbol_spbl, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
         if r2.get("code") != "00000":
             raise Exception(f"{resp} | {r2}")
         rows = r2.get("data", [])
@@ -154,10 +158,10 @@ def get_candles(symbol_plain, limit=120):
     rows.reverse()
     return [float(r[4]) for r in rows]
 
-def get_price(symbol_plain):
-    r = _get("/api/spot/v1/market/ticker", params={"symbol": symbol_plain})
+def get_price(symbol_spbl):
+    r = _get("/api/spot/v1/market/ticker", params={"symbol": symbol_spbl})
     if r.get("code") != "00000":
-        r2 = _get("/api/spot/v1/market/tickers", params={"symbol": symbol_plain})
+        r2 = _get("/api/spot/v1/market/tickers", params={"symbol": symbol_spbl})
         if r2.get("code") != "00000" or not r2.get("data"):
             raise Exception(f"{r} | {r2}")
         d = r2["data"][0]
@@ -174,10 +178,9 @@ def get_balance(coin="USDT"):
         return 0.0
     return float(arr[0].get("available", 0.0))
 
-# ---- Trading (plain symbol) ----
-def market_buy(symbol_plain, quote_usdt):
+def market_buy(symbol_spbl, quote_usdt):
     payload = {
-        "symbol": symbol_plain,
+        "symbol": symbol_spbl,
         "side": "buy",
         "orderType": "market",
         "force": "normal",
@@ -188,9 +191,9 @@ def market_buy(symbol_plain, quote_usdt):
         raise Exception(resp.get("msg", "order buy failed"))
     return resp.get("data", {})
 
-def market_sell(symbol_plain, size):
+def market_sell(symbol_spbl, size):
     payload = {
-        "symbol": symbol_plain,
+        "symbol": symbol_spbl,
         "side": "sell",
         "orderType": "market",
         "force": "normal",
@@ -205,8 +208,8 @@ def market_sell(symbol_plain, size):
 last_no_signal = {}
 SYMBOLS = []
 
-def ema_signal(symbol_plain):
-    closes = get_candles(symbol_plain, limit=max(EMA_SLOW+10, 60))
+def ema_signal(symbol_spbl):
+    closes = get_candles(symbol_spbl, limit=max(EMA_SLOW+10, 60))
     if len(closes) < EMA_SLOW+1:
         return {"signal": None, "reason": "Недостаточно данных"}
     ef = ema(closes, EMA_FAST)
@@ -252,12 +255,12 @@ def monitor_positions():
 
 def trade_loop():
     global SYMBOLS, last_no_signal
-    SYMBOLS = resolve_symbols(DESIRED)
+    SYMBOLS = resolve_symbols_to_spbl(DESIRED)
     if not SYMBOLS:
         tg("❗ Не нашёл ни одной спотовой пары на Bitget.")
         return
     last_no_signal = {s: 0 for s in SYMBOLS}
-    tg("🤖 Бот запущен (Bitget SPOT, clean). Пары: " + ", ".join(SYMBOLS))
+    tg("🤖 Бот запущен (Bitget SPOT, *_SPBL everywhere). Пары: " + ", ".join(SYMBOLS))
 
     while True:
         start = time.time()
@@ -312,7 +315,7 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bitget SPOT bot (clean) is running", 200
+    return "Bitget SPOT bot (*_SPBL) is running", 200
 
 @app.route("/profit", methods=["GET"])
 def profit_status():
