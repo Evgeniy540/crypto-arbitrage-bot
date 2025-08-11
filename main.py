@@ -1,8 +1,7 @@
-# === main.py (Bitget SPOT — autodetect symbols + dual-format market buy) ===
+# === main.py (Bitget SPOT — dual-buy + more frequent EMA signals) ===
 import os, time, hmac, hashlib, base64, json, threading, logging
 from flask import Flask
 import requests
-from datetime import datetime, timedelta, timezone
 
 # -------- KEYS --------
 BITGET_API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
@@ -14,18 +13,23 @@ TELEGRAM_CHAT_ID = "5723086631"
 
 # -------- SETTINGS --------
 BASE_PAIRS = ["BTCUSDT","ETHUSDT","SOLUSDT","TRXUSDT","XRPUSDT"]
-TIMEFRAME_SEC = 300
+TIMEFRAME_SEC = 300           # 5m
 EMA_FAST = 9
 EMA_SLOW = 21
+THRESHOLD_PCT = 0.0005        # 0.05% EMA gap
+CONFIRM_BARS = 2              # need 2 bars EMA9>EMA21 if no hard cross
+CROSS_LOOKBACK = 3            # look back N bars for a cross
 TP_PCT = 0.015
 SL_PCT = 0.010
 CHECK_INTERVAL = 30
 NO_SIGNAL_INTERVAL = 3600
+ENTRY_COOLDOWN_SEC = 900      # 15 min cooldown per symbol
 TRADE_AMOUNT_USDT = 10.0
 MIN_BALANCE_BUFFER = 0.5
 
 POSITIONS_FILE = "positions.json"
 PROFIT_FILE = "profit.json"
+ENTRY_STATE_FILE = "entry_state.json"  # for cooldown
 LOG_LEVEL = "INFO"
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -37,6 +41,7 @@ BASE_URL = "https://api.bitget.com"
 def _ts(): return str(int(time.time()*1000))
 
 def _sign(timestamp, method, path, body=""):
+    import hashlib, hmac
     msg = f"{timestamp}{method}{path}{body}"
     mac = hmac.new(BITGET_API_SECRET.encode(), msg.encode(), hashlib.sha256).digest()
     return base64.b64encode(mac).decode()
@@ -100,6 +105,7 @@ def save_json(path, data):
 
 positions = load_json(POSITIONS_FILE, {})
 profit = load_json(PROFIT_FILE, {"total_usdt": 0.0, "trades": []})
+entry_state = load_json(ENTRY_STATE_FILE, {})  # {"BTCUSDT": {"last_entry_ts": 0}}
 
 # ---- Discover symbols ----
 PRODUCTS_CACHE = {"ts":0, "map":{}}
@@ -187,29 +193,24 @@ def _place_order(payload):
 
 def market_buy_dual(plain, quote_usdt):
     symbol = ensure_spbl(plain)
-    # Try quoteOrderQty first
     payload_q = {"symbol": symbol, "side":"buy","orderType":"market","force":"normal",
                  "quoteOrderQty": f"{quote_usdt:.6f}"}
     r = _place_order(payload_q)
     if r.get("code") == "00000":
         return r.get("data", {})
-    # If Bitget complains about quantity, try size
-    if r.get("code") in ("40019","40036","33039") or "quantity" in str(r).lower():
-        try:
-            price = get_price(plain)
-        except Exception as e:
-            raise Exception(f"market_buy_dual/get_price failed: {e}")
-        size = max(quote_usdt / price * 0.999, 0.0)  # fee headroom
-        # format size with 8 decimals (Bitget spot accepts up to 8)
-        size_str = f"{size:.8f}".rstrip('0').rstrip('.') if '.' in f"{size:.8f}" else f"{size:.8f}"
-        payload_s = {"symbol": symbol, "side":"buy","orderType":"market","force":"normal",
-                     "size": size_str}
-        r2 = _place_order(payload_s)
-        if r2.get("code") == "00000":
-            return r2.get("data", {})
-        raise Exception(f"market_buy_dual failed: first={r}, second={r2}")
-    else:
-        raise Exception(f"market_buy_dual failed: resp={r}")
+    # Fallback to size
+    try:
+        price = get_price(plain)
+    except Exception as e:
+        raise Exception(f"market_buy_dual/get_price failed: {e}")
+    size = max(quote_usdt / price * 0.999, 0.0)
+    size_str = f"{size:.8f}".rstrip('0').rstrip('.') if '.' in f"{size:.8f}" else f"{size:.8f}"
+    payload_s = {"symbol": symbol, "side":"buy","orderType":"market","force":"normal",
+                 "size": size_str}
+    r2 = _place_order(payload_s)
+    if r2.get("code") == "00000":
+        return r2.get("data", {})
+    raise Exception(f"market_buy_dual failed: first={r}, second={r2}")
 
 def market_sell(plain, size):
     symbol = ensure_spbl(plain)
@@ -229,14 +230,35 @@ def get_balance(coin="USDT"):
 
 # ---- Strategy ----
 def ema_signal(plain):
-    closes = get_candles(plain, limit=EMA_SLOW+60)
+    closes = get_candles(plain, limit=max(EMA_SLOW+60, 100))
     ef=ema(closes, EMA_FAST); es=ema(closes, EMA_SLOW)
-    if ef[-1] > es[-1] and ef[-2] <= es[-2]:
-        return {"signal":"LONG","price":closes[-1],"ema":(ef[-1],es[-1])}
+    # a) strict cross inside last N bars
+    cross=False
+    for i in range(1, min(CROSS_LOOKBACK+1, len(ef))):
+        if ef[-i] > es[-i] and ef[-i-1] <= es[-i-1]:
+            cross=True
+            break
+    # b) soft condition: gap >= threshold for CONFIRM_BARS
+    ok_soft=True
+    for i in range(1, CONFIRM_BARS+1):
+        gap = (ef[-i] - es[-i]) / es[-i]
+        if gap < THRESHOLD_PCT:
+            ok_soft=False; break
+    if cross or ok_soft:
+        return {"signal":"LONG","price":closes[-1],"ema":(ef[-1],es[-1]),"why":"cross" if cross else "gap"}
     return {"signal":None,"reason":"Нет сигнала","ema":(ef[-1],es[-1])}
 
 last_no_signal={}
 SYMBOLS = BASE_PAIRS[:]
+
+def can_enter(sym):
+    st = entry_state.get(sym, {})
+    last_ts = st.get("last_entry_ts", 0)
+    return (time.time() - last_ts) >= ENTRY_COOLDOWN_SEC
+
+def mark_entered(sym):
+    entry_state.setdefault(sym, {})["last_entry_ts"] = time.time()
+    save_json(ENTRY_STATE_FILE, entry_state)
 
 def monitor_positions():
     changed=False
@@ -268,7 +290,7 @@ def run_loop():
     last_no_signal={s:0 for s in SYMBOLS}
     refresh_products()
     sym_map=", ".join([f"{p}->{sym_exact(p)}" for p in SYMBOLS])
-    tg("🤖 Bitget SPOT запущен (dual buy). Пары: " + sym_map)
+    tg("🤖 Bitget SPOT запущен (dual buy + soft EMA). Пары: " + sym_map)
 
     for p in SYMBOLS:
         try:
@@ -284,7 +306,8 @@ def run_loop():
 
         for p in SYMBOLS:
             try:
-                if p in positions: continue
+                if p in positions or not can_enter(p): 
+                    continue
                 try:
                     sig=ema_signal(p)
                 except Exception as e:
@@ -308,7 +331,8 @@ def run_loop():
                                       "buy_price": price, "spent_usdt": need,
                                       "ts": int(time.time()*1000)}
                         save_json(POSITIONS_FILE, positions)
-                        tg(f"🟢 Покупка {p} ({sym_exact(p)})\nСумма: {need:.2f} USDT\nЦена ~ {price:.6f}\nEMA9/21: {sig['ema'][0]:.6f} / {sig['ema'][1]:.6f}")
+                        mark_entered(p)
+                        tg(f"🟢 Покупка {p} ({sym_exact(p)}) [{sig.get('why')}]\nСумма: {need:.2f} USDT\nЦена ~ {price:.6f}\nEMA9/21: {sig['ema'][0]:.6f} / {sig['ema'][1]:.6f}")
                     except Exception as e:
                         tg(f"❗ Ошибка покупки {p}: {e}"); logging.error("buy failed %s: %s", p, e)
                 else:
@@ -327,7 +351,7 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bitget SPOT bot (autodetect + dual-buy) is running", 200
+    return "Bitget SPOT bot (dual-buy + soft EMA) is running", 200
 
 @app.route("/profit", methods=["GET"])
 def profit_status():
