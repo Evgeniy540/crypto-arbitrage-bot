@@ -1,315 +1,288 @@
 # -*- coding: utf-8 -*-
 """
-Bitget SPOT (SPBL) — EMA9/21, покупка по quantity с
-- пред-проверкой минимума ордера (notional и minBaseQty)
-- пред-проверкой баланса (USDT)
-- автоповторами на 40808 (scale) и 45110 (min notional в ответе)
-- мягким сигналом (EMA9 > EMA21 или недавний кросс)
-- TP/SL + кулдаун
+Bitget SPOT (SPBL) EMA9/21 бот с безопасной торговлей:
+- автоподбор точного символа *_SPBL
+- самотест (цена, кол-во свечей)
+- расчёт EMA9/21 и «мягкий» сигнал (не спамит)
+- проверка баланса и мин. ноты (minTradeUSDT)
+- маркет-покупка по quoteAmount (USDT), маркет-продажа по quantity
+- корректное округление (quantityPrecision / pricePrecision)
+- понятные Telegram-уведомления
 
-ENV:
-  BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSPHRASE
-  TG_TOKEN, TG_CHAT (необязательно)
-  TRADE_USDT (дефолт 1.50), TP_PCT (0.015), SL_PCT (0.01)
+Требуемые переменные окружения:
+BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSPHRASE
+TG_TOKEN (необязательно), TG_CHAT_ID (необязательно)
+PAIRS="BTCUSDT,ETHUSDT,SOLUSDT,TRXUSDT,XRPUSDT"  (необязательно)
+EMA_FAST=9  EMA_SLOW=21  INTERVAL=60  (сек, 60=1m, 300=5m)
+BUY_USDT=1.20  MIN_USDT=1.10
+COOL_SEC=30   (анти-спам по каждому символу)
 """
 
-import os, time, hmac, json, math, re, hashlib, base64
-from decimal import Decimal, ROUND_DOWN
+import os, time, hmac, hashlib, base64, json, math, threading
+from datetime import datetime, timezone
+from typing import Dict, Tuple, List
 import requests
 
-# ----------------- настройки -----------------
-PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "TRXUSDT", "XRPUSDT"]
-TIMEFRAME = "1min"
-CANDLES = 60
-EMA_FAST, EMA_SLOW = 9, 21
-SOFT_MARGIN = 0.0005
-COOLDOWN_SEC = 15 * 60
-TRADE_USDT = float(os.getenv("TRADE_USDT", "1.5"))
-TP_PCT = float(os.getenv("TP_PCT", "0.015"))
-SL_PCT = float(os.getenv("SL_PCT", "0.010"))
-
+# ---------- ENV ----------
+API_KEY = os.getenv("BITGET_API_KEY", "")
+API_SECRET = os.getenv("BITGET_API_SECRET", "")
+API_PASS = os.getenv("BITGET_PASSPHRASE", "")
 TG_TOKEN = os.getenv("TG_TOKEN", "")
-TG_CHAT  = os.getenv("TG_CHAT", "")
+TG_CHAT = os.getenv("TG_CHAT_ID", "")
+PAIRS = os.getenv("PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,TRXUSDT,XRPUSDT").split(",")
+EMA_FAST = int(os.getenv("EMA_FAST", "9"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
+INTERVAL = int(os.getenv("INTERVAL", "60"))  # seconds
+BUY_USDT = float(os.getenv("BUY_USDT", "1.20"))
+MIN_USDT = float(os.getenv("MIN_USDT", "1.10"))
+COOL_SEC = int(os.getenv("COOL_SEC", "30"))
 
-BG_KEY = os.getenv("BITGET_API_KEY", "")
-BG_SECRET = os.getenv("BITGET_API_SECRET", "")
-BG_PASS = os.getenv("BITGET_PASSPHRASE", "")
 BASE = "https://api.bitget.com"
 
 session = requests.Session()
-session.headers.update({"Content-Type": "application/json", "locale": "en-US"})
-session.timeout = 20
+session.headers.update({"Content-Type": "application/json"})
 
-def now_ms(): return int(time.time()*1000)
+# ---------- UTILS ----------
+def ts_ms() -> str:
+    # Bitget ждёт ISO8601 с миллисекундами
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-def send_tg(text: str):
-    if not TG_TOKEN or not TG_CHAT: return
+def sign(method: str, path: str, body: str) -> Dict[str, str]:
+    msg = f"{ts_ms()}{method}{path}{body}".encode()
+    mac = hmac.new(API_SECRET.encode(), msg, hashlib.sha256).digest()
+    sig = base64.b64encode(mac).decode()
+    return {
+        "ACCESS-KEY": API_KEY,
+        "ACCESS-SIGN": sig,
+        "ACCESS-TIMESTAMP": ts_ms(),
+        "ACCESS-PASSPHRASE": API_PASS,
+        "Locale": "en-US",
+    }
+
+def tg(msg: str):
+    if not TG_TOKEN or not TG_CHAT:
+        return
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHAT, "text": text})
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": msg, "disable_web_page_preview": True},
+            timeout=8,
+        )
     except Exception:
         pass
 
-# --------------- подпись/вызовы ---------------
-def _sign(ts, method, path, body=""):
-    pre = f"{ts}{method}{path}{body}"
-    digest = hmac.new(BG_SECRET.encode(), pre.encode(), hashlib.sha256).digest()
-    return base64.b64encode(digest).decode()
-
-def _auth(method, path, body=None):
-    if body is None: body = ""
-    elif not isinstance(body, str): body = json.dumps(body, separators=(",", ":"))
-    ts = str(now_ms())
-    headers = {
-        "ACCESS-KEY": BG_KEY,
-        "ACCESS-SIGN": _sign(ts, method.upper(), path, body),
-        "ACCESS-TIMESTAMP": ts,
-        "ACCESS-PASSPHRASE": BG_PASS,
-        "Content-Type": "application/json",
-        "locale": "en-US",
-    }
+def get(path: str, params: dict = None, auth: bool = False):
     url = BASE + path
-    r = session.request(method.upper(), url, data=body if method!="get" else None, headers=headers)
-    r.raise_for_status()
-    try: return r.json()
-    except Exception: return {"code":"HTTP", "raw": r.text}
+    if params:
+        url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+    hdr = {}
+    if auth:
+        hdr = sign("GET", path if not params else f"{path}?"+ "&".join(f"{k}={v}" for k,v in params.items()), "")
+    r = session.get(url, headers=hdr, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+    return r.json()
 
-def jget(url, params=None):
-    r = session.get(url, params=params); r.raise_for_status(); return r.json()
+def post(path: str, data: dict, auth: bool = True):
+    body = json.dumps(data, separators=(",", ":"))
+    hdr = sign("POST", path, body) if auth else {}
+    r = session.post(BASE + path, data=body, headers=hdr, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+    return r.json()
 
-def quantize(val: float, scale: int) -> str:
-    q = Decimal(str(val)).quantize(Decimal('1.' + '0'*scale), rounding=ROUND_DOWN)
-    return f"{q:.{scale}f}"
+# ---------- MARKET META ----------
+class SymMeta:
+    def __init__(self, symbol, base, quote, min_usdt, q_prec, p_prec):
+        self.symbol = symbol            # BTCUSDT_SPBL
+        self.base = base                # BTC
+        self.quote = quote              # USDT
+        self.min_usdt = float(min_usdt) if min_usdt else 1.0
+        self.q_prec = int(q_prec)
+        self.p_prec = int(p_prec)
 
-# --------------- справочники биржи ---------------
-# meta[plain] = {symbol, qtyPrec, minBaseQty, minNotionalUSDT}
-meta = {}
-
-def load_products():
-    """Тянем продукты + попытка определить минимумы."""
-    global meta
-    items = jget(BASE + "/api/spot/v1/public/products").get("data", [])
-    m = {}
-    for it in items:
-        base = it.get("baseCoin") or it.get("base")
-        quote = it.get("quoteCoin") or it.get("quote")
-        if not base or not quote: continue
-        plain = f"{base}{quote}"
-        if plain not in [p for p in PAIRS]:  # plain без _SPBL
+def load_products() -> Dict[str, SymMeta]:
+    data = get("/api/spot/v1/public/products")
+    book = {}
+    for it in data.get("data", []):
+        # интересуют *_SPBL (смесь нескольких ликовых пулов)
+        if not it.get("symbol", "").endswith("_SPBL"):
             continue
-        symbol = it.get("symbol") or f"{plain}_SPBL"
-        qtyPrec = int(it.get("quantityScale") or it.get("quantityPrecision") or 4)
+        # приводим BTCUSDT
+        plain = it["symbol"].replace("_SPBL", "")
+        book[plain] = SymMeta(
+            symbol=it["symbol"],
+            base=it.get("baseCoin"),
+            quote=it.get("quoteCoin"),
+            min_usdt=it.get("minTradeUSDT") or it.get("minTradeUSDTForStrategy") or "1",
+            q_prec=it.get("quantityPrecision", 8),
+            p_prec=it.get("pricePrecision", 8)
+        )
+    return book
 
-        # минималки — что удастся извлечь из разных схем полей
-        minBaseQty = float(it.get("minTradeAmount") or it.get("minOrderAmt") or 0.0)
-        # часть инстансов отдают minNotional (в USDT) — если нет, посчитаем по цене
-        minNotionalUSDT = float(it.get("minTradeUSDT") or it.get("minTradeUsd") or 0.0)
+PRODUCTS = load_products()
 
-        m[plain] = {
-            "symbol": symbol,
-            "qtyPrec": qtyPrec,
-            "minBaseQty": minBaseQty,
-            "minNotionalUSDT": minNotionalUSDT
-        }
-    meta = m
-    send_tg("🔎 Bitget products loaded: " + ", ".join([meta[p]["symbol"] for p in meta]))
+# ---------- DATA ----------
+def candles_spot(symbol_spbl: str, limit=60, granularity=INTERVAL) -> List[float]:
+    # Bitget: /api/spot/v1/market/candles?symbol=BTCUSDT_SPBL&granularity=60&limit=60
+    res = get("/api/spot/v1/market/candles", {
+        "symbol": symbol_spbl, "granularity": granularity, "limit": limit
+    })
+    arr = res.get("data", [])
+    # формат: [[ts, open, high, low, close, volume], ...] (строки)
+    closes = [float(x[4]) for x in sorted(arr, key=lambda z: int(z[0]))]
+    return closes
 
-def last_price(plain):
-    sym = meta[plain]["symbol"]
-    r = jget(BASE + "/api/spot/v1/market/ticker", {"symbol": sym}).get("data", {})
-    return float(r.get("close") or r.get("lastPr") or r.get("last") or 0.0)
-
-def candles_close(plain, limit):
-    sym = meta[plain]["symbol"]
-    data = jget(BASE + "/api/spot/v1/market/candles", {"symbol": sym, "period": TIMEFRAME}).get("data", [])
-    closes = []
-    for row in data[:limit][::-1]:
-        if isinstance(row, dict): closes.append(float(row.get("close")))
-        else: closes.append(float(row[4]))
-    return closes[-limit:]
-
-def ema(vals, n):
-    if len(vals) < n: return None
-    k = 2/(n+1); e = sum(vals[:n])/n
-    for v in vals[n:]: e = v*k + e*(1-k)
+def ema(values: List[float], period: int) -> float:
+    if len(values) < period:
+        return values[-1]
+    k = 2.0 / (period + 1.0)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
     return e
 
-# --------------- баланс и минимумы ---------------
-def get_usdt_balance() -> float:
-    r = _auth("get", "/api/spot/v1/account/assets")
-    if r.get("code") != "00000": return 0.0
-    bal = 0.0
-    for a in r.get("data", []):
-        if (a.get("coin") or a.get("asset")) == "USDT":
-            # в разных ответах поле может называться по-разному
-            free = a.get("available") or a.get("availableAmt") or a.get("free") or "0"
-            try: bal = float(free)
-            except: bal = 0.0
-            break
-    return bal
+def ticker_close(symbol_spbl: str) -> float:
+    # /api/spot/v1/market/tickers?symbol=BTCUSDT_SPBL
+    r = get("/api/spot/v1/market/tickers", {"symbol": symbol_spbl})
+    d = r.get("data", [])
+    if d and "close" in d[0]:
+        return float(d[0]["close"])
+    if d and "lastPr" in d[0]:
+        return float(d[0]["lastPr"])
+    raise RuntimeError("No close price in ticker")
 
-def resolve_min_notional_usdt(plain) -> float:
-    """Пытаемся знать минимальный notional в USDT для пары."""
-    info = meta[plain]
-    notional = float(info.get("minNotionalUSDT") or 0.0)
-    if notional > 0: return notional
-    # fallback: цена * minBaseQty (если есть)
-    minBaseQty = float(info.get("minBaseQty") or 0.0)
-    if minBaseQty > 0:
-        p = max(1e-12, last_price(plain))
-        return minBaseQty * p
-    # крайнюю меру ставим 1 USDT (как часто пишет Bitget)
-    return 1.0
+# ---------- ACCOUNT ----------
+def balance(coin: str) -> float:
+    r = get("/api/spot/v1/account/assets", {"coin": coin}, auth=True)
+    for it in r.get("data", []):
+        if it["coin"].upper() == coin.upper():
+            return float(it.get("available", "0"))
+    return 0.0
 
-# --------------- отправка ордеров ---------------
-def _retry_scale(resp: dict, payload: dict):
-    if resp.get("code") != "40808": return resp
-    m = re.search(r"checkScale\s*=\s*(\d+)", str(resp))
-    if not m: return resp
-    scale = int(m.group(1))
-    q = float(payload.get("quantity", 0))
-    step = 10 ** (-scale)
-    q = math.floor(q / step) * step
-    if q <= 0: return resp
-    payload["quantity"] = quantize(q, scale)
-    send_tg(f"↩️ Retry 40808 scale={scale} qty={payload['quantity']} for {payload.get('symbol')}")
-    return _auth("post", "/api/spot/v1/trade/orders", payload)
+def round_qty(q: float, prec: int) -> float:
+    if prec < 0: prec = 0
+    step = 10 ** prec
+    return math.floor(q * step) / step
 
-def market_buy_quantity(plain: str, want_usdt: float):
-    # пред-проверки
-    min_usdt = resolve_min_notional_usdt(plain)
-    target_usdt = max(want_usdt, min_usdt)
-    bal = get_usdt_balance()
-    if bal < target_usdt:
-        raise Exception(f"Insufficient balance: need ~{target_usdt:.4f} USDT, have {bal:.4f}")
-
-    sym = meta[plain]["symbol"]
-    qprec = int(meta[plain]["qtyPrec"])
-    price = last_price(plain)
-    if price <= 0: raise Exception(f"No price for {plain}")
-
-    qty = float(Decimal(str(target_usdt / price)).quantize(Decimal('1.' + '0'*qprec), rounding=ROUND_DOWN))
-    if qty <= 0: raise Exception(f"Computed qty <= 0 (target_usdt={target_usdt}, price={price})")
-
-    payload = {
-        "symbol": sym,
+# ---------- ORDERS ----------
+def market_buy_by_quote(symbol_spbl: str, meta: SymMeta, quote_usdt: float) -> dict:
+    # Bitget принимает quoteAmount для market BUY
+    body = {
+        "symbol": symbol_spbl,
         "side": "buy",
         "orderType": "market",
         "force": "normal",
-        "clientOid": f"buyq-{sym}-{now_ms()}",
-        "quantity": quantize(qty, qprec),
+        "quoteAmount": f"{quote_usdt:.2f}"
     }
-    r = _auth("post", "/api/spot/v1/trade/orders", payload)
+    return post("/api/spot/v1/trade/orders", body)
 
-    # 45110 — биржа вернула «минимум N USDT»: пробуем подтянуться к нему и повторить один раз
-    if r.get("code") == "45110":
-        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*USDT", str(r))
-        need = float(m.group(1)) if m else min_usdt
-        target2 = max(target_usdt, need)
-        qty2 = float(Decimal(str(target2 / price)).quantize(Decimal('1.' + '0'*qprec), rounding=ROUND_DOWN))
-        if qty2 > 0 and target2 <= bal:
-            payload["quantity"] = quantize(qty2, qprec)
-            send_tg(f"↩️ Retry 45110 -> qty={payload['quantity']} (~{target2:.4f} USDT)")
-            r = _auth("post", "/api/spot/v1/trade/orders", payload)
-        else:
-            raise Exception(f"retry failed: min {need} USDT, balance {bal:.4f}")
-
-    if r.get("code") == "40808":
-        r = _retry_scale(r, payload)
-
-    if r.get("code") != "00000":
-        raise Exception(f"{r}")
-
-    return r.get("data", {}), float(payload["quantity"]), price
-
-def market_sell_all(plain: str, qty: float):
-    sym = meta[plain]["symbol"]; qprec = int(meta[plain]["qtyPrec"])
-    qty = float(Decimal(str(qty)).quantize(Decimal('1.' + '0'*qprec), rounding=ROUND_DOWN))
-    if qty <= 0: raise Exception("Sell qty <= 0")
-    payload = {
-        "symbol": sym, "side": "sell", "orderType": "market", "force": "normal",
-        "clientOid": f"sellq-{sym}-{now_ms()}",
-        "quantity": quantize(qty, qprec),
+def market_sell_by_qty(symbol_spbl: str, qty: float) -> dict:
+    body = {
+        "symbol": symbol_spbl,
+        "side": "sell",
+        "orderType": "market",
+        "force": "normal",
+        "quantity": f"{qty}"
     }
-    r = _auth("post", "/api/spot/v1/trade/orders", payload)
-    if r.get("code") == "40808": r = _retry_scale(r, payload)
-    if r.get("code") != "00000": raise Exception(f"{r}")
-    return r.get("data", {}), float(payload["quantity"])
+    return post("/api/spot/v1/trade/orders", body)
 
-# --------------- стратегия ---------------
-def want_enter(closes):
-    if len(closes) < EMA_SLOW + 2: return False
-    e9, e21 = ema(closes, EMA_FAST), ema(closes, EMA_SLOW)
-    if e9 is None or e21 is None: return False
-    cond_now = e9 > e21 * (1 + SOFT_MARGIN)
-    cross = False
-    if len(closes) >= EMA_SLOW + 3:
-        e9p, e21p = ema(closes[:-1], EMA_FAST), ema(closes[:-1], EMA_SLOW)
-        e9pp, e21pp = ema(closes[:-2], EMA_FAST), ema(closes[:-2], EMA_SLOW)
-        cross = (e9pp is not None and e21pp is not None and e9p is not None and e21p is not None
-                 and e9pp <= e21pp and e9p > e21p)
-    return cond_now or cross
+# ---------- STRATEGY ----------
+last_action_at: Dict[str, float] = {}   # анти-спам
 
-positions = {}  # plain -> {qty, entry}
-cooldown  = {}  # plain -> ts
+def process_pair(plain: str):
+    meta = PRODUCTS.get(plain)
+    if not meta:
+        tg(f"⚠️ Пара {plain} не найдена среди SPBL. Пропуск.")
+        return
 
-def want_exit(plain, last):
-    pos = positions.get(plain); if not pos: return False, ""
-    entry = pos["entry"]
-    if last >= entry * (1 + TP_PCT): return True, "TP"
-    if last <= entry * (1 - SL_PCT): return True, "SL"
-    return False, ""
-
-def cycle(plain):
+    symbol = meta.symbol
+    # Самотест
     try:
-        if plain not in meta: return
-        closes = candles_close(plain, CANDLES)
-        if not closes: send_tg(f"ℹ️ Пропуск {plain}: нет свечей"); return
-        e9, e21, last = ema(closes, EMA_FAST), ema(closes, EMA_SLOW), closes[-1]
-        send_tg(f"ℹ️ {plain}: EMA9/21 {e9:.6f} / {e21:.6f}")
-
-        # выход
-        pos = positions.get(plain)
-        if pos:
-            ok, why = want_exit(plain, last)
-            if ok:
-                try:
-                    _, sold = market_sell_all(plain, pos["qty"])
-                    send_tg(f"✅ SELL {plain} ({why}) qty={sold}")
-                except Exception as ex:
-                    send_tg(f"❗ Sell error {plain}: {ex}")
-                finally:
-                    positions.pop(plain, None)
-                    cooldown[plain] = time.time()
-            return  # одна позиция на пару одновременно
-
-        # вход
-        if time.time() - cooldown.get(plain, 0) < COOLDOWN_SEC: return
-        if want_enter(closes):
-            try:
-                data, qty, price = market_buy_quantity(plain, TRADE_USDT)
-                positions[plain] = {"qty": qty, "entry": price}
-                send_tg(f"🟢 BUY {plain}: qty={qty}, price={price}")
-            except Exception as ex:
-                send_tg(f"❗ Buy error {plain}: {ex}")
-
+        closes = candles_spot(symbol, limit=EMA_SLOW+30)
     except Exception as e:
-        send_tg(f"❗ Cycle error {plain}: {e}")
+        tg(f"❗ Ошибка свечей {plain}: {e}")
+        return
+    if len(closes) < EMA_SLOW + 1:
+        tg(f"ℹ️ По {plain} мало свечей: {len(closes)}")
+        return
 
-def main():
-    if not (BG_KEY and BG_SECRET and BG_PASS):
-        print("⚠️ BITGET_API_* envs missing"); return
-    load_products()
-    enabled = [p for p in PAIRS if p in meta]
-    send_tg("🤖 Bitget SPOT (soft EMA, pre-checks) пары: " + ", ".join(meta[p]["symbol"] for p in enabled))
+    fast = ema(closes[-120:], EMA_FAST)
+    slow = ema(closes[-120:], EMA_SLOW)
+    last = closes[-1]
+
+    tg(f"ℹ️ {plain}: EMA{EMA_FAST}/{EMA_SLOW}: {fast:.6f} / {slow:.6f} (last={last:.6f})")
+
+    now = time.time()
+    if now - last_action_at.get(plain, 0) < COOL_SEC:
+        return
+
+    # Условие входа (пример: мягкий «перекрест»)
+    want_buy = last > fast > slow
+    want_sell = last < slow < fast  # простой обратный
+
+    # BUY
+    if want_buy:
+        usdt_avail = balance("USDT")
+        lot = max(BUY_USDT, meta.min_usdt, MIN_USDT)
+        if usdt_avail < lot:
+            tg(f"ℹ️ Недостаточно USDT для {plain}. Нужно ≥ {lot:.2f}, есть {usdt_avail:.2f}")
+            last_action_at[plain] = now
+            return
+        try:
+            r = market_buy_by_quote(symbol, meta, lot)
+            if r.get("code") == "00000":
+                tg(f"✅ Покупка {plain} на {lot:.2f} USDT: OK")
+            else:
+                tg(f"❗ Ошибка покупки {plain}: {r}")
+        except Exception as e:
+            tg(f"❗ Ошибка покупки {plain}: {e}")
+        last_action_at[plain] = now
+        return
+
+    # SELL: если есть монета и сигнал «слабый выход»
+    if want_sell:
+        coin_bal = balance(meta.base)
+        if coin_bal <= 0:
+            last_action_at[plain] = now
+            return
+        # продавать только если нота ≥ minTradeUSDT
+        if coin_bal * last < max(meta.min_usdt, MIN_USDT) * 0.98:
+            last_action_at[plain] = now
+            return
+        qty = round_qty(coin_bal, meta.q_prec)
+        if qty <= 0:
+            last_action_at[plain] = now
+            return
+        try:
+            r = market_sell_by_qty(symbol, qty)
+            if r.get("code") == "00000":
+                tg(f"✅ Продажа {plain}: qty={qty}")
+            else:
+                tg(f"❗ Ошибка продажи {plain}: {r}")
+        except Exception as e:
+            tg(f"❗ Ошибка продажи {plain}: {e}")
+        last_action_at[plain] = now
+
+# ---------- MAIN LOOP ----------
+def worker():
+    tg("🤖 Bitget SPOT запущен (soft EMA, quantity-safe). Пары: " + ", ".join(sorted(PAIRS)))
     while True:
-        for p in enabled:
-            cycle(p)
-            time.sleep(1)
-        time.sleep(5)
+        try:
+            for p in PAIRS:
+                plain = p.strip().upper()
+                # обеспечить наличие *_SPBL в кеше (на случай рестарта рынка)
+                if plain not in PRODUCTS:
+                    PRODUCTS.update(load_products())
+                threading.Thread(target=process_pair, args=(plain,), daemon=True).start()
+            time.sleep(INTERVAL)
+        except Exception as e:
+            tg(f"❗ Loop error: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("bye")
+    # Короткая проверка ключей
+    if not (API_KEY and API_SECRET and API_PASS):
+        tg("⚠️ Нет API-ключей Bitget в переменных окружения.")
+    # Запуск
+    worker()
