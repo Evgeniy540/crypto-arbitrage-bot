@@ -1,7 +1,8 @@
-# === main.py (Bitget SPOT, SPBL-only, EMA 9/21 + trading, safe candles) ===
+# === main.py (Bitget SPOT, SPBL-only, robust candles with time window) ===
 import os, time, hmac, hashlib, base64, json, threading, logging
 from flask import Flask
 import requests
+from datetime import datetime, timedelta, timezone
 
 # -------- KEYS --------
 BITGET_API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
@@ -18,10 +19,10 @@ EMA_FAST = 9
 EMA_SLOW = 21
 TP_PCT = 0.015
 SL_PCT = 0.010
-CHECK_INTERVAL = 30      # seconds between loops
-NO_SIGNAL_INTERVAL = 3600  # remind "no signal" once per hour
+CHECK_INTERVAL = 30
+NO_SIGNAL_INTERVAL = 3600
 TRADE_AMOUNT_USDT = 10.0
-MIN_BALANCE_BUFFER = 0.5   # keep a tiny buffer to avoid 'insufficient balance'
+MIN_BALANCE_BUFFER = 0.5
 
 POSITIONS_FILE = "positions.json"
 PROFIT_FILE = "profit.json"
@@ -114,24 +115,44 @@ def period_str(sec):
     m = int(sec/60)
     return {1:"1min",3:"3min",5:"5min",15:"15min",30:"30min",60:"1hour",240:"4hour",1440:"1day"}.get(m,"5min")
 
-# -------- Bitget: SPBL-only --------
-def get_candles(symbol_spbl, limit=EMA_SLOW+50):
+# -------- Robust candles with window & retries --------
+def _ms(dt):  # datetime -> ms
+    return int(dt.timestamp() * 1000)
+
+def get_candles(symbol_spbl, limit=EMA_SLOW+60):
     symbol_spbl = ensure_spbl(symbol_spbl)
-    # Use both 'period' and (fallback) 'granularity'
-    params = {"symbol": symbol_spbl, "period": period_str(TIMEFRAME_SEC), "limit": str(max(limit, EMA_SLOW+1))}
-    r = _get("/api/spot/v1/market/candles", params=params)
-    rows = []
-    if r.get("code") == "00000":
-        rows = r.get("data", [])
-    else:
-        r2 = _get("/api/spot/v1/market/candles",
-                  params={"symbol": symbol_spbl, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
-        if r2.get("code") == "00000":
-            rows = r2.get("data", [])
-        else:
-            raise Exception(f"Candles error for {symbol_spbl}: {r} | {r2}")
-    if not isinstance(rows, list) or len(rows) == 0:
-        raise Exception(f"No candles for {symbol_spbl}")
+    need = max(limit, EMA_SLOW + 1)
+    # Build a 7-day lookback window to be safe
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(seconds=need * TIMEFRAME_SEC * 2)  # x2 margin
+    start_ms = _ms(start)
+    end_ms = _ms(now)
+
+    # Try 1: period + limit only
+    params1 = {"symbol": symbol_spbl, "period": period_str(TIMEFRAME_SEC), "limit": str(need)}
+    # Try 2: granularity + limit
+    params2 = {"symbol": symbol_spbl, "granularity": TIMEFRAME_SEC, "limit": str(need)}
+    # Try 3: period + window
+    params3 = {"symbol": symbol_spbl, "period": period_str(TIMEFRAME_SEC),
+               "startTime": str(start_ms), "endTime": str(end_ms)}
+    # Try 4: granularity + window
+    params4 = {"symbol": symbol_spbl, "granularity": TIMEFRAME_SEC,
+               "startTime": str(start_ms), "endTime": str(end_ms)}
+
+    tries = [params1, params2, params3, params4]
+    rows = None; last_err = None
+    for pr in tries:
+        try:
+            r = _get("/api/spot/v1/market/candles", params=pr)
+            if r.get("code") == "00000":
+                rows = r.get("data", [])
+                if isinstance(rows, list) and len(rows) > 0:
+                    break
+        except Exception as e:
+            last_err = e
+    if not rows:
+        raise Exception(f"Empty candles for {symbol_spbl}. last_err={last_err}")
+
     rows.reverse()  # old -> new
     closes = []
     for row in rows:
@@ -184,7 +205,7 @@ def market_sell(symbol_spbl, size):
 last_no_signal = {}
 
 def ema_signal(symbol_spbl):
-    closes = get_candles(symbol_spbl, limit=EMA_SLOW+50)
+    closes = get_candles(symbol_spbl, limit=EMA_SLOW+60)
     ef = ema(closes, EMA_FAST)
     es = ema(closes, EMA_SLOW)
     if ef[-1] > es[-1] and ef[-2] <= es[-2]:
@@ -246,7 +267,16 @@ def run_loop():
             try:
                 if sym in positions:
                     continue
-                sig = ema_signal(sym)
+                try:
+                    sig = ema_signal(sym)
+                except Exception as e:
+                    # Not enough/empty data â log once per hour
+                    now = time.time()
+                    if now - last_no_signal.get(sym, 0) > NO_SIGNAL_INTERVAL:
+                        last_no_signal[sym] = now
+                        tg(f"â¹ï¸ ÐÑÐ¾Ð¿ÑÑÐº {sym}: {e}")
+                    continue
+
                 if sig["signal"] == "LONG":
                     try:
                         usdt = get_balance("USDT")
@@ -277,21 +307,19 @@ def run_loop():
                     now = time.time()
                     if now - last_no_signal.get(sym, 0) > NO_SIGNAL_INTERVAL:
                         last_no_signal[sym] = now
-                        tg(f"â¹ï¸ ÐÐ¾ {sym} ÑÐµÐ¹ÑÐ°Ñ Ð½ÐµÑ ÑÐ¸Ð³Ð½Ð°Ð»Ð°. EMA9/21: {sig['ema'][0]:.6f} / {sig['ema'][1]:.6f}")
+                        tg(f"â¹ï¸ ÐÐ¾ {sym} Ð½ÐµÑ ÑÐ¸Ð³Ð½Ð°Ð»Ð°. EMA9/21: {sig['ema'][0]:.6f} / {sig['ema'][1]:.6f}")
             except Exception as e:
                 logging.error("loop symbol %s error: %s", sym, e)
 
-        # pacing
         sleep_left = CHECK_INTERVAL - int(time.time() - start)
-        if sleep_left > 0:
-            time.sleep(sleep_left)
+        if sleep_left > 0: time.sleep(sleep_left)
 
 # ---- Flask ----
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bitget SPOT bot (SPBL-only, EMA9/21 + trading) is running", 200
+    return "Bitget SPOT bot (SPBL-only, robust candles) is running", 200
 
 @app.route("/profit", methods=["GET"])
 def profit_status():
