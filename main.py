@@ -1,4 +1,4 @@
-# === main.py (Bitget SPOT — final: plain for data, *_SPBL for orders, safe) ===
+# === main.py (Bitget SPOT — autodetect symbol formats) ===
 import os, time, hmac, hashlib, base64, json, threading, logging
 from flask import Flask
 import requests
@@ -25,6 +25,7 @@ MIN_BALANCE_BUFFER = 0.5
 
 POSITIONS_FILE = "positions.json"
 PROFIT_FILE = "profit.json"
+CACHE_FILE = "bitget_symbol_cache.json"
 LOG_LEVEL = "INFO"
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -90,6 +91,7 @@ def save_json(path, data):
 
 positions = load_json(POSITIONS_FILE, {})
 profit = load_json(PROFIT_FILE, {"total_usdt": 0.0, "trades": []})
+symbol_cache = load_json(CACHE_FILE, {})   # {desired_key: {"data": "...", "order": "..."}}
 
 # ---- helpers ----
 def ema(series, period):
@@ -113,67 +115,83 @@ def to_plain(sym: str) -> str:
 def to_spbl(sym: str) -> str:
     return sym if sym.endswith("_SPBL") else (sym + "_SPBL")
 
-# ---- products resolver ----
+# ---- products ----
 def fetch_products():
     r = _get("/api/spot/v1/public/products")
     if r.get("code") != "00000":
         raise Exception("products error: " + str(r))
     return r.get("data", [])
 
-def resolve_symbols(desired):
-    prods = fetch_products()
-    by_symbol = {(p.get("symbol","") or "").upper(): p for p in prods}
-    by_pair = {((p.get("baseCoin","")+p.get("quoteCoin","")).upper()): p for p in prods}
-    out = []
-    missed = []
-    for want in desired:
-        key = want.upper()
-        p = by_symbol.get(key) or by_pair.get(key)
-        if p and p.get("symbol"):
-            sym = (p["symbol"] or "").upper()
-            out.append({"plain": to_plain(sym), "spbl": to_spbl(sym)})
-        else:
-            out.append({"plain": key, "spbl": to_spbl(key)})
-            missed.append(want)
-    if missed:
-        tg("⚠️ Не нашёл пары в products, использую по умолчанию: " + ", ".join(missed))
-    return out
+def products_symbol_for(pair_upper):
+    for p in fetch_products():
+        sym = (p.get("symbol") or "").upper()
+        base = (p.get("baseCoin") or "").upper()
+        quote = (p.get("quoteCoin") or "").upper()
+        if base + quote == pair_upper:
+            return sym
+    return None
 
-# ---- market data (plain) ----
-def get_candles(plain, limit=120):
+def probe_ticker(symbol):
+    try:
+        r = _get("/api/spot/v1/market/ticker", params={"symbol": symbol})
+        return r.get("code") == "00000"
+    except Exception:
+        return False
+
+def detect_forms(pair_upper):
+    exact = products_symbol_for(pair_upper)
+    candidates = []
+    if exact: candidates.append(exact.upper())
+    candidates += [pair_upper, to_spbl(pair_upper)]
+    tried = []
+    for cand in candidates:
+        if cand in tried: continue
+        tried.append(cand)
+        if probe_ticker(cand):
+            tg(f"🔎 Формат найден для {pair_upper}: {cand}")
+            return {"data": cand, "order": cand}
+    tg(f"⚠️ Не удалось подобрать формат для {pair_upper}. Буду использовать {pair_upper} как есть.")
+    return {"data": pair_upper, "order": pair_upper}
+
+def get_forms(pair_upper):
+    forms = symbol_cache.get(pair_upper)
+    if not forms:
+        forms = detect_forms(pair_upper)
+        symbol_cache[pair_upper] = forms
+        save_json(CACHE_FILE, symbol_cache)
+    return forms
+
+def get_candles(symbol_data, limit=120):
     r = _get("/api/spot/v1/market/candles",
-             params={"symbol": plain, "period": period_str(TIMEFRAME_SEC), "limit": str(max(limit, EMA_SLOW+1))})
+             params={"symbol": symbol_data, "period": period_str(TIMEFRAME_SEC), "limit": str(max(limit, EMA_SLOW+1))})
     rows = []
     if r.get("code") == "00000":
         rows = r.get("data", [])
     else:
         r2 = _get("/api/spot/v1/market/candles",
-                  params={"symbol": plain, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
-        if r2.get("code") == "00000":
-            rows = r2.get("data", [])
-        else:
-            raise Exception(f"{r} | {r2}")
+                  params={"symbol": symbol_data, "granularity": TIMEFRAME_SEC, "limit": str(max(limit, EMA_SLOW+1))})
+        if r2.get("code") == "00000": rows = r2.get("data", [])
+        else: raise Exception(f"{r} | {r2}")
     rows.reverse()
     closes = []
     for row in rows:
         if isinstance(row, (list,tuple)) and len(row) > 4:
-            v = safe_float(row[4])
-            if v is not None:
-                closes.append(v)
+            v = safe_float(row[4]); 
+            if v is not None: closes.append(v)
     return closes
 
-def get_price(plain):
-    r = _get("/api/spot/v1/market/ticker", params={"symbol": plain})
+def get_price(symbol_data):
+    r = _get("/api/spot/v1/market/ticker", params={"symbol": symbol_data})
     if r.get("code") == "00000":
         d = r.get("data", {})
         p = safe_float(d.get("lastPr") or d.get("last"))
         if p is not None: return p
-    r2 = _get("/api/spot/v1/market/tickers", params={"symbol": plain})
+    r2 = _get("/api/spot/v1/market/tickers", params={"symbol": symbol_data})
     if r2.get("code") == "00000" and r2.get("data"):
         d = r2["data"][0]
         p = safe_float(d.get("lastPr") or d.get("last"))
         if p is not None: return p
-    raise Exception(f"no price for {plain}: {r} | {r2}")
+    raise Exception(f"no price for {symbol_data}: {r} | {r2}")
 
 def get_balance(coin="USDT"):
     r = _get("/api/spot/v1/account/assets", params={"coin": coin}, auth=True)
@@ -181,136 +199,134 @@ def get_balance(coin="USDT"):
     arr = r.get("data", [])
     return safe_float(arr[0].get("available")) if arr else 0.0
 
-# ---- orders (spbl) ----
-def market_buy(spbl, quote_usdt):
-    payload = {"symbol": spbl, "side": "buy", "orderType": "market", "force": "normal",
-               "quoteOrderQty": f"{quote_usdt:.6f}"}
+def try_order(payload):
     r = _post("/api/spot/v1/trade/orders", payload)
-    if r.get("code") != "00000": raise Exception(r.get("msg","order buy failed"))
+    if r.get("code") != "00000":
+        raise Exception(r.get("msg","order failed"))
     return r.get("data", {})
 
-def market_sell(spbl, size):
-    payload = {"symbol": spbl, "side": "sell", "orderType": "market", "force": "normal",
-               "size": f"{size:.8f}"}
-    r = _post("/api/spot/v1/trade/orders", payload)
-    if r.get("code") != "00000": raise Exception(r.get("msg","order sell failed"))
-    return r.get("data", {})
+def market_buy(pair_upper, forms, quote_usdt):
+    candidates = [forms["order"], to_spbl(pair_upper), pair_upper, products_symbol_for(pair_upper) or pair_upper]
+    tried=set(); last=None
+    for sym in candidates:
+        if sym in tried or sym is None: continue
+        tried.add(sym)
+        payload = {"symbol": sym, "side":"buy", "orderType":"market", "force":"normal",
+                   "quoteOrderQty": f"{quote_usdt:.6f}"}
+        try:
+            data = try_order(payload)
+            if sym != forms["order"]:
+                forms["order"]=sym; symbol_cache[pair_upper]=forms; save_json(CACHE_FILE, symbol_cache)
+                tg(f"🔁 Обновил order-символ для {pair_upper}: {sym}")
+            return data
+        except Exception as e:
+            last=e
+    raise last or Exception("order buy failed")
 
-# ---- strategy ----
-SYMBOLS = []  # list of {'plain','spbl'}
-last_no_signal = {}
+def market_sell(pair_upper, forms, size):
+    candidates = [forms["order"], to_spbl(pair_upper), pair_upper, products_symbol_for(pair_upper) or pair_upper]
+    tried=set(); last=None
+    for sym in candidates:
+        if sym in tried or sym is None: continue
+        tried.add(sym)
+        payload = {"symbol": sym, "side":"sell", "orderType":"market", "force":"normal",
+                   "size": f"{size:.8f}"}
+        try:
+            data = try_order(payload)
+            if sym != forms["order"]:
+                forms["order"]=sym; symbol_cache[pair_upper]=forms; save_json(CACHE_FILE, symbol_cache)
+                tg(f"🔁 Обновил order-символ для {pair_upper}: {sym}")
+            return data
+        except Exception as e:
+            last=e
+    raise last or Exception("order sell failed")
 
-def ema_signal(plain):
-    closes = get_candles(plain, limit=max(EMA_SLOW+10,60))
-    if len(closes) < EMA_SLOW+1:
-        return {"signal": None, "reason": "Недостаточно данных"}
-    ef = ema(closes, EMA_FAST); es = ema(closes, EMA_SLOW)
-    if ef[-1] > es[-1] and ef[-2] <= es[-2]:
-        return {"signal": "LONG", "price": closes[-1], "ema": (ef[-1], es[-1])}
-    return {"signal": None, "reason": "Нет сигнала", "ema": (ef[-1], es[-1])}
+SYMS=[]; last_no_signal={}
+
+def ema_signal(symbol_data):
+    closes = get_candles(symbol_data, limit=max(EMA_SLOW+10,60))
+    if len(closes) < EMA_SLOW+1: return {"signal": None, "reason":"Недостаточно данных"}
+    ef=ema(closes, EMA_FAST); es=ema(closes, EMA_SLOW)
+    if ef[-1]>es[-1] and ef[-2]<=es[-2]: return {"signal":"LONG","price":closes[-1],"ema":(ef[-1],es[-1])}
+    return {"signal": None, "reason":"Нет сигнала", "ema":(ef[-1],es[-1])}
 
 def monitor_positions():
-    changed = False
-    for plain, pos in list(positions.items()):
-        try:
-            price = get_price(plain)
-        except Exception as e:
-            logging.warning("price check failed %s: %s", plain, e)
-            continue
-        pnl = (price - pos["buy_price"]) / pos["buy_price"]
-        if pnl >= TP_PCT or pnl <= -SL_PCT:
-            side = "TP" if pnl >= TP_PCT else "SL"
+    changed=False
+    for pair, pos in list(positions.items()):
+        forms=pos["forms"]
+        try: price=get_price(forms["data"])
+        except Exception as e: logging.warning("price check failed %s: %s", pair, e); continue
+        pnl=(price-pos["buy_price"])/pos["buy_price"]
+        if pnl>=TP_PCT or pnl<=-SL_PCT:
+            side="TP" if pnl>=TP_PCT else "SL"
             try:
-                market_sell(pos["spbl"], pos["qty"])
-                pnl_usdt = price * pos["qty"] - pos["spent_usdt"]
-                profit["total_usdt"] += pnl_usdt
-                profit["trades"].append({
-                    "symbol": plain,
-                    "side": side,
-                    "buy_price": pos["buy_price"],
-                    "sell_price": price,
-                    "qty": pos["qty"],
-                    "pnl_pct": round(pnl * 100, 4),
-                    "pnl_usdt": round(pnl_usdt, 6),
-                    "ts_close": int(time.time() * 1000)
-                })
+                market_sell(pair, forms, pos["qty"])
+                pnl_usdt=price*pos["qty"]-pos["spent_usdt"]
+                profit["total_usdt"]+=pnl_usdt
+                profit["trades"].append({"symbol":forms["data"],"side":side,"buy_price":pos["buy_price"],
+                                         "sell_price":price,"qty":pos["qty"],
+                                         "pnl_pct":round(pnl*100,4),"pnl_usdt":round(pnl_usdt,6),
+                                         "ts_close":int(time.time()*1000)})
                 save_json(PROFIT_FILE, profit)
-                tg(f"✅ {side} по {plain}\nПродажа ~{price:.6f}\nP/L: {pnl*100:.3f}% ({pnl_usdt:.4f} USDT)\nСумм. прибыль: {profit['total_usdt']:.4f} USDT")
-                positions.pop(plain, None)
-                changed = True
+                tg(f"✅ {side} по {pair}\nПродажа ~{price:.6f}\nP/L: {pnl*100:.3f}% ({pnl_usdt:.4f} USDT)\nСумм. прибыль: {profit['total_usdt']:.4f} USDT")
+                positions.pop(pair, None); changed=True
             except Exception as e:
-                tg(f"❗ Ошибка продажи {plain}: {e}")
-                logging.error("sell failed %s: %s", plain, e)
-    if changed:
-        save_json(POSITIONS_FILE, positions)
+                tg(f"❗ Ошибка продажи {pair}: {e}"); logging.error("sell failed %s: %s", pair, e)
+    if changed: save_json(POSITIONS_FILE, positions)
 
 def trade_loop():
-    global SYMBOLS, last_no_signal
-    SYMBOLS = resolve_symbols(DESIRED)
-    if not SYMBOLS:
-        tg("❗ Не нашёл ни одной пары."); return
-    last_no_signal = {s['plain']:0 for s in SYMBOLS}
-    tg("🤖 Бот запущен. Пары: " + ", ".join([f"{s['plain']}|{s['spbl']}" for s in SYMBOLS]))
-
-    # self-test
-    for S in SYMBOLS:
-        p = S['plain']; sp = S['spbl']
-        try:
-            price = get_price(p)
-            _ = get_candles(p, 30)
-            tg(f"✅ Self-test {p}: OK (ticker {price})")
-        except Exception as e:
-            tg(f"⚠️ Self-test {p}: {e} (будут пропуски сигналов)")
+    global SYMS, last_no_signal
+    SYMS=[] 
+    for d in DESIRED:
+        pair=d.upper()
+        forms=get_forms(pair)
+        SYMS.append({"pair": pair, "forms": forms})
+    last_no_signal={s["pair"]:0 for s in SYMS}
+    tg("🤖 Bitget (autodetect) пары:\n" + "\n".join([f"{s['pair']}: data={s['forms']['data']}, order={s['forms']['order']}" for s in SYMS]))
 
     while True:
-        start = time.time()
-        try:
-            monitor_positions()
-        except Exception as e:
-            logging.error("monitor error: %s", e)
+        start=time.time()
+        try: monitor_positions()
+        except Exception as e: logging.error("monitor error: %s", e)
 
-        for S in SYMBOLS:
-            plain, spbl = S['plain'], S['spbl']
+        for S in SYMS:
+            pair=S["pair"]; forms=S["forms"]
             try:
-                if plain in positions: 
-                    continue
-                sig = ema_signal(plain)
-                if sig["signal"] == "LONG":
-                    try:
-                        usdt = get_balance("USDT")
-                    except Exception as e:
-                        tg(f"❗ Ошибка баланса USDT: {e}"); continue
-                    need = TRADE_AMOUNT_USDT
+                if pair in positions: continue
+                sig=ema_signal(forms["data"])
+                if sig["signal"]=="LONG":
+                    try: usdt=get_balance("USDT")
+                    except Exception as e: tg(f"❗ Ошибка баланса USDT: {e}"); continue
+                    need=TRADE_AMOUNT_USDT
                     if usdt < need + MIN_BALANCE_BUFFER:
-                        tg(f"ℹ️ Недостаточно USDT для {plain}. Баланс: {usdt:.4f}, нужно: {need:.2f}."); continue
+                        tg(f"ℹ️ Недостаточно USDT для {pair}. Баланс: {usdt:.4f}, нужно: {need:.2f}."); continue
                     try:
-                        market_buy(spbl, need)
+                        market_buy(pair, forms, need)
                         time.sleep(0.5)
-                        price = get_price(plain)
-                        est_qty = (need * (1 - 0.001)) / price
-                        positions[plain] = {"spbl": spbl, "qty": float(f"{est_qty:.8f}"),
-                                            "buy_price": price, "spent_usdt": need,
-                                            "ts": int(time.time()*1000)}
+                        price=get_price(forms["data"])
+                        est_qty=(need*(1-0.001))/price
+                        positions[pair]={"forms":forms,"qty":float(f"{est_qty:.8f}"),
+                                         "buy_price":price,"spent_usdt":need,"ts":int(time.time()*1000)}
                         save_json(POSITIONS_FILE, positions)
-                        tg(f"🟢 Покупка {plain}\nСумма: {need:.2f} USDT\nЦена ~ {price:.6f}\nEMA9/21: {sig['ema'][0]:.6f} / {sig['ema'][1]:.6f}")
+                        tg(f"🟢 Покупка {pair}\nСумма: {need:.2f} USDT\nЦена ~ {price:.6f}\nEMA9/21: {sig['ema'][0]:.6f} / {sig['ema'][1]:.6f}")
                     except Exception as e:
-                        tg(f"❗ Ошибка покупки {plain}: {e}"); logging.error("buy failed %s: %s", plain, e)
+                        tg(f"❗ Ошибка покупки {pair}: {e}"); logging.error("buy failed %s: %s", pair, e)
                 else:
-                    now = time.time()
-                    if now - last_no_signal.get(plain, 0) > NO_SIGNAL_INTERVAL:
-                        last_no_signal[plain] = now
-                        tg(f"ℹ️ По {plain} сейчас нет сигнала. EMA9/21: {sig['ema'][0]:.6f} / {sig['ema'][1]:.6f}")
+                    now=time.time()
+                    if now - last_no_signal.get(pair,0) > NO_SIGNAL_INTERVAL:
+                        last_no_signal[pair]=now
+                        tg(f"ℹ️ По {pair} нет сигнала. EMA9/21: {sig['ema'][0]:.6f} / {sig['ema'][1]:.6f}")
             except Exception as e:
-                logging.error("loop symbol %s error: %s", plain, e)
+                logging.error("loop symbol %s error: %s", pair, e)
 
-        time.sleep(max(1, CHECK_INTERVAL - int(time.time() - start)))
+        time.sleep(max(1, CHECK_INTERVAL - int(time.time()-start)))
 
 # ---- Flask ----
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bitget SPOT bot (final dual-safe) is running", 200
+    return "Bitget SPOT bot (autodetect) is running", 200
 
 @app.route("/profit", methods=["GET"])
 def profit_status():
