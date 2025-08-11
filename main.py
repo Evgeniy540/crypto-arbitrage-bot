@@ -1,4 +1,4 @@
-# === main.py (Bitget SPOT — autodetect symbols from /public/products to avoid 400172) ===
+# === main.py (Bitget SPOT — autodetect symbols + dual-format market buy) ===
 import os, time, hmac, hashlib, base64, json, threading, logging
 from flask import Flask
 import requests
@@ -13,8 +13,8 @@ TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 
 # -------- SETTINGS --------
-BASE_PAIRS = ["BTCUSDT","ETHUSDT","SOLUSDT","TRXUSDT","XRPUSDT"]  # без суффикса — найдём точную форму
-TIMEFRAME_SEC = 300   # 5m
+BASE_PAIRS = ["BTCUSDT","ETHUSDT","SOLUSDT","TRXUSDT","XRPUSDT"]
+TIMEFRAME_SEC = 300
 EMA_FAST = 9
 EMA_SLOW = 21
 TP_PCT = 0.015
@@ -75,9 +75,13 @@ def _post(path, payload):
     body = json.dumps(payload, separators=(',',':'))
     headers = _headers("POST", path, body)
     r = requests.post(url, headers=headers, data=body, timeout=20)
+    try:
+        j = r.json()
+    except Exception:
+        j = {"code": str(r.status_code), "raw": r.text[:400]}
     if r.status_code != 200:
-        raise Exception(f"HTTP {r.status_code}: {r.text}")
-    return r.json()
+        j.setdefault("http", r.status_code)
+    return j
 
 def tg(msg):
     try:
@@ -97,39 +101,33 @@ def save_json(path, data):
 positions = load_json(POSITIONS_FILE, {})
 profit = load_json(PROFIT_FILE, {"total_usdt": 0.0, "trades": []})
 
-# ---- Discover exact SPOT symbols from public/products ----
+# ---- Discover symbols ----
 PRODUCTS_CACHE = {"ts":0, "map":{}}
 
 def refresh_products():
     j = _get("/api/spot/v1/public/products")
     mp = {}
-    data = j.get("data", [])
-    for d in data or []:
-        # Typical fields: symbol='BTCUSDT_SPBL', baseCoin='BTC', quoteCoin='USDT', status='online'
+    for d in (j.get("data") or []):
         sym = str(d.get("symbol") or "").upper()
-        if not sym: continue
         base = (d.get("baseCoin") or "").upper()
         quote = (d.get("quoteCoin") or "").upper()
-        plain = f"{base}{quote}" if base and quote else None
-        if plain:
-            mp[plain] = sym  # e.g., 'BTCUSDT' -> 'BTCUSDT_SPBL'
+        if sym and base and quote:
+            mp[f"{base}{quote}"] = sym
     if mp:
         PRODUCTS_CACHE["map"] = mp
         PRODUCTS_CACHE["ts"]  = int(time.time())
         tg("🔎 Bitget products loaded: " + ", ".join([mp.get(p,"?") for p in BASE_PAIRS]))
     else:
-        tg(f"❗ Failed to load products: {str(j)[:200]}")
+        tg(f"❗ Failed to load products: {str(j)[:220]}")
 
 def sym_exact(plain):
-    plain = str(plain or "").upper()
     if time.time() - PRODUCTS_CACHE["ts"] > 3600 or not PRODUCTS_CACHE["map"]:
         refresh_products()
-    return PRODUCTS_CACHE["map"].get(plain, plain)  # fallback to plain
+    return PRODUCTS_CACHE["map"].get(plain.upper(), plain.upper())
 
-def ensure_spbl(sym_plain):
-    exact = sym_exact(sym_plain.replace("_SPBL",""))
-    # if discovered symbol already has suffix, return as-is
-    return exact if exact.endswith("_SPBL") else exact + "_SPBL"
+def ensure_spbl(plain):
+    s = sym_exact(plain)
+    return s if s.endswith("_SPBL") else s + "_SPBL"
 
 def safe_float(x):
     try: return float(x)
@@ -146,23 +144,21 @@ def period_str(sec):
     m=int(sec/60)
     return {1:"1min",3:"3min",5:"5min",15:"15min",30:"30min",60:"1hour",240:"4hour",1440:"1day"}.get(m,"5min")
 
-# ---- Candles/Ticker using discovered symbols ----
+# ---- Market data ----
 def get_candles(plain, limit=EMA_SLOW+60):
-    symbol = sym_exact(plain)  # e.g., BTCUSDT_SPBL
+    symbol = sym_exact(plain)
     need = max(limit, EMA_SLOW+1)
-    # 1) period variant
     j = _get("/api/spot/v1/market/candles",
              params={"symbol": symbol, "period": period_str(TIMEFRAME_SEC), "limit": str(min(200,need))})
     data = j.get("data", [])
     if not (isinstance(data,list) and len(data)>0):
-        # 2) history + granularity
         j = _get("/api/spot/v1/market/history-candles",
                  params={"symbol": symbol, "granularity": TIMEFRAME_SEC, "limit": str(min(200,need))})
         data = j.get("data", [])
     if not (isinstance(data,list) and len(data)>0):
         tg(f"❗ Raw candle resp for {symbol}: {str(j)[:220]}")
         raise Exception(f"No candles for {symbol}")
-    rows = list(data); rows.reverse()
+    rows=list(data); rows.reverse()
     closes=[]
     for row in rows:
         if isinstance(row,(list,tuple)) and len(row)>4:
@@ -184,27 +180,52 @@ def get_price(plain):
         if p is not None: return p
     raise Exception(f"No price for {symbol}: {j}")
 
+# ---- Trading ----
+def _place_order(payload):
+    j = _post("/api/spot/v1/trade/orders", payload)
+    return j
+
+def market_buy_dual(plain, quote_usdt):
+    symbol = ensure_spbl(plain)
+    # Try quoteOrderQty first
+    payload_q = {"symbol": symbol, "side":"buy","orderType":"market","force":"normal",
+                 "quoteOrderQty": f"{quote_usdt:.6f}"}
+    r = _place_order(payload_q)
+    if r.get("code") == "00000":
+        return r.get("data", {})
+    # If Bitget complains about quantity, try size
+    if r.get("code") in ("40019","40036","33039") or "quantity" in str(r).lower():
+        try:
+            price = get_price(plain)
+        except Exception as e:
+            raise Exception(f"market_buy_dual/get_price failed: {e}")
+        size = max(quote_usdt / price * 0.999, 0.0)  # fee headroom
+        # format size with 8 decimals (Bitget spot accepts up to 8)
+        size_str = f"{size:.8f}".rstrip('0').rstrip('.') if '.' in f"{size:.8f}" else f"{size:.8f}"
+        payload_s = {"symbol": symbol, "side":"buy","orderType":"market","force":"normal",
+                     "size": size_str}
+        r2 = _place_order(payload_s)
+        if r2.get("code") == "00000":
+            return r2.get("data", {})
+        raise Exception(f"market_buy_dual failed: first={r}, second={r2}")
+    else:
+        raise Exception(f"market_buy_dual failed: resp={r}")
+
+def market_sell(plain, size):
+    symbol = ensure_spbl(plain)
+    size_str = f"{size:.8f}".rstrip('0').rstrip('.') if '.' in f"{size:.8f}" else f"{size:.8f}"
+    payload={"symbol": symbol, "side":"sell","orderType":"market","force":"normal",
+             "size": size_str}
+    r=_place_order(payload)
+    if r.get("code") != "00000":
+        raise Exception(f"sell failed: {r}")
+    return r.get("data", {})
+
 def get_balance(coin="USDT"):
     j = _get("/api/spot/v1/account/assets", params={"coin": coin}, auth=True)
     if j.get("code") != "00000": raise Exception(j.get("msg","unknown"))
     arr = j.get("data", [])
     return safe_float(arr[0].get("available")) if arr else 0.0
-
-def market_buy(plain, quote_usdt):
-    symbol = ensure_spbl(plain)  # orders strictly SPBL
-    payload={"symbol": symbol, "side":"buy","orderType":"market","force":"normal",
-             "quoteOrderQty": f"{quote_usdt:.6f}"}
-    j=_post("/api/spot/v1/trade/orders", payload)
-    if j.get("code") != "00000": raise Exception(j.get("msg","order buy failed"))
-    return j.get("data", {})
-
-def market_sell(plain, size):
-    symbol = ensure_spbl(plain)
-    payload={"symbol": symbol, "side":"sell","orderType":"market","force":"normal",
-             "size": f"{size:.8f}"}
-    j=_post("/api/spot/v1/trade/orders", payload)
-    if j.get("code") != "00000": raise Exception(j.get("msg","order sell failed"))
-    return j.get("data", {})
 
 # ---- Strategy ----
 def ema_signal(plain):
@@ -215,7 +236,7 @@ def ema_signal(plain):
     return {"signal":None,"reason":"Нет сигнала","ema":(ef[-1],es[-1])}
 
 last_no_signal={}
-SYMBOLS = BASE_PAIRS[:]  # plain names
+SYMBOLS = BASE_PAIRS[:]
 
 def monitor_positions():
     changed=False
@@ -247,7 +268,7 @@ def run_loop():
     last_no_signal={s:0 for s in SYMBOLS}
     refresh_products()
     sym_map=", ".join([f"{p}->{sym_exact(p)}" for p in SYMBOLS])
-    tg("🤖 Bitget SPOT запущен. Пары: " + sym_map)
+    tg("🤖 Bitget SPOT запущен (dual buy). Пары: " + sym_map)
 
     for p in SYMBOLS:
         try:
@@ -279,8 +300,8 @@ def run_loop():
                     if usdt < need + MIN_BALANCE_BUFFER:
                         tg(f"ℹ️ Недостаточно USDT для {p}. Баланс: {usdt:.6f}, нужно: {need:.2f}."); continue
                     try:
-                        market_buy(p, need)
-                        time.sleep(0.5)
+                        _ = market_buy_dual(p, need)
+                        time.sleep(0.7)
                         price=get_price(p)
                         est_qty=(need*(1-0.001))/price
                         positions[p]={"qty": float(f"{est_qty:.8f}"),
@@ -306,7 +327,7 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bitget SPOT bot (autodetect symbols) is running", 200
+    return "Bitget SPOT bot (autodetect + dual-buy) is running", 200
 
 @app.route("/profit", methods=["GET"])
 def profit_status():
