@@ -1,4 +1,4 @@
-# === main.py (Bitget SPOT; BUY=quoteOrderQty, SELL=quantity; self-heal; EMA 7/14; TP 1.0% / SL 0.7%; MIN_CANDLES=5) ===
+# === main.py (Bitget SPOT; BUY: quoteOrderQty→quantity→size с мягкой обработкой 400; SELL: quantity; self-heal; EMA 7/14; TP 1.0% / SL 0.7%) ===
 import os, time, hmac, hashlib, base64, json, threading, math, logging, requests
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -28,7 +28,7 @@ CHECK_INTERVAL = 30
 NO_SIGNAL_COOLDOWN_MIN = 60
 MAX_OPEN_POSITIONS = 2
 
-# при необходимости можно задать больший минимум в USDT для отдельных пар
+# если по каким-то парам требуются бóльшие минималки — укажем тут:
 MIN_TRADE_USDT_BY_SYMBOL = {
     # "BGBUSDT": 5.0,
 }
@@ -87,9 +87,12 @@ def headers(ts: str, sign: str):
 
 def get_json_or_raise(resp):
     txt = resp.text
-    try: data = resp.json()
-    except Exception: raise RuntimeError(f"HTTP {resp.status_code}: {txt}")
-    if resp.status_code >= 400: raise RuntimeError(f"HTTP {resp.status_code}: {txt}")
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(f"HTTP {resp.status_code}: {txt}")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code}: {txt}")
     return data
 
 def load_json(path, default):
@@ -267,29 +270,74 @@ def get_usdt_balance() -> float:
     if not arr: return 0.0
     return float(arr[0].get("available","0"))
 
-def place_market_buy(sym_no_sfx: str, quote_usdt: float):
-    """Market BUY: используем quoteOrderQty (USDT)."""
-    if quote_usdt is None or quote_usdt <= 0:
-        raise RuntimeError("empty_quote_usdt")
+# ---------- мягкий POST: никогда не бросает исключение по HTTP-коду ----------
+def soft_post(path: str, body: dict):
     ts = now_ms()
-    path = "/api/spot/v1/trade/orders"
-    body = {
-        "symbol": normalize_symbol(sym_no_sfx),
-        "side": "buy",
-        "orderType": "market",
-        "force": "gtc",
-        "quoteOrderQty": f"{quote_usdt:.4f}"
-    }
-    payload = json.dumps(body, separators=(",",":"))
+    payload = json.dumps(body, separators=(",", ":"))
     sign = sign_payload(ts, "POST", path, payload)
-    r = requests.post(BITGET + path, headers=headers(ts,sign), data=payload, timeout=20)
-    d = get_json_or_raise(r)
-    if d.get("code") != "00000":
-        raise RuntimeError(f"order error: {d}")
-    return d["data"]
+    r = requests.post(BITGET + path, headers=headers(ts, sign), data=payload, timeout=20)
+    txt = r.text
+    try:
+        d = r.json()
+    except Exception:
+        d = {"code": f"HTTP{r.status_code}", "msg": txt}
+    return r.status_code, d, txt
+# ---------------------------------------------------------------------------
+
+def place_market_buy(sym_no_sfx: str, quote_usdt: float, qty_str_fallback: str | None, price_hint: float | None):
+    """
+    Market BUY c каскадом:
+    1) quoteOrderQty (USDT) → 2) quantity (шт) → 3) size (шт)
+    Любой HTTP 400 анализируем, а не падаем.
+    """
+    if not quote_usdt or quote_usdt <= 0:
+        raise RuntimeError("empty_quote_usdt")
+
+    path = "/api/spot/v1/trade/orders"
+    sym = normalize_symbol(sym_no_sfx)
+    client_oid = f"tg-{sym_no_sfx}-{int(time.time()*1000)}"
+
+    # 1) quoteOrderQty
+    body1 = {"symbol": sym, "side": "buy", "orderType": "market", "force": "gtc",
+             "clientOrderId": client_oid, "quoteOrderQty": f"{float(quote_usdt):.4f}"}
+    st1, d1, _ = soft_post(path, body1)
+    if d1.get("code") == "00000": return d1.get("data")
+    # если это не 40019/кол-во пустое — отдаём ошибку наверх
+    if not (str(d1.get("code")).endswith("40019") or "quantity" in str(d1).lower()):
+        if st1 < 400:  # биржа вернула неуспех, но без HTTP-ошибки
+            raise RuntimeError(f"order error: {d1}")
+        # HTTP ошибка — тоже завершим
+        raise RuntimeError(f"HTTP {st1}: {d1}")
+
+    # подготовим qty
+    qty = (qty_str_fallback or "").strip()
+    if not qty and price_hint and price_hint > 0:
+        rules = get_symbol_rules(sym_no_sfx)
+        qscale = int(rules.get("quantityScale", 4))
+        qty_est = floor_to_scale(quote_usdt / price_hint, qscale)
+        if qty_est > 0:
+            qty = f"{qty_est:.{qscale}f}"
+    if not qty or qty in ("0","0.0"):  # совсем нечего отправлять
+        raise RuntimeError("fallback_qty_empty")
+
+    # 2) quantity
+    body2 = {"symbol": sym, "side": "buy", "orderType": "market", "force": "gtc",
+             "clientOrderId": client_oid, "quantity": qty}
+    st2, d2, _ = soft_post(path, body2)
+    if d2.get("code") == "00000": return d2.get("data")
+
+    # 3) size (последний шанс)
+    if str(d2.get("code")).endswith("40019") or "quantity" in str(d2).lower():
+        body3 = {"symbol": sym, "side": "buy", "orderType": "market", "force": "gtc",
+                 "clientOrderId": client_oid, "size": qty}
+        st3, d3, _ = soft_post(path, body3)
+        if d3.get("code") == "00000": return d3.get("data")
+        raise RuntimeError(f"order error: HTTP {st3} {d3}")
+
+    raise RuntimeError(f"order error: HTTP {st2} {d2}")
 
 def place_market_sell(sym_no_sfx: str, qty_str: str):
-    """Market SELL: используем quantity (шт.)."""
+    """Market SELL: quantity."""
     if not qty_str or str(qty_str).strip() in ("", "0", "0.0"):
         raise RuntimeError("empty_quantity")
     ts = now_ms()
@@ -302,14 +350,13 @@ def place_market_sell(sym_no_sfx: str, qty_str: str):
         "quantity": str(qty_str)
     }
     payload = json.dumps(body, separators=(",",":"))
-    sign = sign_payload(ts, "POST", path, payload)
-    r = requests.post(BITGET + path, headers=headers(ts,sign), data=payload, timeout=20)
+    sign = sign_payload(ts,"POST",path,payload)
+    r = requests.post(BITGET+path, headers=headers(ts,sign), data=payload, timeout=20)
     d = get_json_or_raise(r)
-    if d.get("code") != "00000":
-        raise RuntimeError(f"order error: {d}")
+    if d.get("code") != "00000": raise RuntimeError(f"order error: {d}")
     return d["data"]
 
-# ====== Тех.индикаторы ======
+# ====== Техника ======
 def ema(values, period):
     if len(values) < period: return []
     k = 2/(period+1)
@@ -364,13 +411,13 @@ def maybe_buy_signal():
             tg(f"❕ {sym}: покупка пропущена (amount<{min_usdt:.4f}). Баланс {usdt_avail:.4f} USDT.")
             return
 
-        # Отправляем BUY по USDT
-        place_market_buy(sym, quote)
+        qscale = int(rules["quantityScale"])
+        qty_est = floor_to_scale(quote / price, qscale)
 
-        # Оценим полученное кол-во для учёта
-        qty_est = floor_to_scale(quote / price, int(rules["quantityScale"]))
+        # Покупка: quoteOrderQty → quantity → size (без падения на HTTP 400)
+        place_market_buy(sym, quote, f"{qty_est:.{qscale}f}", price)
+
         notional = qty_est * price
-
         positions[sym] = {"qty": qty_est, "avg": price, "amount": notional,
                           "opened": datetime.now(timezone.utc).isoformat()}
         save_json(STATE_FILE, positions)
