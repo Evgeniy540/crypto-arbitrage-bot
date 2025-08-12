@@ -1,4 +1,7 @@
-# === main.py (Bitget SPOT; BUY: quoteOrderQty→quantity→size с мягкой обработкой 400; SELL: quantity; self-heal; EMA 7/14; TP 1.0% / SL 0.7%) ===
+# === main.py — Bitget SPOT ===
+# BUY: quoteOrderQty → quantity → size, автоподгонка суммы до minTradeUSDT (+буфер)
+# SELL: quantity. Self-heal, EMA 7/14, TP 1.0%, SL 0.7%, /status /profit, Flask keep-alive.
+
 import os, time, hmac, hashlib, base64, json, threading, math, logging, requests
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -16,21 +19,22 @@ TELEGRAM_CHAT_ID = "5723086631"
 DAILY_REPORT_HHMM = os.environ.get("DAILY_REPORT_HHMM", "20:47").strip()
 USE_WEBHOOK = os.environ.get("TELEGRAM_WEBHOOK", "0") == "1"
 
-# ====== НАСТРОЙКИ ======
+# ====== НАСТРОЙКИ ТОРГОВЛИ ======
 SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","PEPEUSDT","BGBUSDT"]
-BASE_TRADE_AMOUNT = 10.0   # USDT на сделку
-TP_PCT = 0.010             # +1.0%
-SL_PCT = 0.007             # -0.7%
+BASE_TRADE_AMOUNT = 10.0      # базовая сумма на сделку в USDT
+TP_PCT = 0.010                 # 1.0%
+SL_PCT = 0.007                 # 0.7%
 EMA_FAST = 7
 EMA_SLOW = 14
 MIN_CANDLES = 5
-CHECK_INTERVAL = 30
+CHECK_INTERVAL = 30            # сек
 NO_SIGNAL_COOLDOWN_MIN = 60
 MAX_OPEN_POSITIONS = 2
+MIN_NOTIONAL_BUFFER = 1.02     # +2% к минимуму, чтобы не цепляться о пороги
 
-# если по каким-то парам требуются бóльшие минималки — укажем тут:
+# при желании можно задать бóльший минимум на конкретные пары
 MIN_TRADE_USDT_BY_SYMBOL = {
-    # "BGBUSDT": 5.0,
+    # "TRXUSDT": 1.5,
 }
 
 CANDLES_LIMIT = max(100, EMA_SLOW + 20)
@@ -87,12 +91,9 @@ def headers(ts: str, sign: str):
 
 def get_json_or_raise(resp):
     txt = resp.text
-    try:
-        data = resp.json()
-    except Exception:
-        raise RuntimeError(f"HTTP {resp.status_code}: {txt}")
-    if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code}: {txt}")
+    try: data = resp.json()
+    except Exception: raise RuntimeError(f"HTTP {resp.status_code}: {txt}")
+    if resp.status_code >= 400: raise RuntimeError(f"HTTP {resp.status_code}: {txt}")
     return data
 
 def load_json(path, default):
@@ -116,6 +117,15 @@ positions = load_json(STATE_FILE, {})  # {sym: {qty, avg, amount, opened}}
 profits   = load_json(PROFIT_FILE, {"total":0.0,"trades":[]})
 last_no_signal_sent = datetime.now(timezone.utc) - timedelta(minutes=NO_SIGNAL_COOLDOWN_MIN+1)
 _last_daily_report_date = None
+_last_error_sent_at = {}  # антиспам одинаковых ошибок {key: dt}
+
+def _should_send_err(key:str, cooldown_sec=90):
+    dt = _last_error_sent_at.get(key)
+    now = datetime.now(timezone.utc)
+    if not dt or (now - dt).total_seconds() > cooldown_sec:
+        _last_error_sent_at[key] = now
+        return True
+    return False
 
 # ====== self-heal cache/idx/quarantine ======
 _bad_until: dict[str, datetime] = {}
@@ -270,7 +280,7 @@ def get_usdt_balance() -> float:
     if not arr: return 0.0
     return float(arr[0].get("available","0"))
 
-# ---------- мягкий POST: никогда не бросает исключение по HTTP-коду ----------
+# мягкий POST — не бросает исключения по HTTP, возвращает (status, json|{}, text)
 def soft_post(path: str, body: dict):
     ts = now_ms()
     payload = json.dumps(body, separators=(",", ":"))
@@ -282,13 +292,17 @@ def soft_post(path: str, body: dict):
     except Exception:
         d = {"code": f"HTTP{r.status_code}", "msg": txt}
     return r.status_code, d, txt
-# ---------------------------------------------------------------------------
 
-def place_market_buy(sym_no_sfx: str, quote_usdt: float, qty_str_fallback: str | None, price_hint: float | None):
+def _min_notional(sym_no_sfx: str) -> float:
+    rules = get_symbol_rules(sym_no_sfx)
+    overr = float(MIN_TRADE_USDT_BY_SYMBOL.get(sym_no_sfx, 0.0))
+    return max(1.0, float(rules.get("minTradeUSDT", 1.0)), overr)
+
+def place_market_buy(sym_no_sfx: str, quote_usdt: float, qty_str_fallback: str | None, price_hint: float | None, usdt_balance: float):
     """
-    Market BUY c каскадом:
-    1) quoteOrderQty (USDT) → 2) quantity (шт) → 3) size (шт)
-    Любой HTTP 400 анализируем, а не падаем.
+    Market BUY c каскадом и автоподгонкой минимума:
+    1) quoteOrderQty (USDT) → 2) quantity → 3) size
+    Если 45110 — увеличиваем quote до minTradeUSDT*BUFFER, если хватает баланса, и повторяем 1 раз.
     """
     if not quote_usdt or quote_usdt <= 0:
         raise RuntimeError("empty_quote_usdt")
@@ -297,47 +311,48 @@ def place_market_buy(sym_no_sfx: str, quote_usdt: float, qty_str_fallback: str |
     sym = normalize_symbol(sym_no_sfx)
     client_oid = f"tg-{sym_no_sfx}-{int(time.time()*1000)}"
 
-    # 1) quoteOrderQty
-    body1 = {"symbol": sym, "side": "buy", "orderType": "market", "force": "gtc",
-             "clientOrderId": client_oid, "quoteOrderQty": f"{float(quote_usdt):.4f}"}
-    st1, d1, _ = soft_post(path, body1)
-    if d1.get("code") == "00000": return d1.get("data")
-    # если это не 40019/кол-во пустое — отдаём ошибку наверх
-    if not (str(d1.get("code")).endswith("40019") or "quantity" in str(d1).lower()):
-        if st1 < 400:  # биржа вернула неуспех, но без HTTP-ошибки
-            raise RuntimeError(f"order error: {d1}")
-        # HTTP ошибка — тоже завершим
-        raise RuntimeError(f"HTTP {st1}: {d1}")
+    def try_send(mode: str, qty_or_quote: str):
+        body = {"symbol": sym, "side": "buy", "orderType": "market", "force": "gtc", "clientOrderId": client_oid}
+        body[mode] = qty_or_quote
+        return soft_post(path, body)
 
-    # подготовим qty
-    qty = (qty_str_fallback or "").strip()
-    if not qty and price_hint and price_hint > 0:
-        rules = get_symbol_rules(sym_no_sfx)
-        qscale = int(rules.get("quantityScale", 4))
-        qty_est = floor_to_scale(quote_usdt / price_hint, qscale)
-        if qty_est > 0:
-            qty = f"{qty_est:.{qscale}f}"
-    if not qty or qty in ("0","0.0"):  # совсем нечего отправлять
+    def qty_from(quote):
+        if qty_str_fallback:
+            return qty_str_fallback
+        if price_hint and price_hint > 0:
+            qscale = int(get_symbol_rules(sym_no_sfx)["quantityScale"])
+            q = floor_to_scale(quote / price_hint, qscale)
+            if q > 0: return f"{q:.{qscale}f}"
+        return None
+
+    # ------ первый заход ------
+    q1 = f"{float(quote_usdt):.4f}"
+    st, d, _ = try_send("quoteOrderQty", q1)
+    code = str(d.get("code"))
+    if code == "00000": return d.get("data")
+    if code == "45110":  # меньше минимума
+        min_usdt = _min_notional(sym_no_sfx) * MIN_NOTIONAL_BUFFER
+        need = floor_usdt(min_usdt, 4)
+        if usdt_balance >= need:
+            q1 = f"{need:.4f}"
+            st, d, _ = try_send("quoteOrderQty", q1)
+            if str(d.get("code")) == "00000": return d.get("data")
+    if code != "40019" and "quantity" not in str(d).lower():
+        raise RuntimeError(f"order error: HTTP {st} {d}")
+
+    # ------ второй заход: quantity ------
+    q_qty = qty_from(float(q1))
+    if not q_qty or q_qty in ("0","0.0"):
         raise RuntimeError("fallback_qty_empty")
+    st2, d2, _ = try_send("quantity", q_qty)
+    if str(d2.get("code")) == "00000": return d2.get("data")
 
-    # 2) quantity
-    body2 = {"symbol": sym, "side": "buy", "orderType": "market", "force": "gtc",
-             "clientOrderId": client_oid, "quantity": qty}
-    st2, d2, _ = soft_post(path, body2)
-    if d2.get("code") == "00000": return d2.get("data")
-
-    # 3) size (последний шанс)
-    if str(d2.get("code")).endswith("40019") or "quantity" in str(d2).lower():
-        body3 = {"symbol": sym, "side": "buy", "orderType": "market", "force": "gtc",
-                 "clientOrderId": client_oid, "size": qty}
-        st3, d3, _ = soft_post(path, body3)
-        if d3.get("code") == "00000": return d3.get("data")
-        raise RuntimeError(f"order error: HTTP {st3} {d3}")
-
-    raise RuntimeError(f"order error: HTTP {st2} {d2}")
+    # ------ третий заход: size ------
+    st3, d3, _ = try_send("size", q_qty)
+    if str(d3.get("code")) == "00000": return d3.get("data")
+    raise RuntimeError(f"order error: HTTP {st3} {d3}")
 
 def place_market_sell(sym_no_sfx: str, qty_str: str):
-    """Market SELL: quantity."""
     if not qty_str or str(qty_str).strip() in ("", "0", "0.0"):
         raise RuntimeError("empty_quantity")
     ts = now_ms()
@@ -356,7 +371,7 @@ def place_market_sell(sym_no_sfx: str, qty_str: str):
     if d.get("code") != "00000": raise RuntimeError(f"order error: {d}")
     return d["data"]
 
-# ====== Техника ======
+# ====== Тех.индикаторы ======
 def ema(values, period):
     if len(values) < period: return []
     k = 2/(period+1)
@@ -398,24 +413,22 @@ def maybe_buy_signal():
 
     sym = chosen
     try:
-        price = get_ticker_price(sym)  # для отчёта
+        price = get_ticker_price(sym)   # для отчёта
         usdt_avail = get_usdt_balance()
 
-        rules = get_symbol_rules(sym)
-        min_rule = float(max(1.0, rules.get("minTradeUSDT", 1.0)))
-        min_over = float(MIN_TRADE_USDT_BY_SYMBOL.get(sym, 0.0))
-        min_usdt = max(min_rule, min_over)
-
+        min_usdt = _min_notional(sym)
         quote = floor_usdt(min(BASE_TRADE_AMOUNT, usdt_avail), 4)
         if quote < min_usdt:
-            tg(f"❕ {sym}: покупка пропущена (amount<{min_usdt:.4f}). Баланс {usdt_avail:.4f} USDT.")
+            if _should_send_err(f"min_{sym}"):
+                tg(f"❕ {sym}: покупка пропущена (amount<{min_usdt:.4f}). Баланс {usdt_avail:.4f} USDT.")
             return
 
-        qscale = int(rules["quantityScale"])
+        # предварительное количество для учёта и фолбэка
+        qscale = int(get_symbol_rules(sym)["quantityScale"])
         qty_est = floor_to_scale(quote / price, qscale)
 
-        # Покупка: quoteOrderQty → quantity → size (без падения на HTTP 400)
-        place_market_buy(sym, quote, f"{qty_est:.{qscale}f}", price)
+        # покупка: quote→quantity→size, при 45110 поднять до минимума и повторить
+        place_market_buy(sym, quote, f"{qty_est:.{qscale}f}", price, usdt_avail)
 
         notional = qty_est * price
         positions[sym] = {"qty": qty_est, "avg": price, "amount": notional,
@@ -423,7 +436,8 @@ def maybe_buy_signal():
         save_json(STATE_FILE, positions)
         tg(f"✅ Покупка {sym}: ~qty={qty_est}, цена≈{price:.8f}, сумма≈{quote:.4f} USDT. (EMA {EMA_FAST}/{EMA_SLOW})")
     except Exception as e:
-        tg(f"❗ Ошибка покупки {sym}: {e}")
+        if _should_send_err(f"buy_{sym}"):
+            tg(f"❗ Ошибка покупки {sym}: {e}")
         log.exception(f"buy error {sym}: {e}")
 
 def manage_positions():
@@ -445,7 +459,8 @@ def manage_positions():
                 if qty <= 0: to_close.append(sym); continue
                 min_usdt = max(1.0, rules["minTradeUSDT"])
                 if qty*price < min_usdt:
-                    tg(f"❗ Продажа {sym} отклонена: сумма {qty*price:.6f} < {min_usdt:.6f} USDT.")
+                    if _should_send_err(f"sell_min_{sym}"):
+                        tg(f"❗ Продажа {sym} отклонена: сумма {qty*price:.6f} < {min_usdt:.6f} USDT.")
                     to_close.append(sym); continue
 
                 place_market_sell(sym, f"{qty:.{qscale}f}")
