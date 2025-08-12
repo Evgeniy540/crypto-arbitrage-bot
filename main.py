@@ -1,11 +1,11 @@
-# === main.py (Bitget SPOT; self-heal; safe-size; EMA 7/14; TP 1.0% / SL 0.7%; MIN_CANDLES=5) ===
+# === main.py (Bitget SPOT; safe-size; self-heal tickers/candles; EMA 7/14; TP 1.0% / SL 0.7%; MIN_CANDLES=5) ===
 import os, time, hmac, hashlib, base64, json, threading, math, logging, requests
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from collections import defaultdict
 from flask import Flask, request
 
-# ====== КЛЮЧИ (примерные; оставь свои) ======
+# ====== КЛЮЧИ (замени на свои при надобности) ======
 API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
 API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
 API_PASSPHRASE = "Evgeniy84"
@@ -23,7 +23,7 @@ TP_PCT = 0.010                    # +1.0%
 SL_PCT = 0.007                    # -0.7%
 EMA_FAST = 7
 EMA_SLOW = 14
-MIN_CANDLES = 5                   # чаще сигналы
+MIN_CANDLES = 5
 CHECK_INTERVAL = 30               # сек
 NO_SIGNAL_COOLDOWN_MIN = 60
 MAX_OPEN_POSITIONS = 2
@@ -33,7 +33,7 @@ STATE_FILE = "positions.json"
 PROFIT_FILE = "profit.json"
 BITGET = "https://api.bitget.com"
 
-# ====== SELF-HEAL параметры ======
+# ====== SELF-HEAL ======
 MAX_RETRIES = 4
 RETRY_BASE_SLEEP = 0.5
 QUARANTINE_MIN = 10               # мин
@@ -48,7 +48,6 @@ app = Flask(__name__)
 @app.get("/")
 def health(): return "OK", 200
 
-# глотатель вебхуков, чтобы не было 404; вебхук можно включить через env
 @app.post("/telegram")
 def telegram_webhook():
     if not USE_WEBHOOK:
@@ -88,7 +87,6 @@ def get_json_or_raise(resp):
     if resp.status_code >= 400: raise RuntimeError(f"HTTP {resp.status_code}: {txt}")
     return data
 
-# ====== ХРАНИЛКИ ======
 def load_json(path, default):
     try:
         with open(path,"r",encoding="utf-8") as f: return json.load(f)
@@ -97,7 +95,7 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
 
-# positions[sym] = {"qty":..., "avg":..., "amount":..., "opened":...}
+# ====== СТЕЙТ ======
 positions = load_json(STATE_FILE, {})
 profits   = load_json(PROFIT_FILE, {"total":0.0,"trades":[]})
 last_no_signal_sent = datetime.now(timezone.utc) - timedelta(minutes=NO_SIGNAL_COOLDOWN_MIN+1)
@@ -137,10 +135,8 @@ def normalize_symbol(sym_no_sfx: str) -> str:
 def _sleep_backoff(attempt): time.sleep(RETRY_BASE_SLEEP * (2 ** attempt))
 
 def _candle_close(row):
-    # Bitget чаще отдаёт массив: [ts,open,high,low,close,vol,...]
     if isinstance(row, (list, tuple)) and len(row) >= 5:
         return float(row[4])
-    # иногда словари
     if isinstance(row, dict):
         for k in ("close", "c", "last", "endClose"):
             if k in row: return float(row[k])
@@ -155,7 +151,6 @@ def get_symbol_rules(sym_no_sfx: str):
             "minTradeUSDT": float(p.get("minTradeUSDT",1.0))}
 
 def _price_from_candles(sym_no_sfx):
-    """Резерв: последняя цена из свечи."""
     try:
         closes = get_candles(sym_no_sfx, limit=2)
         if closes:
@@ -165,12 +160,6 @@ def _price_from_candles(sym_no_sfx):
     return None
 
 def get_ticker_price(sym_no_sfx) -> float:
-    """Надёжная цена:
-       1) /market/tickers lastPr/close/last
-       2) если нет — последняя свеча
-       3) если нет — свежий кэш (<5 мин)
-       + ретраи, бэк-офф, карантин при повторных сбоях.
-    """
     until = _bad_until.get(sym_no_sfx)
     if until and until > datetime.now(timezone.utc):
         raise RuntimeError(f"symbol_quarantined:{sym_no_sfx}")
@@ -178,7 +167,6 @@ def get_ticker_price(sym_no_sfx) -> float:
     sym = normalize_symbol(sym_no_sfx)
     last_exc = None
 
-    # 1) основной тикер с ретраями
     for attempt in range(MAX_RETRIES):
         try:
             r = requests.get(
@@ -205,19 +193,16 @@ def get_ticker_price(sym_no_sfx) -> float:
             last_exc = e
         _sleep_backoff(attempt)
 
-    # 2) резерв — цена из свечи
     px_fallback = _price_from_candles(sym_no_sfx)
     if px_fallback is not None:
         _cache_set(sym_no_sfx, px_fallback)
         return float(px_fallback)
 
-    # 3) последний кэш (до 5 мин давности)
     px_cached = _cache_get(sym_no_sfx, max_age_sec=300)
     if px_cached is not None:
         log.warning(f"{sym_no_sfx}: using cached price {px_cached} due to {repr(last_exc)}")
         return float(px_cached)
 
-    # повторные сбои — карантин монеты
     _err_counter[sym_no_sfx] += 1
     if _err_counter[sym_no_sfx] >= 2:
         _bad_until[sym_no_sfx] = datetime.now(timezone.utc) + timedelta(minutes=QUARANTINE_MIN)
@@ -245,11 +230,11 @@ def get_candles(sym_no_sfx, limit=CANDLES_LIMIT):
                 if code != "00000":
                     if code in ("40034","41018","400"):
                         last_err = RuntimeError(f"param_error:{code}:{data.get('msg')}")
-                        break  # к след. варианту
+                        break
                     raise RuntimeError(f"bitget_error:{data}")
                 rows = data.get("data") or []
                 closes = []
-                for row in reversed(rows):  # от старых к новым
+                for row in reversed(rows):
                     try: closes.append(_candle_close(row))
                     except Exception: continue
                 if len(closes) >= MIN_CANDLES:
@@ -284,11 +269,7 @@ def floor_to_scale(x, scale):
     return math.floor(x*m)/m
 
 def compute_order_qty(sym_no_sfx: str, amount_usdt: float, price: float):
-    """
-    Возвращает (qty_str, info) для Bitget.
-    qty_str — уже округлено до quantityScale и готово для отправки;
-    info=None если всё ок, иначе краткая причина отказа.
-    """
+    """Никогда не вернёт пустой size. Возвращает (size_str или None, причина_если_None)."""
     if price is None or price <= 0:
         return None, "no_price"
 
@@ -367,7 +348,7 @@ def maybe_buy_signal():
 
     sym = chosen
     try:
-        price = get_ticker_price(sym)  # теперь с fallback и кэшем
+        price = get_ticker_price(sym)  # self-heal + кэш
         usdt_avail = get_usdt_balance()
         amount = min(BASE_TRADE_AMOUNT, usdt_avail)
 
@@ -377,8 +358,7 @@ def maybe_buy_signal():
             return
 
         place_market_order(sym, "buy", size_str)
-        qty = float(size_str)
-        notional = qty * price
+        qty = float(size_str); notional = qty * price
 
         positions[sym] = {"qty": qty, "avg": price, "amount": notional,
                           "opened": datetime.now(timezone.utc).isoformat()}
