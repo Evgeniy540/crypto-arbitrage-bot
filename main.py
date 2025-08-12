@@ -1,11 +1,11 @@
-# === main.py (Bitget SPOT; safe-size; self-heal tickers/candles; EMA 7/14; TP 1.0% / SL 0.7%; MIN_CANDLES=5) ===
+# === main.py (Bitget SPOT; quantity-param; safe-size; self-heal; EMA 7/14; TP 1.0% / SL 0.7%; MIN_CANDLES=5) ===
 import os, time, hmac, hashlib, base64, json, threading, math, logging, requests
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from collections import defaultdict
 from flask import Flask, request
 
-# ====== КЛЮЧИ (замени на свои при надобности) ======
+# ====== КЛЮЧИ (замени при необходимости) ======
 API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
 API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
 API_PASSPHRASE = "Evgeniy84"
@@ -14,17 +14,17 @@ API_PASSPHRASE = "Evgeniy84"
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 DAILY_REPORT_HHMM = os.environ.get("DAILY_REPORT_HHMM", "20:47").strip()
-USE_WEBHOOK = os.environ.get("TELEGRAM_WEBHOOK", "0") == "1"  # по умолчанию off
+USE_WEBHOOK = os.environ.get("TELEGRAM_WEBHOOK", "0") == "1"
 
 # ====== НАСТРОЙКИ ======
 SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","PEPEUSDT","BGBUSDT"]
-BASE_TRADE_AMOUNT = 10.0          # USDT на сделку
-TP_PCT = 0.010                    # +1.0%
-SL_PCT = 0.007                    # -0.7%
+BASE_TRADE_AMOUNT = 10.0
+TP_PCT = 0.010    # +1.0%
+SL_PCT = 0.007    # -0.7%
 EMA_FAST = 7
 EMA_SLOW = 14
 MIN_CANDLES = 5
-CHECK_INTERVAL = 30               # сек
+CHECK_INTERVAL = 30
 NO_SIGNAL_COOLDOWN_MIN = 60
 MAX_OPEN_POSITIONS = 2
 
@@ -36,13 +36,13 @@ BITGET = "https://api.bitget.com"
 # ====== SELF-HEAL ======
 MAX_RETRIES = 4
 RETRY_BASE_SLEEP = 0.5
-QUARANTINE_MIN = 10               # мин
+QUARANTINE_MIN = 10  # мин
 
 # ====== ЛОГГЕР ======
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot")
 
-# ====== Flask keep-alive ======
+# ====== Flask ======
 app = Flask(__name__)
 
 @app.get("/")
@@ -60,7 +60,7 @@ def telegram_webhook():
         log.warning(f"webhook error: {e}")
         return "err", 200
 
-# ====== УТИЛИТЫ ======
+# ====== UTIL ======
 def tg(text: str, chat_id: str | None = None):
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -101,19 +101,16 @@ profits   = load_json(PROFIT_FILE, {"total":0.0,"trades":[]})
 last_no_signal_sent = datetime.now(timezone.utc) - timedelta(minutes=NO_SIGNAL_COOLDOWN_MIN+1)
 _last_daily_report_date = None
 
-# ====== SELF-HEAL: индексы/карантин/кэш цены ======
-_bad_until: dict[str, datetime] = {}     # {sym_no_sfx: until_utc}
+# ====== self-heal cache/idx/quarantine ======
+_bad_until: dict[str, datetime] = {}
 _err_counter = defaultdict(int)
-PRICE_CACHE = {}  # {sym_no_sfx: {"px": float, "ts": datetime}}
+PRICE_CACHE = {}  # {sym: {"px": float, "ts": datetime}}
 
-def _cache_set(sym, px):
-    PRICE_CACHE[sym] = {"px": float(px), "ts": datetime.now(timezone.utc)}
-
+def _cache_set(sym, px): PRICE_CACHE[sym] = {"px": float(px), "ts": datetime.now(timezone.utc)}
 def _cache_get(sym, max_age_sec=300):
     it = PRICE_CACHE.get(sym)
     if not it: return None
-    if (datetime.now(timezone.utc) - it["ts"]).total_seconds() > max_age_sec:
-        return None
+    if (datetime.now(timezone.utc) - it["ts"]).total_seconds() > max_age_sec: return None
     return it["px"]
 
 @lru_cache(maxsize=256)
@@ -135,8 +132,7 @@ def normalize_symbol(sym_no_sfx: str) -> str:
 def _sleep_backoff(attempt): time.sleep(RETRY_BASE_SLEEP * (2 ** attempt))
 
 def _candle_close(row):
-    if isinstance(row, (list, tuple)) and len(row) >= 5:
-        return float(row[4])
+    if isinstance(row, (list, tuple)) and len(row) >= 5: return float(row[4])
     if isinstance(row, dict):
         for k in ("close", "c", "last", "endClose"):
             if k in row: return float(row[k])
@@ -153,8 +149,7 @@ def get_symbol_rules(sym_no_sfx: str):
 def _price_from_candles(sym_no_sfx):
     try:
         closes = get_candles(sym_no_sfx, limit=2)
-        if closes:
-            return float(closes[-1])
+        if closes: return float(closes[-1])
     except Exception as e:
         log.warning(f"{sym_no_sfx}: fallback candles price error {repr(e)}")
     return None
@@ -166,15 +161,11 @@ def get_ticker_price(sym_no_sfx) -> float:
 
     sym = normalize_symbol(sym_no_sfx)
     last_exc = None
-
     for attempt in range(MAX_RETRIES):
         try:
-            r = requests.get(
-                BITGET + "/api/spot/v1/market/tickers",
-                params={"symbol": sym},
-                headers={"User-Agent":"Mozilla/5.0"},
-                timeout=15
-            )
+            r = requests.get(BITGET + "/api/spot/v1/market/tickers",
+                             params={"symbol": sym},
+                             headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
             d = get_json_or_raise(r)
             if d.get("code") == "00000":
                 arr = d.get("data") or []
@@ -218,7 +209,6 @@ def get_candles(sym_no_sfx, limit=CANDLES_LIMIT):
         {"symbol": sym, "period": "1min", "limit": limit},
         {"symbol": sym, "granularity": "60", "limit": limit},
     ]
-
     last_err = None
     for params in variants:
         for attempt in range(MAX_RETRIES):
@@ -269,7 +259,7 @@ def floor_to_scale(x, scale):
     return math.floor(x*m)/m
 
 def compute_order_qty(sym_no_sfx: str, amount_usdt: float, price: float):
-    """Никогда не вернёт пустой size. Возвращает (size_str или None, причина_если_None)."""
+    """Возвращает (qty_str, why). Никогда не отдаёт пустое количество."""
     if price is None or price <= 0:
         return None, "no_price"
 
@@ -291,15 +281,22 @@ def compute_order_qty(sym_no_sfx: str, amount_usdt: float, price: float):
 
     return f"{qty:.{qscale}f}", None
 
-def place_market_order(sym_no_sfx, side, size_str):
-    if not size_str:
-        raise RuntimeError("empty_size")
+def place_market_order(sym_no_sfx, side, qty_str):
+    # Bitget SPOT: параметр называется quantity
+    if not qty_str or str(qty_str).strip() in ("", "0", "0.0"):
+        raise RuntimeError("empty_quantity")
     ts = now_ms()
     path = "/api/spot/v1/trade/orders"
-    body = {"symbol": normalize_symbol(sym_no_sfx), "side": side.lower(),
-            "orderType":"market","force":"gtc","size": size_str}
+    body = {
+        "symbol": normalize_symbol(sym_no_sfx),
+        "side": side.lower(),
+        "orderType": "market",
+        "force": "gtc",
+        "quantity": str(qty_str)  # ключевой фикс
+    }
     payload = json.dumps(body, separators=(",",":"))
     sign = sign_payload(ts,"POST",path,payload)
+    log.info(f"placing {side} {sym_no_sfx}: quantity={qty_str}")
     r = requests.post(BITGET+path, headers=headers(ts,sign), data=payload, timeout=20)
     d = get_json_or_raise(r)
     if d.get("code") != "00000": raise RuntimeError(f"order error: {d}")
@@ -324,7 +321,7 @@ def ema_signal(closes):
     if f[-2] >= s[-2] and f[-1] < s[-1]: return "short"
     return None
 
-# ====== ЛОГИКА ТОРГОВЛИ ======
+# ====== ТОРГОВЛЯ ======
 def maybe_buy_signal():
     global positions, last_no_signal_sent
     if len(positions) >= MAX_OPEN_POSITIONS: return
@@ -348,17 +345,17 @@ def maybe_buy_signal():
 
     sym = chosen
     try:
-        price = get_ticker_price(sym)  # self-heal + кэш
+        price = get_ticker_price(sym)
         usdt_avail = get_usdt_balance()
         amount = min(BASE_TRADE_AMOUNT, usdt_avail)
 
-        size_str, why = compute_order_qty(sym, amount, price)
+        qty_str, why = compute_order_qty(sym, amount, price)
         if why is not None:
-            tg(f"❕ {sym}: пропуск покупки ({why}). Баланс {usdt_avail:.4f} USDT.")
+            tg(f"❕ {sym}: покупка пропущена ({why}). Баланс {usdt_avail:.4f} USDT.")
             return
 
-        place_market_order(sym, "buy", size_str)
-        qty = float(size_str); notional = qty * price
+        place_market_order(sym, "buy", qty_str)
+        qty = float(qty_str); notional = qty * price
 
         positions[sym] = {"qty": qty, "avg": price, "amount": notional,
                           "opened": datetime.now(timezone.utc).isoformat()}
