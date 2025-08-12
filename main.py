@@ -1,6 +1,7 @@
 # === main.py — Bitget SPOT бот ===
-# Покупка: quoteOrderQty → quantity (без «quantity empty»), автоподгонка до minTradeUSDT*1.02
-# Продажа: quantity. Self-heal, EMA 7/14, TP 1.0%, SL 0.7%, /status /profit, Flask keep-alive.
+# Покупка: quoteOrderQty → size → quantity (без "quantity empty"),
+# автоподгонка суммы до minTradeUSDT*1.02. Продажа: size.
+# Self-heal, EMA 7/14, TP 1.0%, SL 0.7%, /status /profit, Flask keep-alive.
 
 import os, time, hmac, hashlib, base64, json, threading, math, logging, requests
 from datetime import datetime, timedelta, timezone
@@ -32,7 +33,7 @@ NO_SIGNAL_COOLDOWN_MIN = 60
 MAX_OPEN_POSITIONS = 2
 MIN_NOTIONAL_BUFFER = 1.02     # +2% к minTradeUSDT
 
-# при желании можно задать больший минимум по отдельным парам
+# при желании — бóльший минимум для отдельных пар
 MIN_TRADE_USDT_BY_SYMBOL = {
     # "TRXUSDT": 1.50,
 }
@@ -280,14 +281,9 @@ def get_usdt_balance() -> float:
     if not arr: return 0.0
     return float(arr[0].get("available","0"))
 
-# ====== ПОКУПКА (quote → quantity, автоподгонка до минимума) ======
+# ====== ПОКУПКА (quote → size → quantity, автоподгонка) ======
 def place_market_buy(sym_no_sfx: str, quote_usdt: float, _unused: str | None,
                      price_hint: float | None, usdt_balance: float):
-    """
-    Market BUY с каскадом и детерминированным qty:
-    1) quoteOrderQty (USDT) → 2) quantity (шт)
-    Если 45110 — поднимаем сумму до minTradeUSDT*1.02 (если хватает баланса) и повторяем.
-    """
     if not quote_usdt or quote_usdt <= 0:
         raise RuntimeError("empty_quote_usdt")
 
@@ -298,26 +294,21 @@ def place_market_buy(sym_no_sfx: str, quote_usdt: float, _unused: str | None,
     min_usdt_rule = float(max(1.0, rules.get("minTradeUSDT", 1.0)))
     min_needed = min_usdt_rule * MIN_NOTIONAL_BUFFER
 
-    # цена нужна обязательно для qty
     px = float(price_hint or get_ticker_price(sym_no_sfx))
 
-    def make_qty(quote: float) -> str:
+    def make_size(quote: float) -> str:
         qty_raw = quote / px
         qty = floor_to_scale(qty_raw, qscale)
         if qty <= 0:
-            # увеличим до минимума (если хватит баланса)
             need = max(min_needed, quote_usdt)
             if usdt_balance >= need:
                 q2 = floor_to_scale(need / px, qscale)
-                if q2 > 0:
-                    return f"{q2:.{qscale}f}"
-            # крайний случай — минимальный шаг
+                if q2 > 0: return f"{q2:.{qscale}f}"
             step = 10 ** (-qscale)
-            q3 = round(step, qscale)
-            return f"{q3:.{qscale}f}"
+            return f"{round(step, qscale):.{qscale}f}"
         return f"{qty:.{qscale}f}"
 
-    def soft_post(path: str, body: dict):
+    def soft_post(body: dict):
         ts = now_ms()
         payload = json.dumps(body, separators=(",", ":"))
         sign = sign_payload(ts, "POST", path, payload)
@@ -327,60 +318,52 @@ def place_market_buy(sym_no_sfx: str, quote_usdt: float, _unused: str | None,
         except Exception:
             return r.status_code, {"code": f"HTTP{r.status_code}", "msg": r.text}
 
-    def try_quote(quote: float):
-        body = {
-            "symbol": sym_api,
-            "side": "buy",
-            "orderType": "market",
-            "force": "gtc",
-            "clientOrderId": f"tg-{sym_no_sfx}-{int(time.time()*1000)}",
-            "quoteOrderQty": f"{float(quote):.4f}"
-        }
-        return soft_post(path, body)
+    def body_quote(q):
+        return {"symbol": sym_api, "side": "buy", "orderType": "market", "force": "gtc",
+                "clientOrderId": f"tg-{sym_no_sfx}-{int(time.time()*1000)}",
+                "quoteOrderQty": f"{float(q):.4f}"}
+    def body_size(s):
+        return {"symbol": sym_api, "side": "buy", "orderType": "market", "force": "gtc",
+                "clientOrderId": f"tg-{sym_no_sfx}-{int(time.time()*1000)}",
+                "size": s}
+    def body_quantity(qty):
+        return {"symbol": sym_api, "side": "buy", "orderType": "market", "force": "gtc",
+                "clientOrderId": f"tg-{sym_no_sfx}-{int(time.time()*1000)}",
+                "quantity": qty}
 
-    def try_qty(qty_str: str):
-        body = {
-            "symbol": sym_api,
-            "side": "buy",
-            "orderType": "market",
-            "force": "gtc",
-            "clientOrderId": f"tg-{sym_no_sfx}-{int(time.time()*1000)}",
-            "quantity": qty_str
-        }
-        return soft_post(path, body)
-
-    # попытка 1: quoteOrderQty базовой суммой
+    # попытка 1: quoteOrderQty
     quote = float(quote_usdt)
-    st1, d1 = try_quote(quote)
-    if str(d1.get("code")) == "00000":
-        return d1.get("data")
+    st1, d1 = soft_post(body_quote(quote))
+    if str(d1.get("code")) == "00000": return d1.get("data")
 
-    # если меньше минимума — поднимем сумму один раз
+    # если меньше минимума — поднять сумму один раз
     if str(d1.get("code")) == "45110" and usdt_balance >= min_needed:
         quote = floor_usdt(min_needed, 4)
-        st1b, d1b = try_quote(quote)
-        if str(d1b.get("code")) == "00000":
-            return d1b.get("data")
-        d1 = d1b  # анализируем последний ответ
+        st1b, d1b = soft_post(body_quote(quote))
+        if str(d1b.get("code")) == "00000": return d1b.get("data")
+        d1 = d1b
 
-    # попытка 2: quantity (строго не пустой)
-    qty_str = make_qty(quote)
-    st2, d2 = try_qty(qty_str)
-    if str(d2.get("code")) == "00000":
-        return d2.get("data")
+    # попытка 2: size (основной путь для SPOT на Bitget)
+    size_str = make_size(quote)
+    st2, d2 = soft_post(body_size(size_str))
+    if str(d2.get("code")) == "00000": return d2.get("data")
 
-    # не удалось — прозрачный отчёт в TG
+    # попытка 3: quantity (на случай, если у аккаунта включён альтернативный формат)
+    st3, d3 = soft_post(body_quantity(size_str))
+    if str(d3.get("code")) == "00000": return d3.get("data")
+
+    # не удалось — отчёт в TG
     tg(
         f"❗ Не удалось купить {sym_no_sfx}: "
-        f"quote={quote:.4f} USDT, qty={qty_str} (qscale={qscale}).\n"
-        f"Ответы: quote→ {st1} {d1}; quantity→ {st2} {d2}"
+        f"quote={quote:.4f} USDT, size/qty={size_str} (qscale={qscale}).\n"
+        f"Ответы: quote→ {st1} {d1}; size→ {st2} {d2}; quantity→ {st3} {d3}"
     )
-    raise RuntimeError(f"order error: {st2} {d2}")
+    raise RuntimeError(f"order error: {st3} {d3}")
 
-# ====== Продажа ======
-def place_market_sell(sym_no_sfx: str, qty_str: str):
-    if not qty_str or str(qty_str).strip() in ("", "0", "0.0"):
-        raise RuntimeError("empty_quantity")
+# ====== Продажа (size) ======
+def place_market_sell(sym_no_sfx: str, size_str: str):
+    if not size_str or str(size_str).strip() in ("", "0", "0.0"):
+        raise RuntimeError("empty_size")
     ts = now_ms()
     path = "/api/spot/v1/trade/orders"
     body = {
@@ -388,7 +371,7 @@ def place_market_sell(sym_no_sfx: str, qty_str: str):
         "side": "sell",
         "orderType": "market",
         "force": "gtc",
-        "quantity": str(qty_str)
+        "size": str(size_str)
     }
     payload = json.dumps(body, separators=(",",":"))
     sign = sign_payload(ts,"POST",path,payload)
@@ -444,7 +427,7 @@ def maybe_buy_signal():
 
     sym = chosen
     try:
-        price = get_ticker_price(sym)   # для отчёта
+        price = get_ticker_price(sym)
         usdt_avail = get_usdt_balance()
 
         min_usdt = _min_notional(sym)
@@ -455,15 +438,15 @@ def maybe_buy_signal():
             return
 
         qscale = int(get_symbol_rules(sym)["quantityScale"])
-        qty_est = floor_to_scale(quote / price, qscale)
+        size_est = floor_to_scale(quote / price, qscale)
 
         place_market_buy(sym, quote, None, price, usdt_avail)
 
-        notional = qty_est * price
-        positions[sym] = {"qty": qty_est, "avg": price, "amount": notional,
+        notional = size_est * price
+        positions[sym] = {"qty": size_est, "avg": price, "amount": notional,
                           "opened": datetime.now(timezone.utc).isoformat()}
         save_json(STATE_FILE, positions)
-        tg(f"✅ Покупка {sym}: ~qty={qty_est}, цена≈{price:.8f}, сумма≈{quote:.4f} USDT. (EMA {EMA_FAST}/{EMA_SLOW})")
+        tg(f"✅ Покупка {sym}: ~qty={size_est}, цена≈{price:.8f}, сумма≈{quote:.4f} USDT. (EMA {EMA_FAST}/{EMA_SLOW})")
     except Exception as e:
         if _should_send_err(f"buy_{sym}"):
             tg(f"❗ Ошибка покупки {sym}: {e}")
@@ -484,21 +467,21 @@ def manage_positions():
             if reason:
                 rules = get_symbol_rules(sym)
                 qscale = int(rules["quantityScale"])
-                qty = floor_to_scale(float(pos["qty"]), qscale)
-                if qty <= 0: to_close.append(sym); continue
+                size = floor_to_scale(float(pos["qty"]), qscale)
+                if size <= 0: to_close.append(sym); continue
                 min_usdt = max(1.0, rules["minTradeUSDT"])
-                if qty*price < min_usdt:
+                if size*price < min_usdt:
                     if _should_send_err(f"sell_min_{sym}"):
-                        tg(f"❗ Продажа {sym} отклонена: сумма {qty*price:.6f} < {min_usdt:.6f} USDT.")
+                        tg(f"❗ Продажа {sym} отклонена: сумма {size*price:.6f} < {min_usdt:.6f} USDT.")
                     to_close.append(sym); continue
 
-                place_market_sell(sym, f"{qty:.{qscale}f}")
-                pnl = (price - avg)*qty
+                place_market_sell(sym, f"{size:.{qscale}f}")
+                pnl = (price - avg)*size
                 profits["total"] += pnl
-                profits["trades"].append({"symbol":sym,"qty":qty,"buy":avg,"sell":price,
+                profits["trades"].append({"symbol":sym,"qty":size,"buy":avg,"sell":price,
                                           "pnl":pnl,"closed":datetime.now(timezone.utc).isoformat(),"reason":reason})
                 save_json(PROFIT_FILE, profits)
-                tg(f"💰 {reason} {sym}: qty={qty}, {avg:.8f}→{price:.8f}, PnL={pnl:.4f} USDT. Итого: {profits['total']:.4f} USDT.")
+                tg(f"💰 {reason} {sym}: qty={size}, {avg:.8f}→{price:.8f}, PnL={pnl:.4f} USDT. Итого: {profits['total']:.4f} USDT.")
                 to_close.append(sym)
         except Exception as e:
             log.warning(f"manage error {sym}: {e}")
