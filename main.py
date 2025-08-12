@@ -1,11 +1,11 @@
-# === main.py (Bitget SPOT; self-heal tickers/candles; EMA 7/14; TP 1.0% / SL 0.7%; MIN_CANDLES=5; /profit, /status; watchdog; Flask) ===
+# === main.py (Bitget SPOT; self-heal; safe-size; EMA 7/14; TP 1.0% / SL 0.7%; MIN_CANDLES=5) ===
 import os, time, hmac, hashlib, base64, json, threading, math, logging, requests
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from collections import defaultdict
 from flask import Flask, request
 
-# ====== КЛЮЧИ (твои) ======
+# ====== КЛЮЧИ (примерные; оставь свои) ======
 API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
 API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
 API_PASSPHRASE = "Evgeniy84"
@@ -279,11 +279,44 @@ def get_usdt_balance() -> float:
     if not arr: return 0.0
     return float(arr[0].get("available","0"))
 
-def place_market_order(sym_no_sfx, side, size):
+def floor_to_scale(x, scale):
+    m = 10 ** max(0, scale)
+    return math.floor(x*m)/m
+
+def compute_order_qty(sym_no_sfx: str, amount_usdt: float, price: float):
+    """
+    Возвращает (qty_str, info) для Bitget.
+    qty_str — уже округлено до quantityScale и готово для отправки;
+    info=None если всё ок, иначе краткая причина отказа.
+    """
+    if price is None or price <= 0:
+        return None, "no_price"
+
+    rules = get_symbol_rules(sym_no_sfx)
+    qscale = int(rules.get("quantityScale", 4))
+    min_usdt = float(max(1.0, rules.get("minTradeUSDT", 1.0)))
+
+    if amount_usdt < min_usdt:
+        return None, f"amount<{min_usdt:.4f}"
+
+    qty = floor_to_scale(amount_usdt / price, qscale)
+    if qty <= 0:
+        qty = floor_to_scale((min_usdt / price) * 1.0001, qscale)
+
+    if qty <= 0:
+        return None, "qty_zero"
+    if qty * price < min_usdt:
+        return None, f"notional<{min_usdt:.4f}"
+
+    return f"{qty:.{qscale}f}", None
+
+def place_market_order(sym_no_sfx, side, size_str):
+    if not size_str:
+        raise RuntimeError("empty_size")
     ts = now_ms()
     path = "/api/spot/v1/trade/orders"
     body = {"symbol": normalize_symbol(sym_no_sfx), "side": side.lower(),
-            "orderType":"market","force":"gtc","size": str(size)}
+            "orderType":"market","force":"gtc","size": size_str}
     payload = json.dumps(body, separators=(",",":"))
     sign = sign_payload(ts,"POST",path,payload)
     r = requests.post(BITGET+path, headers=headers(ts,sign), data=payload, timeout=20)
@@ -310,10 +343,6 @@ def ema_signal(closes):
     if f[-2] >= s[-2] and f[-1] < s[-1]: return "short"
     return None
 
-def floor_to_scale(x, scale):
-    m = 10 ** max(0, scale)
-    return math.floor(x*m)/m
-
 # ====== ЛОГИКА ТОРГОВЛИ ======
 def maybe_buy_signal():
     global positions, last_no_signal_sent
@@ -338,23 +367,20 @@ def maybe_buy_signal():
 
     sym = chosen
     try:
-        rules = get_symbol_rules(sym)
         price = get_ticker_price(sym)  # теперь с fallback и кэшем
         usdt_avail = get_usdt_balance()
         amount = min(BASE_TRADE_AMOUNT, usdt_avail)
-        min_usdt = max(1.0, rules["minTradeUSDT"])
-        if amount < min_usdt:
-            tg(f"Недостаточно USDT для {sym}. Баланс {usdt_avail:.4f}, минимум {min_usdt:.4f}."); return
 
-        qty = floor_to_scale(amount/price, rules["quantityScale"])
-        if qty*price < min_usdt:
-            qty = floor_to_scale((min_usdt/price)*1.0001, rules["quantityScale"])
-        notional = qty*price
-        if qty <= 0 or notional < min_usdt:
-            tg(f"❗ {sym}: сумма после округления {notional:.6f} < {min_usdt:.6f}. Увеличь сумму сделки."); return
+        size_str, why = compute_order_qty(sym, amount, price)
+        if why is not None:
+            tg(f"❕ {sym}: пропуск покупки ({why}). Баланс {usdt_avail:.4f} USDT.")
+            return
 
-        place_market_order(sym, "buy", f"{qty:.{rules['quantityScale']}f}")
-        positions[sym] = {"qty":qty, "avg":price, "amount":notional,
+        place_market_order(sym, "buy", size_str)
+        qty = float(size_str)
+        notional = qty * price
+
+        positions[sym] = {"qty": qty, "avg": price, "amount": notional,
                           "opened": datetime.now(timezone.utc).isoformat()}
         save_json(STATE_FILE, positions)
         tg(f"✅ Покупка {sym}: qty={qty}, цена≈{price:.8f}, сумма≈{notional:.4f} USDT. (EMA {EMA_FAST}/{EMA_SLOW})")
@@ -376,13 +402,15 @@ def manage_positions():
 
             if reason:
                 rules = get_symbol_rules(sym)
-                qty = floor_to_scale(float(pos["qty"]), rules["quantityScale"])
+                qscale = int(rules["quantityScale"])
+                qty = floor_to_scale(float(pos["qty"]), qscale)
                 if qty <= 0: to_close.append(sym); continue
                 min_usdt = max(1.0, rules["minTradeUSDT"])
                 if qty*price < min_usdt:
-                    tg(f"❗ Продажа {sym} отклонена: сумма {qty*price:.6f} < {min_usdt:.6f} USDT."); to_close.append(sym); continue
+                    tg(f"❗ Продажа {sym} отклонена: сумма {qty*price:.6f} < {min_usdt:.6f} USDT.")
+                    to_close.append(sym); continue
 
-                place_market_order(sym, "sell", f"{qty:.{rules['quantityScale']}f}")
+                place_market_order(sym, "sell", f"{qty:.{qscale}f}")
                 pnl = (price - avg)*qty
                 profits["total"] += pnl
                 profits["trades"].append({"symbol":sym,"qty":qty,"buy":avg,"sell":price,
