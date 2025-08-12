@@ -1,57 +1,69 @@
-# === main.py (Bitget SPOT; _SPBL fix; EMA 7/14; TP 0.8% / SL 0.6%; трейлинг до BE; 2 позиции; /profit; daily; Flask) ===
+# === main.py (Bitget SPOT; self-heal; EMA 9/21; TP 1.5% / SL 1%; MIN_CANDLES=10; /profit, /status; watchdog; Flask) ===
 import os, time, hmac, hashlib, base64, json, threading, math, logging, requests
-from datetime import datetime, timedelta
-from flask import Flask
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from flask import Flask, request
 
-# ===== КЛЮЧИ =====
+# ====== КЛЮЧИ (оставил как у тебя) ======
 API_KEY = "bg_7bd202760f36727cedf11a481dbca611"
 API_SECRET = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
 API_PASSPHRASE = "Evgeniy84"
 
-# ===== TELEGRAM =====
+# ====== TELEGRAM ======
 TELEGRAM_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 DAILY_REPORT_HHMM = os.environ.get("DAILY_REPORT_HHMM", "20:47").strip()
+USE_WEBHOOK = os.environ.get("TELEGRAM_WEBHOOK", "0") == "1"  # по умолчанию off
 
-# ===== НАСТРОЙКИ =====
+# ====== НАСТРОЙКИ ======
 SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","PEPEUSDT","BGBUSDT"]
-BASE_TRADE_AMOUNT = 10.0
-TP_PCT = 0.008
-SL_PCT = 0.006
-TRAIL_ARM_PCT = 0.005
-EMA_FAST = 7
-EMA_SLOW = 14
-CHECK_INTERVAL = 15
+BASE_TRADE_AMOUNT = 10.0         # USDT на сделку
+TP_PCT = 0.015                   # +1.5%
+SL_PCT = 0.010                   # -1.0%
+EMA_FAST = 9
+EMA_SLOW = 21
+MIN_CANDLES = 10                 # было 21 — сделаем чаще
+CHECK_INTERVAL = 15              # сек
 NO_SIGNAL_COOLDOWN_MIN = 60
 MAX_OPEN_POSITIONS = 2
 
-CANDLE_PERIOD = "1min"
-CANDLES_LIMIT = 100
+CANDLES_LIMIT = max(100, EMA_SLOW + 20)
 STATE_FILE = "positions.json"
 PROFIT_FILE = "profit.json"
 BITGET = "https://api.bitget.com"
 
-# ===== ЛОГГЕР =====
+# ====== ЛОГГЕР ======
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot")
 
-# ===== FLASK keep-alive =====
+# ====== Flask keep-alive ======
 app = Flask(__name__)
-@app.route("/")
+
+@app.get("/")
 def health(): return "OK", 200
 
-# ===== УТИЛИТЫ =====
-def api_symbol(sym: str) -> str:
-    s = sym if sym.endswith("_SPBL") else f"{sym}_SPBL"
-    return s
+# глотатель вебхуков, чтобы не было 404 в логах; при желании можно включить вебхук
+@app.post("/telegram")
+def telegram_webhook():
+    if not USE_WEBHOOK:
+        return "webhook disabled", 200
+    try:
+        upd = request.get_json(force=True, silent=True) or {}
+        handle_telegram_update(upd)
+        return "ok", 200
+    except Exception as e:
+        log.warning(f"webhook error: {e}")
+        return "err", 200
 
-def tg(text: str, chat_id: str = None):
+# ====== УТИЛИТЫ ======
+def tg(text: str, chat_id: str | None = None):
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                       data={"chat_id": chat_id or TELEGRAM_CHAT_ID, "text": text}, timeout=10)
-    except Exception as e: logging.warning(f"TG send error: {e}")
+    except Exception as e:
+        log.warning(f"TG send error: {e}")
 
-def now_ms(): return str(int(time.time() * 1000))
+def now_ms() -> str: return str(int(time.time() * 1000))
 
 def sign_payload(ts: str, method: str, path: str, body: str = "") -> str:
     prehash = ts + method.upper() + path + body
@@ -70,7 +82,7 @@ def get_json_or_raise(resp):
     if resp.status_code >= 400: raise RuntimeError(f"HTTP {resp.status_code}: {txt}")
     return data
 
-# ===== ХРАНИЛКИ =====
+# ====== ХРАНИЛКИ ======
 def load_json(path, default):
     try:
         with open(path,"r",encoding="utf-8") as f: return json.load(f)
@@ -79,54 +91,90 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
 
-positions = load_json(STATE_FILE, {})  # {sym: {qty, avg, amount, opened, stop}}
+# positions[sym] = {"qty":..., "avg":..., "amount":..., "opened":..., "stop":...}
+positions = load_json(STATE_FILE, {})
 profits   = load_json(PROFIT_FILE, {"total":0.0,"trades":[]})
-last_no_signal_sent = datetime.utcnow() - timedelta(minutes=NO_SIGNAL_COOLDOWN_MIN+1)
+last_no_signal_sent = datetime.now(timezone.utc) - timedelta(minutes=NO_SIGNAL_COOLDOWN_MIN+1)
 _last_daily_report_date = None
 
-# ===== BITGET =====
-def get_products():
-    r = requests.get(BITGET + "/api/spot/v1/public/products", timeout=15, headers={"User-Agent":"Mozilla/5.0"})
-    data = get_json_or_raise(r)
-    if data.get("code") != "00000": raise RuntimeError(f"products error: {data}")
-    return data["data"]
+# ====== SELF-HEAL CORE ======
+_BAD_SYMBOLS_UNTIL: dict[str, datetime] = {}  # quarantine map
 
-_RULES = {}
-def get_symbol_rules(sym_no_sfx):
-    sym = api_symbol(sym_no_sfx)
-    if sym in _RULES: return _RULES[sym]
-    for p in get_products():
-        if p.get("symbol") == sym:
-            _RULES[sym] = {
-                "priceScale": int(p.get("priceScale",4)),
-                "quantityScale": int(p.get("quantityScale",4)),
-                "minTradeUSDT": float(p.get("minTradeUSDT",1.0))
-            }
-            return _RULES[sym]
-    logging.warning(f"Rules not found for {sym}, using defaults.")
-    _RULES[sym] = {"priceScale":4,"quantityScale":4,"minTradeUSDT":1.0}
-    return _RULES[sym]
+@lru_cache(maxsize=256)
+def _products_index() -> dict[str, dict]:
+    r = requests.get(BITGET + "/api/spot/v1/public/products", timeout=15,
+                     headers={"User-Agent":"Mozilla/5.0"})
+    d = get_json_or_raise(r)
+    if d.get("code") != "00000": raise RuntimeError(f"products error: {d}")
+    return {p["symbol"]: p for p in d.get("data", [])}
+
+def normalize_symbol(sym_no_sfx: str) -> str:
+    cand = sym_no_sfx if sym_no_sfx.endswith("_SPBL") else f"{sym_no_sfx}_SPBL"
+    idx = _products_index()
+    if cand in idx: return cand
+    alt = cand.upper()
+    if alt in idx: return alt
+    raise RuntimeError(f"symbol_not_found:{sym_no_sfx}")
+
+def bitget_get(path: str, params: dict, timeout=15):
+    delay = 0.5
+    for i in range(5):
+        try:
+            r = requests.get(BITGET + path, params=params,
+                             headers={"User-Agent":"Mozilla/5.0"}, timeout=timeout)
+            data = r.json()
+            code = data.get("code")
+        except Exception as e:
+            if i == 4: raise
+            time.sleep(delay); delay *= 1.7; continue
+        if code == "00000": return data
+        if code in ("40034","41018","400"):  # параметр/символ не существует
+            raise RuntimeError(f"param_error:{code}:{data.get('msg','')}")
+        if r.status_code >= 500 or code in ("40715","40716"):  # тех. проблемы
+            if i == 4: raise RuntimeError(f"server_error:{code}:{data}")
+            time.sleep(delay); delay *= 1.7; continue
+        raise RuntimeError(f"bitget_error:{code}:{data}")
+    raise RuntimeError("unreachable")
+
+def get_symbol_rules(sym_no_sfx: str):
+    sym = normalize_symbol(sym_no_sfx)
+    p = _products_index()[sym]
+    return {"priceScale": int(p.get("priceScale",4)),
+            "quantityScale": int(p.get("quantityScale",4)),
+            "minTradeUSDT": float(p.get("minTradeUSDT",1.0))}
 
 def get_ticker_price(sym_no_sfx) -> float:
-    sym = api_symbol(sym_no_sfx)
-    url = BITGET + f"/api/spot/v1/market/tickers?symbol={sym}"
-    r = requests.get(url, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
-    data = get_json_or_raise(r)
-    if data.get("code") != "00000": raise RuntimeError(f"ticker error: {data}")
-    arr = data.get("data", [])
-    if not arr: raise RuntimeError("empty ticker")
+    if _BAD_SYMBOLS_UNTIL.get(sym_no_sfx, datetime.min.replace(tzinfo=timezone.utc)) > datetime.now(timezone.utc):
+        raise RuntimeError(f"symbol_quarantined:{sym_no_sfx}")
+    sym = normalize_symbol(sym_no_sfx)
+    d = bitget_get("/api/spot/v1/market/tickers", {"symbol": sym})
+    arr = d.get("data", [])
+    if not arr: raise RuntimeError("empty_ticker")
     return float(arr[0]["lastPr"])
 
-def get_candles(sym_no_sfx, period=CANDLE_PERIOD, limit=CANDLES_LIMIT):
-    sym = api_symbol(sym_no_sfx)
-    url = BITGET + f"/api/spot/v1/market/candles?symbol={sym}&period={period}&limit={limit}"
-    r = requests.get(url, timeout=20, headers={"User-Agent":"Mozilla/5.0"})
-    data = get_json_or_raise(r)
-    if data.get("code") != "00000": raise RuntimeError(f"candles error: {data}")
-    rows = data.get("data", [])
-    if not rows: return []
-    rows = list(reversed(rows))
-    return [float(x[4]) for x in rows]
+def get_candles(sym_no_sfx, limit=CANDLES_LIMIT):
+    if _BAD_SYMBOLS_UNTIL.get(sym_no_sfx, datetime.min.replace(tzinfo=timezone.utc)) > datetime.now(timezone.utc):
+        raise RuntimeError(f"symbol_quarantined:{sym_no_sfx}")
+    sym = normalize_symbol(sym_no_sfx)
+    # попытка 1: period=1min
+    try:
+        d = bitget_get("/api/spot/v1/market/candles", {"symbol": sym, "period":"1min", "limit": limit})
+        rows = d.get("data", [])
+        if rows and len(rows) >= MIN_CANDLES:
+            rows = list(reversed(rows))
+            return [float(x[4]) for x in rows]
+    except RuntimeError as e:
+        if not str(e).startswith("param_error"):
+            raise
+    # попытка 2: granularity=60
+    d2 = bitget_get("/api/spot/v1/market/candles", {"symbol": sym, "granularity":"60", "limit": limit})
+    rows2 = d2.get("data", [])
+    if rows2 and len(rows2) >= MIN_CANDLES:
+        rows2 = list(reversed(rows2))
+        return [float(x[4]) for x in rows2]
+    # карантин монеты на 10 минут
+    _BAD_SYMBOLS_UNTIL[sym_no_sfx] = datetime.now(timezone.utc) + timedelta(minutes=10)
+    raise RuntimeError(f"no_candles:{sym_no_sfx}")
 
 def get_usdt_balance() -> float:
     ts = now_ms()
@@ -134,35 +182,36 @@ def get_usdt_balance() -> float:
     q = "coin=USDT"
     sign = sign_payload(ts,"GET",path+"?"+q,"")
     r = requests.get(BITGET+path, params={"coin":"USDT"}, headers=headers(ts,sign), timeout=15)
-    data = get_json_or_raise(r)
-    if data.get("code") != "00000": raise RuntimeError(f"balance error: {data}")
-    arr = data.get("data", [])
+    d = get_json_or_raise(r)
+    if d.get("code") != "00000": raise RuntimeError(f"balance error: {d}")
+    arr = d.get("data", [])
     if not arr: return 0.0
     return float(arr[0].get("available","0"))
 
 def place_market_order(sym_no_sfx, side, size):
     ts = now_ms()
     path = "/api/spot/v1/trade/orders"
-    body = {"symbol": api_symbol(sym_no_sfx), "side": side.lower(),
-            "orderType":"market","force":"gtc","size": str(size)}
+    body = {"symbol": normalize_symbol(sym_no_sfx), "side": side.lower(),
+            "orderType": "market", "force":"gtc", "size": str(size)}
     payload = json.dumps(body, separators=(",",":"))
     sign = sign_payload(ts,"POST",path,payload)
     r = requests.post(BITGET+path, headers=headers(ts,sign), data=payload, timeout=20)
-    data = get_json_or_raise(r)
-    if data.get("code") != "00000": raise RuntimeError(f"order error: {data}")
-    return data["data"]
+    d = get_json_or_raise(r)
+    if d.get("code") != "00000": raise RuntimeError(f"order error: {d}")
+    return d["data"]
 
-# ===== ТЕХНИКА =====
+# ====== ТЕХНИКА ======
 def ema(values, period):
     if len(values) < period: return []
-    k = 2 / (period + 1)
-    out = [sum(values[:period]) / period]
-    for v in values[period:]: out.append(v*k + out[-1]*(1-k))
+    k = 2/(period+1)
+    out = [sum(values[:period])/period]
+    for v in values[period:]:
+        out.append(v*k + out[-1]*(1-k))
     return out
 
 def ema_signal(closes):
     if len(closes) < EMA_SLOW: return None
-    f = ema(closes, EMA_FAST); s = ema(closes, EMA_SLOW)
+    f, s = ema(closes, EMA_FAST), ema(closes, EMA_SLOW)
     if len(f) > len(s): f = f[-len(s):]
     if len(s) > len(f): s = s[-len(f):]
     if len(f) < 2: return None
@@ -170,11 +219,11 @@ def ema_signal(closes):
     if f[-2] >= s[-2] and f[-1] < s[-1]: return "short"
     return None
 
-def floor_to_scale(x, scale):
+def floor_to_scale(x, scale):  # биржевое округление вниз
     m = 10 ** max(0, scale)
     return math.floor(x*m)/m
 
-# ===== ПОКУПКА =====
+# ====== ЛОГИКА ПОКУПКИ/ПРОДАЖИ ======
 def maybe_buy_signal():
     global positions, last_no_signal_sent
     if len(positions) >= MAX_OPEN_POSITIONS: return
@@ -183,17 +232,17 @@ def maybe_buy_signal():
     for sym in SYMBOLS:
         if sym in positions: continue
         try:
-            closes = get_candles(sym, CANDLE_PERIOD, CANDLES_LIMIT)
-            if len(closes) < EMA_SLOW: continue
+            closes = get_candles(sym, CANDLES_LIMIT)
+            if len(closes) < MIN_CANDLES: continue
             if ema_signal(closes) == "long":
                 chosen = sym; break
         except Exception as e:
-            logging.warning(f"{sym}: candles error: {e}")
+            log.warning(f"{sym}: candles_error {repr(e)}")
 
     if not chosen:
-        if datetime.utcnow() - last_no_signal_sent >= timedelta(minutes=NO_SIGNAL_COOLDOWN_MIN):
+        if datetime.now(timezone.utc) - last_no_signal_sent >= timedelta(minutes=NO_SIGNAL_COOLDOWN_MIN):
             tg(f"По рынку нет сигнала (EMA {EMA_FAST}/{EMA_SLOW}).")
-            last_no_signal_sent = datetime.utcnow()
+            last_no_signal_sent = datetime.now(timezone.utc)
         return
 
     sym = chosen
@@ -201,33 +250,26 @@ def maybe_buy_signal():
         rules = get_symbol_rules(sym)
         price = get_ticker_price(sym)
         usdt_avail = get_usdt_balance()
-
         amount = min(BASE_TRADE_AMOUNT, usdt_avail)
         min_usdt = max(1.0, rules["minTradeUSDT"])
         if amount < min_usdt:
-            tg(f"Недостаточно USDT для {sym}. Баланс: {usdt_avail:.4f}, минимум: {min_usdt:.4f}.")
-            return
-
+            tg(f"Недостаточно USDT для {sym}. Баланс {usdt_avail:.4f}, минимум {min_usdt:.4f}."); return
         qty = floor_to_scale(amount/price, rules["quantityScale"])
         if qty*price < min_usdt:
             qty = floor_to_scale((min_usdt/price)*1.0001, rules["quantityScale"])
-
         notional = qty*price
         if qty <= 0 or notional < min_usdt:
-            tg(f"❗ {sym}: сумма после округления {notional:.6f} < {min_usdt:.6f}. Увеличь сумму сделки.")
-            return
+            tg(f"❗ {sym}: сумма после округления {notional:.6f} < {min_usdt:.6f}. Увеличь сумму сделки."); return
 
         place_market_order(sym, "buy", f"{qty:.{rules['quantityScale']}f}")
-        positions[sym] = {"qty": qty, "avg": price, "amount": notional,
-                          "opened": datetime.utcnow().isoformat(),
-                          "stop": price*(1-SL_PCT)}
+        positions[sym] = {"qty":qty, "avg":price, "amount":notional,
+                          "opened": datetime.now(timezone.utc).isoformat()}
         save_json(STATE_FILE, positions)
         tg(f"✅ Покупка {sym}: qty={qty}, цена≈{price:.8f}, сумма≈{notional:.4f} USDT. (EMA {EMA_FAST}/{EMA_SLOW})")
     except Exception as e:
         tg(f"❗ Ошибка покупки {sym}: {e}")
-        logging.exception(f"buy error {sym}: {e}")
+        log.exception(f"buy error {sym}: {e}")
 
-# ===== УПРАВЛЕНИЕ ПОЗИЦИЯМИ =====
 def manage_positions():
     global positions, profits
     to_close = []
@@ -236,14 +278,9 @@ def manage_positions():
             price = get_ticker_price(sym)
             avg = pos["avg"]
             change = (price - avg) / avg
-
-            # трейлинг в безубыток (без TG-уведомлений)
-            if change >= TRAIL_ARM_PCT:
-                pos["stop"] = max(pos.get("stop", avg*(1-SL_PCT)), avg)
-
             reason = None
             if change >= TP_PCT: reason = "TP"
-            elif price <= pos.get("stop", avg*(1-SL_PCT)): reason = "SL/Trail"
+            elif change <= -SL_PCT: reason = "SL"
 
             if reason:
                 rules = get_symbol_rules(sym)
@@ -251,28 +288,23 @@ def manage_positions():
                 if qty <= 0: to_close.append(sym); continue
                 min_usdt = max(1.0, rules["minTradeUSDT"])
                 if qty*price < min_usdt:
-                    tg(f"❗ Продажа {sym} отклонена: сумма {qty*price:.6f} < {min_usdt:.6f} USDT.")
-                    to_close.append(sym); continue
+                    tg(f"❗ Продажа {sym} отклонена: сумма {qty*price:.6f} < {min_usdt:.6f} USDT."); to_close.append(sym); continue
 
                 place_market_order(sym, "sell", f"{qty:.{rules['quantityScale']}f}")
-                pnl = (price - avg) * qty
+                pnl = (price - avg)*qty
                 profits["total"] += pnl
-                profits["trades"].append({
-                    "symbol": sym, "qty": qty, "buy": avg, "sell": price,
-                    "pnl": pnl, "closed": datetime.utcnow().isoformat(), "reason": reason
-                })
+                profits["trades"].append({"symbol":sym,"qty":qty,"buy":avg,"sell":price,
+                                          "pnl":pnl,"closed":datetime.now(timezone.utc).isoformat(),"reason":reason})
                 save_json(PROFIT_FILE, profits)
                 tg(f"💰 {reason} {sym}: qty={qty}, {avg:.8f}→{price:.8f}, PnL={pnl:.4f} USDT. Итого: {profits['total']:.4f} USDT.")
                 to_close.append(sym)
-            else:
-                positions[sym] = pos
         except Exception as e:
-            logging.warning(f"manage error {sym}: {e}")
+            log.warning(f"manage error {sym}: {e}")
 
     for sym in to_close: positions.pop(sym, None)
     if to_close: save_json(STATE_FILE, positions)
 
-# ===== ОТЧЁТЫ =====
+# ====== ОТЧЁТЫ/КОМАНДЫ ======
 def format_profit_report():
     total = profits.get("total", 0.0)
     trades = profits.get("trades", [])
@@ -280,7 +312,7 @@ def format_profit_report():
     if positions:
         lines.append("Открытые позиции:")
         for s,p in positions.items():
-            lines.append(f"• {s}: qty={p['qty']}, avg={p['avg']:.8f}, stop={p.get('stop',0):.8f}")
+            lines.append(f"• {s}: qty={p['qty']}, avg={p['avg']:.8f}")
     if trades:
         lines.append("Последние сделки:")
         for t in trades[-5:]:
@@ -289,17 +321,37 @@ def format_profit_report():
         lines.append("Сделок ещё не было.")
     return "\n".join(lines)
 
+def format_status(balance_now: float):
+    return "\n".join([
+        "🛠 Статус",
+        f"Баланс USDT: {balance_now:.4f}",
+        f"Сделка: {BASE_TRADE_AMOUNT:.4f} USDT",
+        f"Открытых позиций: {len(positions)}/{MAX_OPEN_POSITIONS}",
+        f"EMA {EMA_FAST}/{EMA_SLOW}, TP {TP_PCT*100:.1f}%, SL {SL_PCT*100:.1f}%, MIN_CANDLES {MIN_CANDLES}",
+    ] + ([*(f"• {s}: qty={p['qty']}, avg={p['avg']:.8f}" for s,p in positions.items())] if positions else []))
+
 def send_daily_report_if_time():
     global _last_daily_report_date
-    hhmm = datetime.now().strftime("%H:%M")
+    hhmm = datetime.now(timezone.utc).strftime("%H:%M")
     if hhmm == DAILY_REPORT_HHMM:
-        today = datetime.now().date()
+        today = datetime.now(timezone.utc).date()
         if _last_daily_report_date != today:
-            tg("🗓 Ежедневный отчёт:\n"+format_profit_report())
+            tg("🗓 Ежедневный отчёт:\n" + format_profit_report())
             _last_daily_report_date = today
 
-# ===== Telegram long-polling (/profit) =====
-def telegram_loop():
+def handle_telegram_update(upd: dict):
+    msg = upd.get("message") or upd.get("edited_message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id") or TELEGRAM_CHAT_ID)
+    text = (msg.get("text") or "").strip().lower()
+    if text.startswith("/profit"):
+        tg(format_profit_report(), chat_id=chat_id)
+    elif text.startswith("/status"):
+        try: bal = get_usdt_balance()
+        except Exception: bal = 0.0
+        tg(format_status(bal), chat_id=chat_id)
+
+# ====== Telegram long-polling ======
+def telegram_polling_loop():
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     offset = None
     while True:
@@ -311,31 +363,47 @@ def telegram_loop():
             if not data.get("ok"): time.sleep(2); continue
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
-                msg = upd.get("message") or upd.get("edited_message")
-                if not msg: continue
-                chat_id = str(msg["chat"]["id"])
-                text = (msg.get("text") or "").strip().lower()
-                if text.startswith("/profit"):
-                    tg(format_profit_report(), chat_id=chat_id)
+                handle_telegram_update(upd)
         except Exception:
             time.sleep(2)
         try: send_daily_report_if_time()
         except Exception: pass
 
-# ===== ЦИКЛ =====
+# ====== ЦИКЛЫ + WATCHDOG ======
 def trading_loop():
     while True:
         try:
             manage_positions()
             maybe_buy_signal()
         except Exception as e:
-            logging.exception(f"loop error: {e}")
+            log.exception(f"loop error: {e}")
         time.sleep(CHECK_INTERVAL)
 
-# ===== СТАРТ =====
+def start_trading_thread():
+    global trading_thread
+    trading_thread = threading.Thread(target=trading_loop, daemon=True)
+    trading_thread.start()
+
+def start_telegram_thread():
+    global telegram_thread
+    telegram_thread = threading.Thread(target=telegram_polling_loop, daemon=True)
+    telegram_thread.start()
+
+def watchdog():
+    while True:
+        if not trading_thread.is_alive():
+            log.warning("Trading loop died — restarting")
+            start_trading_thread()
+        if not telegram_thread.is_alive():
+            log.warning("Telegram loop died — restarting")
+            start_telegram_thread()
+        time.sleep(5)
+
+# ====== START ======
 if __name__ == "__main__":
-    threading.Thread(target=trading_loop, daemon=True).start()
-    threading.Thread(target=telegram_loop, daemon=True).start()
-    tg("🤖 Бот запущен! EMA 7/14, TP 0.8%, SL 0.6%, трейлинг в BE, до 2 позиций. Уведомления — только по факту сделок.")
+    start_trading_thread()
+    start_telegram_thread()
+    threading.Thread(target=watchdog, daemon=True).start()
+    tg("🤖 Бот запущен! EMA 9/21, TP 1.5%, SL 1%. MIN_CANDLES=10. Self-heal включён. Сообщения — только по факту сделок.")
     port = int(os.environ.get("PORT","5000"))
     app.run(host="0.0.0.0", port=port)
