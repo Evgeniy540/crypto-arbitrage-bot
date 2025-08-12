@@ -1,4 +1,4 @@
-# === main.py (Bitget SPOT; self-heal; EMA 7/14; TP 1.0% / SL 0.7%; MIN_CANDLES=5; /profit, /status; watchdog; Flask) ===
+# === main.py (Bitget SPOT; self-heal tickers/candles; EMA 7/14; TP 1.0% / SL 0.7%; MIN_CANDLES=5; /profit, /status; watchdog; Flask) ===
 import os, time, hmac, hashlib, base64, json, threading, math, logging, requests
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -103,9 +103,20 @@ profits   = load_json(PROFIT_FILE, {"total":0.0,"trades":[]})
 last_no_signal_sent = datetime.now(timezone.utc) - timedelta(minutes=NO_SIGNAL_COOLDOWN_MIN+1)
 _last_daily_report_date = None
 
-# ====== SELF-HEAL: индексы/карантин ======
+# ====== SELF-HEAL: индексы/карантин/кэш цены ======
 _bad_until: dict[str, datetime] = {}     # {sym_no_sfx: until_utc}
 _err_counter = defaultdict(int)
+PRICE_CACHE = {}  # {sym_no_sfx: {"px": float, "ts": datetime}}
+
+def _cache_set(sym, px):
+    PRICE_CACHE[sym] = {"px": float(px), "ts": datetime.now(timezone.utc)}
+
+def _cache_get(sym, max_age_sec=300):
+    it = PRICE_CACHE.get(sym)
+    if not it: return None
+    if (datetime.now(timezone.utc) - it["ts"]).total_seconds() > max_age_sec:
+        return None
+    return it["px"]
 
 @lru_cache(maxsize=256)
 def _products_index() -> dict[str, dict]:
@@ -143,27 +154,74 @@ def get_symbol_rules(sym_no_sfx: str):
             "quantityScale": int(p.get("quantityScale",4)),
             "minTradeUSDT": float(p.get("minTradeUSDT",1.0))}
 
+def _price_from_candles(sym_no_sfx):
+    """Резерв: последняя цена из свечи."""
+    try:
+        closes = get_candles(sym_no_sfx, limit=2)
+        if closes:
+            return float(closes[-1])
+    except Exception as e:
+        log.warning(f"{sym_no_sfx}: fallback candles price error {repr(e)}")
+    return None
+
 def get_ticker_price(sym_no_sfx) -> float:
+    """Надёжная цена:
+       1) /market/tickers lastPr/close/last
+       2) если нет — последняя свеча
+       3) если нет — свежий кэш (<5 мин)
+       + ретраи, бэк-офф, карантин при повторных сбоях.
+    """
     until = _bad_until.get(sym_no_sfx)
     if until and until > datetime.now(timezone.utc):
         raise RuntimeError(f"symbol_quarantined:{sym_no_sfx}")
+
     sym = normalize_symbol(sym_no_sfx)
-    last = None
+    last_exc = None
+
+    # 1) основной тикер с ретраями
     for attempt in range(MAX_RETRIES):
         try:
-            r = requests.get(BITGET + "/api/spot/v1/market/tickers",
-                             params={"symbol": sym},
-                             headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
+            r = requests.get(
+                BITGET + "/api/spot/v1/market/tickers",
+                params={"symbol": sym},
+                headers={"User-Agent":"Mozilla/5.0"},
+                timeout=15
+            )
             d = get_json_or_raise(r)
-            if d.get("code") != "00000":
-                raise RuntimeError(f"ticker_error:{d}")
-            arr = d.get("data", [])
-            if not arr: raise RuntimeError("empty_ticker")
-            return float(arr[0]["lastPr"])
+            if d.get("code") == "00000":
+                arr = d.get("data") or []
+                if arr:
+                    px = arr[0].get("lastPr") or arr[0].get("close") or arr[0].get("last")
+                    if px is not None:
+                        _cache_set(sym_no_sfx, px)
+                        return float(px)
+                last_exc = RuntimeError(f"ticker_no_lastPr:{arr}")
+            else:
+                if d.get("code") in ("40034","41018","400"):
+                    last_exc = RuntimeError(f"param_error:{d.get('code')}:{d.get('msg')}")
+                    break
+                last_exc = RuntimeError(f"ticker_error:{d}")
         except Exception as e:
-            last = e
-            _sleep_backoff(attempt)
-    raise RuntimeError(f"ticker_unavailable:{sym_no_sfx}:{last}")
+            last_exc = e
+        _sleep_backoff(attempt)
+
+    # 2) резерв — цена из свечи
+    px_fallback = _price_from_candles(sym_no_sfx)
+    if px_fallback is not None:
+        _cache_set(sym_no_sfx, px_fallback)
+        return float(px_fallback)
+
+    # 3) последний кэш (до 5 мин давности)
+    px_cached = _cache_get(sym_no_sfx, max_age_sec=300)
+    if px_cached is not None:
+        log.warning(f"{sym_no_sfx}: using cached price {px_cached} due to {repr(last_exc)}")
+        return float(px_cached)
+
+    # повторные сбои — карантин монеты
+    _err_counter[sym_no_sfx] += 1
+    if _err_counter[sym_no_sfx] >= 2:
+        _bad_until[sym_no_sfx] = datetime.now(timezone.utc) + timedelta(minutes=QUARANTINE_MIN)
+    raise RuntimeError(f"ticker_unavailable:{sym_no_sfx}:{last_exc}")
 
 def get_candles(sym_no_sfx, limit=CANDLES_LIMIT):
     until = _bad_until.get(sym_no_sfx)
@@ -181,7 +239,7 @@ def get_candles(sym_no_sfx, limit=CANDLES_LIMIT):
         for attempt in range(MAX_RETRIES):
             try:
                 r = requests.get(BITGET + "/api/spot/v1/market/candles",
-                                  params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
+                                 params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
                 data = get_json_or_raise(r)
                 code = data.get("code")
                 if code != "00000":
@@ -281,7 +339,7 @@ def maybe_buy_signal():
     sym = chosen
     try:
         rules = get_symbol_rules(sym)
-        price = get_ticker_price(sym)
+        price = get_ticker_price(sym)  # теперь с fallback и кэшем
         usdt_avail = get_usdt_balance()
         amount = min(BASE_TRADE_AMOUNT, usdt_avail)
         min_usdt = max(1.0, rules["minTradeUSDT"])
