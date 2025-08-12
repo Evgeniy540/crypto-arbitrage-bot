@@ -1,4 +1,4 @@
-# === main.py (Bitget SPOT; self-heal; EMA 9/21; TP 1.5% / SL 1%; MIN_CANDLES=10; /profit, /status; watchdog; Flask) ===
+# === main.py (Bitget SPOT; self-heal; EMA 7/14; TP 1.0% / SL 0.7%; MIN_CANDLES=5; /profit, /status; watchdog; Flask) ===
 import os, time, hmac, hashlib, base64, json, threading, math, logging, requests
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -19,12 +19,12 @@ USE_WEBHOOK = os.environ.get("TELEGRAM_WEBHOOK", "0") == "1"  # по умолч�
 # ====== НАСТРОЙКИ ======
 SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","PEPEUSDT","BGBUSDT"]
 BASE_TRADE_AMOUNT = 10.0          # USDT на сделку
-TP_PCT = 0.015                    # +1.5%
-SL_PCT = 0.010                    # -1.0%
-EMA_FAST = 9
-EMA_SLOW = 21
-MIN_CANDLES = 10                  # чаще сигналы
-CHECK_INTERVAL = 15               # сек
+TP_PCT = 0.010                    # +1.0%
+SL_PCT = 0.007                    # -0.7%
+EMA_FAST = 7
+EMA_SLOW = 14
+MIN_CANDLES = 5                   # чаще сигналы
+CHECK_INTERVAL = 30               # сек
 NO_SIGNAL_COOLDOWN_MIN = 60
 MAX_OPEN_POSITIONS = 2
 
@@ -148,6 +148,7 @@ def get_ticker_price(sym_no_sfx) -> float:
     if until and until > datetime.now(timezone.utc):
         raise RuntimeError(f"symbol_quarantined:{sym_no_sfx}")
     sym = normalize_symbol(sym_no_sfx)
+    last = None
     for attempt in range(MAX_RETRIES):
         try:
             r = requests.get(BITGET + "/api/spot/v1/market/tickers",
@@ -180,7 +181,7 @@ def get_candles(sym_no_sfx, limit=CANDLES_LIMIT):
         for attempt in range(MAX_RETRIES):
             try:
                 r = requests.get(BITGET + "/api/spot/v1/market/candles",
-                                 params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
+                                  params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
                 data = get_json_or_raise(r)
                 code = data.get("code")
                 if code != "00000":
@@ -441,6 +442,6 @@ if __name__ == "__main__":
     start_trading_thread()
     start_telegram_thread()
     threading.Thread(target=watchdog, daemon=True).start()
-    tg("🤖 Бот запущен! EMA 9/21, TP 1.5%, SL 1%. MIN_CANDLES=10. Self-heal включён. Сообщения — только по факту сделок.")
+    tg("🤖 Бот запущен! EMA 7/14, TP 1.0%, SL 0.7%. MIN_CANDLES=5. Self-heal включён. Сообщения — только по факту сделок.")
     port = int(os.environ.get("PORT","5000"))
     app.run(host="0.0.0.0", port=port)
