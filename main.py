@@ -1,69 +1,70 @@
 # =========================
-# main.py — Bitget SPOT бот
+# main.py — Bitget SPOT EMA 7/14
 # =========================
-# Торговля по EMA 7/14. Ставим маркет-покупку каскадом:
-#   quoteOrderQty → size → quantity
-# Всегда округляем размер до precision биржи и не шлём сделки меньше минимума.
-# В TG пишем только по факту сделок / ошибок. Есть self-heal и ежедневный отчёт.
+# Покупка ТОЛЬКО через quoteOrderQty (строгое строковое поле),
+# чтобы не ловить 40019/empty quantity. Автоподъём суммы до minTradeUSDT.
+# Защиты: Decimal в расчётах, корректные масштабы, понятные сообщения.
 
-import os, time, hmac, hashlib, base64, json, math, logging, requests, threading
+import os, time, json, math, logging, threading, requests, hmac, hashlib, base64
+from flask import Flask
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
-from flask import Flask, request
+from decimal import Decimal, getcontext
 
-# ---------- ПАРАМЕТРЫ ----------
-API_KEY       = "bg_7bd202760f36727cedf11a481dbca611"
-API_SECRET    = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
-API_PASSPHRASE= "Evgeniy84"
+# --- точность Decimal ---
+getcontext().prec = 28
+
+# --- ваши ключи ---
+API_KEY        = "bg_7bd202760f36727cedf11a481dbca611"
+API_SECRET     = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
+API_PASSPHRASE = "Evgeniy84"
 
 TELEGRAM_TOKEN   = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 
+# --- настройки бота ---
 SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","PEPEUSDT","BGBUSDT"]
-
-BASE_TRADE_AMOUNT = 10.0         # базовая сумма на сделку, USDT
-TP_PCT = 0.010                   # тейк-профит 1.0%
-SL_PCT = 0.007                   # стоп-лосс 0.7%
+BASE_TRADE_USDT = Decimal("10")      # базовая заявка
+TP_PCT = Decimal("0.010")             # 1.0%
+SL_PCT = Decimal("0.007")             # 0.7%
 EMA_FAST = 7
 EMA_SLOW = 14
 MIN_CANDLES = 5
-CHECK_INTERVAL = 30              # сек между проходами
-MAX_OPEN_POSITIONS = 2
+CHECK_INTERVAL = 30                   # сек
+MAX_OPEN_POS = 2
 NO_SIGNAL_COOLDOWN_MIN = 60
-MIN_NOTIONAL_BUFFER = 1.02       # небольшой запас к минимуму биржи
-
-DAILY_REPORT_UTC = "20:47"       # HH:MM по UTC
+MIN_NOTIONAL_BUFFER = Decimal("1.02") # запас над минимумом
+DAILY_REPORT_UTC = "20:47"            # HH:MM (UTC)
 
 BITGET = "https://api.bitget.com"
 
-# ---------- ЛОГИ ----------
+# --- логирование ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot")
 
-# ---------- Flask (keep-alive + webhook опционально) ----------
+# --- Flask (keep alive) ---
 app = Flask(__name__)
 
 @app.get("/")
 def health():
     return "OK", 200
 
-# ---------- УТИЛИТЫ ----------
+# --- утилиты ---
 def tg(text: str):
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                       data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=8)
     except Exception as e:
-        log.warning(f"TG send error: {e}")
+        log.warning(f"TG error: {e}")
 
 def now_ms() -> str:
     return str(int(time.time()*1000))
 
-def sign_payload(ts: str, method: str, path: str, body: str="") -> str:
+def _sign(ts: str, method: str, path: str, body: str="") -> str:
     msg = ts + method.upper() + path + body
     digest = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).digest()
     return base64.b64encode(digest).decode()
 
-def headers(ts: str, sign: str):
+def _hdr(ts: str, sign: str):
     return {
         "ACCESS-KEY": API_KEY,
         "ACCESS-SIGN": sign,
@@ -73,7 +74,7 @@ def headers(ts: str, sign: str):
         "User-Agent": "Mozilla/5.0"
     }
 
-def get_json_or_raise(resp):
+def _json(resp):
     txt = resp.text
     try:
         d = resp.json()
@@ -83,92 +84,97 @@ def get_json_or_raise(resp):
         raise RuntimeError(f"HTTP {resp.status_code}: {txt}")
     return d
 
-def floor_to_scale(x: float, scale: int) -> float:
-    m = 10 ** max(0, scale)
-    return math.floor(float(x) * m) / m
+# --- справочники пар (кэш в памяти) ---
+_PRODUCTS_CACHE = None
+_PRODUCTS_AT = 0
 
-def floor_usdt(x: float, scale: int = 4) -> float:
-    m = 10 ** scale
-    return math.floor(float(x) * m) / m
-
-# ---------- КЭШ ПРАВИЛ ПАР ----------
-@lru_cache(maxsize=256)
-def _products_index() -> dict:
+def _reload_products_if_needed():
+    global _PRODUCTS_CACHE, _PRODUCTS_AT
+    if _PRODUCTS_CACHE and (time.time() - _PRODUCTS_AT) < 600:
+        return
     r = requests.get(BITGET + "/api/spot/v1/public/products",
                      headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
-    d = get_json_or_raise(r)
+    d = _json(r)
     if d.get("code") != "00000":
         raise RuntimeError(f"products error: {d}")
-    return {p["symbol"]: p for p in d.get("data", [])}
+    _PRODUCTS_CACHE = {p["symbol"]: p for p in d.get("data", [])}
+    _PRODUCTS_AT = time.time()
 
-def normalize_symbol(sym: str) -> str:
-    # для Bitget формат <BASE><QUOTE>_SPBL (например, BTCUSDT_SPBL)
-    s = sym if sym.endswith("_SPBL") else f"{sym}_SPBL"
-    idx = _products_index()
-    if s in idx: return s
-    raise RuntimeError(f"symbol_not_found:{sym}")
+def _norm(sym: str) -> str:
+    _reload_products_if_needed()
+    s = sym if sym.endswith("_SPBL") else sym + "_SPBL"
+    if s not in _PRODUCTS_CACHE:
+        raise RuntimeError(f"symbol_not_found:{sym}")
+    return s
 
-def get_symbol_rules(sym: str) -> dict:
-    p = _products_index()[normalize_symbol(sym)]
+def get_rules(sym: str):
+    p = _PRODUCTS_CACHE[_norm(sym)]
+    # важное поле: minTradeUSDT — минимальная сумма сделки в USDT
     return {
-        "priceScale":    int(p.get("priceScale", 4)),
-        "quantityScale": int(p.get("quantityScale", 4)),
-        "minTradeUSDT":  float(p.get("minTradeUSDT", 1.0))
+        "priceScale":    int(p.get("priceScale", 6)),
+        "quantityScale": int(p.get("quantityScale", 6)),
+        "minTradeUSDT":  Decimal(p.get("minTradeUSDT", "1"))
     }
 
-# ---------- РЫНОК ----------
-def get_ticker_price(sym: str) -> float:
+# --- рынок ---
+def get_price(sym: str) -> Decimal:
+    # тикер
     r = requests.get(BITGET + "/api/spot/v1/market/tickers",
-                     params={"symbol": normalize_symbol(sym)},
+                     params={"symbol": _norm(sym)},
                      headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
-    d = get_json_or_raise(r)
+    d = _json(r)
     if d.get("code") != "00000":
-        raise RuntimeError(f"ticker error: {d}")
+        raise RuntimeError(f"tickers error: {d}")
     arr = d.get("data") or []
     if not arr: raise RuntimeError("ticker empty")
-    last = arr[0].get("lastPr") or arr[0].get("close") or arr[0].get("last")
-    if last is None: raise RuntimeError("ticker no last price")
-    return float(last)
+    row = arr[0]
+    for k in ("lastPr","close","last","c"):
+        if k in row and row[k] not in (None,""):
+            return Decimal(str(row[k]))
+    # запасной вариант — bestAsk
+    for k in ("bestAsk","askPr","bestAskPr"):
+        if k in row and row[k] not in (None,""):
+            return Decimal(str(row[k]))
+    raise RuntimeError("ticker no price")
 
-def get_candles(sym: str, limit: int = 100):
-    params = {"symbol": normalize_symbol(sym), "period": "1min", "limit": limit}
+def get_candles(sym: str, limit: int = 120):
     r = requests.get(BITGET + "/api/spot/v1/market/candles",
-                     params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=12)
-    d = get_json_or_raise(r)
+                     params={"symbol": _norm(sym), "period":"1min", "limit": limit},
+                     headers={"User-Agent":"Mozilla/5.0"}, timeout=12)
+    d = _json(r)
     if d.get("code") != "00000":
         raise RuntimeError(f"candles error: {d}")
     rows = list(reversed(d.get("data") or []))
     closes = []
     for row in rows:
-        # API может возвращать массив или словарь; вытаскиваем close
-        if isinstance(row, (list, tuple)) and len(row) >= 5:
-            closes.append(float(row[4]))
+        if isinstance(row, (list,tuple)) and len(row) >= 5:
+            closes.append(Decimal(str(row[4])))
         elif isinstance(row, dict):
-            for k in ("lastPr","close","c","last"):
+            for k in ("close","lastPr","c","last"):
                 if k in row:
-                    closes.append(float(row[k])); break
+                    closes.append(Decimal(str(row[k]))); break
     return closes
 
-# ---------- БАЛАНС ----------
-def get_usdt_balance() -> float:
+# --- баланс USDT ---
+def get_usdt_balance() -> Decimal:
     ts = now_ms()
     path = "/api/spot/v1/account/assets"
     q    = "coin=USDT"
-    sign = sign_payload(ts, "GET", path + "?" + q, "")
-    r = requests.get(BITGET + path, params={"coin":"USDT"}, headers=headers(ts,sign), timeout=12)
-    d = get_json_or_raise(r)
-    if d.get("code") != "00000": return 0.0
+    sign = _sign(ts, "GET", path + "?" + q, "")
+    r = requests.get(BITGET + path, params={"coin":"USDT"}, headers=_hdr(ts,sign), timeout=12)
+    d = _json(r)
+    if d.get("code") != "00000": return Decimal("0")
     arr = d.get("data") or []
-    if not arr: return 0.0
-    return float(arr[0].get("available","0"))
+    if not arr: return Decimal("0")
+    return Decimal(str(arr[0].get("available","0")))
 
-# ---------- ТЕХАНАЛИТИКА ----------
-def ema(values, period):
-    if len(values) < period: return []
-    k = 2/(period+1)
-    out = [sum(values[:period])/period]
-    for v in values[period:]:
-        out.append(v*k + out[-1]*(1-k))
+# --- EMA/сигналы ---
+def ema(vals, period):
+    if len(vals) < period: return []
+    k = Decimal("2")/Decimal(period+1)
+    out = [sum(vals[:period], Decimal("0"))/Decimal(period)]
+    for v in vals[period:]:
+        out.append(v*k + out[-1]*(Decimal("1")-k))
     return out
 
 def ema_signal(closes):
@@ -182,87 +188,59 @@ def ema_signal(closes):
     if f[-2] >= s[-2] and f[-1] < s[-1]: return "short"
     return None
 
-# ---------- ЗАКАЗЫ ----------
+# --- заказы (только quoteOrderQty для BUY) ---
 def _post_order(body: dict):
     ts = now_ms()
     path = "/api/spot/v1/trade/orders"
     payload = json.dumps(body, separators=(",",":"))
-    sign = sign_payload(ts, "POST", path, payload)
-    r = requests.post(BITGET + path, data=payload, headers=headers(ts,sign), timeout=20)
+    sign = _sign(ts, "POST", path, payload)
+    r = requests.post(BITGET + path, data=payload, headers=_hdr(ts,sign), timeout=20)
     try:
         return r.status_code, r.json()
     except Exception:
         return r.status_code, {"code": f"HTTP{r.status_code}", "msg": r.text}
 
-def place_market_buy(sym: str, quote_usdt: float, px: float, rules: dict, usdt_balance: float):
-    """
-    Строгая защита от:
-    - пустого количества (size/quantity == 0);
-    - суммы меньше минимума (45110).
-    """
-    qscale = int(rules["quantityScale"])
-    min_usdt = max(1.0, float(rules["minTradeUSDT"]))
-    need_usdt = max(quote_usdt, min_usdt * MIN_NOTIONAL_BUFFER)
-    if need_usdt > usdt_balance:
-        raise RuntimeError(f"balance_low:{usdt_balance:.4f} need:{need_usdt:.4f}")
-
-    # 1) пробуем quoteOrderQty
-    quote = floor_usdt(need_usdt, 4)
-    body_q = {
-        "symbol": normalize_symbol(sym), "side": "buy", "orderType": "market", "force": "gtc",
-        "clientOrderId": f"q-{sym}-{int(time.time()*1000)}", "quoteOrderQty": f"{quote:.4f}"
+def place_market_buy(sym: str, quote_usdt: Decimal, rules: dict, usdt_balance: Decimal):
+    min_usdt = rules["minTradeUSDT"]
+    need = max(quote_usdt, (min_usdt * MIN_NOTIONAL_BUFFER))
+    need = need.quantize(Decimal("0.0001"))  # 4 знака для USDT
+    if need > usdt_balance:
+        raise RuntimeError(f"balance_low:{usdt_balance} need:{need}")
+    body = {
+        "symbol": _norm(sym),
+        "side": "buy",
+        "orderType": "market",
+        "force": "normal",                   # Bitget рекомендует 'normal' для маркетов
+        "clientOrderId": f"q-{sym}-{int(time.time()*1000)}",
+        "quoteOrderQty": f"{need}"           # строго строкой
     }
-    st1, d1 = _post_order(body_q)
-    if str(d1.get("code")) == "00000":
-        return d1.get("data")
+    st, d = _post_order(body)
+    if str(d.get("code")) != "00000":
+        raise RuntimeError(f"order_error:{st}:{d}")
+    return d.get("data")
 
-    # 2) считаем size (кол-во базовой монеты) и пробуем "size"
-    size = floor_to_scale(quote / px, qscale)
-    if size <= 0:
-        # минимальный положительный шаг по масштабу
-        size = round(10 ** (-qscale), qscale)
-    body_s = {
-        "symbol": normalize_symbol(sym), "side": "buy", "orderType": "market", "force": "gtc",
-        "clientOrderId": f"s-{sym}-{int(time.time()*1000)}", "size": f"{size:.{qscale}f}"
-    }
-    st2, d2 = _post_order(body_s)
-    if str(d2.get("code")) == "00000":
-        return d2.get("data")
-
-    # 3) пробуем альтернативно "quantity"
-    body_qty = {
-        "symbol": normalize_symbol(sym), "side": "buy", "orderType": "market", "force": "gtc",
-        "clientOrderId": f"qty-{sym}-{int(time.time()*1000)}", "quantity": f"{size:.{qscale}f}"
-    }
-    st3, d3 = _post_order(body_qty)
-    if str(d3.get("code")) == "00000":
-        return d3.get("data")
-
-    # Не получилось — отправляем подробный отчёт
-    tg(
-        f"❗ Не удалось купить {sym}:\n"
-        f"quote={quote:.4f} USDT, size≈{size:.{qscale}f} (qscale={qscale}).\n"
-        f"Ответы: quote→ {st1} {d1}; size→ {st2} {d2}; quantity→ {st3} {d3}"
-    )
-    # Если конкретно 45110 — это меньше минимума, больше не дожимаем.
-    raise RuntimeError(f"order_error:{d3}")
-
-def place_market_sell(sym: str, size: float, rules: dict):
-    qscale = int(rules["quantityScale"])
-    size = floor_to_scale(float(size), qscale)
+def place_market_sell(sym: str, qty: Decimal, rules: dict):
+    # для sell на Bitget нужен size (кол-во базовой монеты)
+    qscale = rules["quantityScale"]
+    step = Decimal(1).scaleb(-qscale)  # 10^-qscale
+    size = (qty // step) * step
     if size <= 0:
         raise RuntimeError("sell_size_zero")
     body = {
-        "symbol": normalize_symbol(sym), "side": "sell", "orderType": "market", "force": "gtc",
-        "clientOrderId": f"sl-{sym}-{int(time.time()*1000)}", "size": f"{size:.{qscale}f}"
+        "symbol": _norm(sym),
+        "side": "sell",
+        "orderType": "market",
+        "force": "normal",
+        "clientOrderId": f"s-{sym}-{int(time.time()*1000)}",
+        "size": f"{size.normalize()}"
     }
     st, d = _post_order(body)
     if str(d.get("code")) != "00000":
         raise RuntimeError(f"sell_error:{st}:{d}")
-    return d["data"]
+    return d.get("data")
 
-# ---------- ХРАНИЛКА СОСТОЯНИЯ ----------
-STATE_FILE = "positions.json"
+# --- файлы состояния ---
+STATE_FILE  = "positions.json"
 PROFIT_FILE = "profit.json"
 
 def _load(path, default):
@@ -276,27 +254,27 @@ def _save(path, data):
     with open(path,"w",encoding="utf-8") as f:
         json.dump(data,f,ensure_ascii=False,indent=2)
 
-positions = _load(STATE_FILE, {})            # {sym: {qty, avg, amount}}
+positions = _load(STATE_FILE, {})
 profits   = _load(PROFIT_FILE, {"total":0.0,"trades":[]})
 
 _last_no_signal = datetime.now(timezone.utc) - timedelta(minutes=NO_SIGNAL_COOLDOWN_MIN+1)
 _last_daily = None
 
-# ---------- ЛОГИКА ТОРГОВЛИ ----------
+# --- торговая логика ---
 def maybe_buy_signal():
     global positions, _last_no_signal
-    if len(positions) >= MAX_OPEN_POSITIONS:
+    if len(positions) >= MAX_OPEN_POS:
         return
     picked = None
     for sym in SYMBOLS:
         if sym in positions: continue
         try:
-            closes = get_candles(sym, limit=max(EMA_SLOW+20, 100))
+            closes = get_candles(sym, limit=max(EMA_SLOW+20, 120))
             if len(closes) < MIN_CANDLES: continue
             if ema_signal(closes) == "long":
                 picked = sym; break
         except Exception as e:
-            log.warning(f"{sym}: candles error {e}")
+            log.warning(f"{sym} candles error: {e}")
 
     if not picked:
         if datetime.now(timezone.utc) - _last_no_signal > timedelta(minutes=NO_SIGNAL_COOLDOWN_MIN):
@@ -306,25 +284,31 @@ def maybe_buy_signal():
 
     sym = picked
     try:
-        rules = get_symbol_rules(sym)
-        px    = get_ticker_price(sym)
+        rules = get_rules(sym)
+        px    = get_price(sym)               # для инфо/контроля (покупка всё равно quoteOrderQty)
         bal   = get_usdt_balance()
 
-        min_usdt = max(1.0, rules["minTradeUSDT"])
-        quote    = min(BASE_TRADE_AMOUNT, bal)
-        if quote < min_usdt:
-            tg(f"❕ {sym}: покупка пропущена — сумма {quote:.4f} USDT < {min_usdt:.4f} (мин.). Баланс {bal:.4f}.")
+        min_usdt = rules["minTradeUSDT"]
+        quote    = min(BASE_TRADE_USDT, bal)
+        need     = max(quote, (min_usdt * MIN_NOTIONAL_BUFFER)).quantize(Decimal("0.0001"))
+        if need > bal:
+            tg(f"❕ {sym}: покупка пропущена — нужно {need} USDT (мин {min_usdt}), баланс {bal}.")
             return
 
-        data = place_market_buy(sym, quote, px, rules, bal)
+        place_market_buy(sym, need, rules, bal)
 
-        # примерная фиксация размера (для статуса)
-        qscale = int(rules["quantityScale"])
-        size_est = floor_to_scale(quote / px, qscale)
-        positions[sym] = {"qty": size_est, "avg": px, "amount": size_est*px,
-                          "opened": datetime.now(timezone.utc).isoformat()}
+        # примерная оценка количества для статуса
+        qscale = rules["quantityScale"]
+        step = Decimal(1).scaleb(-qscale)
+        qty_est = ((need/px) // step) * step
+        positions[sym] = {
+            "qty": float(qty_est),
+            "avg": float(px),
+            "amount": float(qty_est*px),
+            "opened": datetime.now(timezone.utc).isoformat()
+        }
         _save(STATE_FILE, positions)
-        tg(f"✅ Покупка {sym}: ~qty={size_est}, цена≈{px:.8f}, сумма≈{quote:.4f} USDT (EMA {EMA_FAST}/{EMA_SLOW}).")
+        tg(f"✅ Покупка {sym}: ~qty≈{qty_est}, цена≈{px}, сумма={need} USDT (мин {min_usdt}).")
     except Exception as e:
         tg(f"❗ Ошибка покупки {sym}: {e}")
 
@@ -333,43 +317,39 @@ def manage_positions():
     to_close = []
     for sym, pos in list(positions.items()):
         try:
-            rules = get_symbol_rules(sym)
-            px    = get_ticker_price(sym)
-            avg   = pos["avg"]
+            rules = get_rules(sym)
+            px    = get_price(sym)
+            avg   = Decimal(str(pos["avg"]))
+            qty   = Decimal(str(pos["qty"]))
             chg   = (px - avg)/avg
             reason = None
             if chg >= TP_PCT: reason = "TP"
             elif chg <= -SL_PCT: reason = "SL"
             if not reason: continue
 
-            qscale = int(rules["quantityScale"])
-            size   = floor_to_scale(float(pos["qty"]), qscale)
-            if size <= 0:
-                to_close.append(sym); continue
-
-            place_market_sell(sym, size, rules)
-            pnl = (px - avg) * size
-            profits["total"] += pnl
+            place_market_sell(sym, qty, rules)
+            pnl = (px - avg) * qty
+            profits["total"] = float(Decimal(str(profits["total"])) + pnl)
             profits["trades"].append({
-                "symbol": sym, "qty": size, "buy": avg, "sell": px,
-                "pnl": pnl, "closed": datetime.now(timezone.utc).isoformat(), "reason": reason
+                "symbol": sym, "qty": float(qty), "buy": float(avg), "sell": float(px),
+                "pnl": float(pnl), "closed": datetime.now(timezone.utc).isoformat(), "reason": reason
             })
             _save(PROFIT_FILE, profits)
-            tg(f"💰 {reason} {sym}: qty={size}, {avg:.8f}→{px:.8f}, PnL={pnl:.4f} USDT. Итого: {profits['total']:.4f} USDT.")
+            tg(f"💰 {reason} {sym}: qty={qty}, {avg}→{px}, PnL={pnl:.6f} USDT. "
+               f"Итого: {profits['total']:.6f} USDT.")
             to_close.append(sym)
         except Exception as e:
             log.warning(f"manage {sym} error: {e}")
-
     for s in to_close:
         positions.pop(s, None)
     if to_close:
         _save(STATE_FILE, positions)
 
-# ---------- ОТЧЁТЫ ----------
+# --- отчёты и команды ---
 def format_profit():
     total = profits.get("total",0.0)
     rows  = profits.get("trades",[])
-    lines = [f"📊 Отчёт. Итоговая прибыль: {total:.4f} USDT"]
+    lines = [f"📊 Итоговая прибыль: {total:.6f} USDT"]
     if positions:
         lines.append("Открытые позиции:")
         for s,p in positions.items():
@@ -377,21 +357,22 @@ def format_profit():
     if rows:
         lines.append("Последние сделки:")
         for t in rows[-5:]:
-            lines.append(f"• {t['symbol']} ({t['reason']}): {t['qty']} шт, "
-                         f"{t['buy']:.6f}→{t['sell']:.6f}, PnL={t['pnl']:.4f}")
+            lines.append(f"• {t['symbol']} ({t['reason']}): {t['qty']} шт,"
+                         f" {t['buy']:.6f}→{t['sell']:.6f}, PnL={t['pnl']:.6f}")
     else:
         lines.append("Сделок ещё не было.")
     return "\n".join(lines)
 
 def format_status():
-    bal = 0.0
-    try: bal = get_usdt_balance()
-    except Exception: pass
+    try:
+        bal = get_usdt_balance()
+    except Exception:
+        bal = Decimal("0")
     lines = [
         "🛠 Статус",
-        f"Баланс USDT: {bal:.4f}",
-        f"Сделка: {BASE_TRADE_AMOUNT:.4f} USDT",
-        f"Открытых позиций: {len(positions)}/{MAX_OPEN_POSITIONS}",
+        f"Баланс USDT: {bal}",
+        f"Сделка: {BASE_TRADE_USDT} USDT",
+        f"Открытых позиций: {len(positions)}/{MAX_OPEN_POS}",
         f"EMA {EMA_FAST}/{EMA_SLOW}, TP {TP_PCT*100:.1f}%, SL {SL_PCT*100:.1f}%, MIN_CANDLES {MIN_CANDLES}",
     ]
     if positions:
@@ -399,16 +380,13 @@ def format_status():
             lines.append(f"• {s}: qty={p['qty']}, avg={p['avg']:.8f}")
     return "\n".join(lines)
 
-def daily_report_tick():
-    global _last_daily
+def daily_report_tick(_last=[None]):
     hhmm = datetime.now(timezone.utc).strftime("%H:%M")
-    if hhmm == DAILY_REPORT_UTC:
-        today = datetime.now(timezone.utc).date()
-        if _last_daily != today:
-            tg("🗓 Ежедневный отчёт:\n" + format_profit())
-            _last_daily = today
+    if hhmm == DAILY_REPORT_UTC and _last[0] != hhmm:
+        _last[0] = hhmm
+        tg("🗓 Ежедневный отчёт:\n" + format_profit())
 
-# ---------- TELEGRAM LONG POLL ----------
+# --- Telegram long poll ---
 def tg_loop():
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     offset = None
@@ -437,7 +415,7 @@ def tg_loop():
         try: daily_report_tick()
         except Exception: pass
 
-# ---------- ОСНОВНОЙ ЦИКЛ ----------
+# --- основной цикл ---
 def trade_loop():
     while True:
         try:
@@ -447,7 +425,7 @@ def trade_loop():
             log.exception(f"loop error: {e}")
         time.sleep(CHECK_INTERVAL)
 
-# ---------- RUN ----------
+# --- run ---
 if __name__ == "__main__":
     threading.Thread(target=trade_loop, daemon=True).start()
     threading.Thread(target=tg_loop,    daemon=True).start()
