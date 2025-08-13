@@ -1,15 +1,16 @@
 # =========================
-# main.py — Bitget SPOT EMA 7/14 (устойчивые market-ордера)
+# main.py — Bitget SPOT: EMA 7/14 + устойчивые market-ордера
+# Свечи с многоступенчатым фолбэком (исправляет 400172)
 # =========================
 import os, time, json, hmac, base64, hashlib, logging, threading, requests
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, getcontext, ROUND_DOWN
-from flask import Flask, request as _flask_request
+from flask import Flask
 
 # ---------- Decimal ----------
 getcontext().prec = 28
 
-# ---------- Конфиг (ЗАПОЛНИ при необходимости) ----------
+# ---------- Конфиг ----------
 API_KEY        = "bg_7bd202760f36727cedf11a481dbca611"
 API_SECRET     = "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
 API_PASSPHRASE = "Evgeniy84"
@@ -17,20 +18,20 @@ API_PASSPHRASE = "Evgeniy84"
 TELEGRAM_TOKEN   = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID = "5723086631"
 
-BITGET = "https://api.bitget.com"  # v2
+BITGET = "https://api.bitget.com"
 
 SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","PEPEUSDT","BGBUSDT"]
 
 # Торговые параметры
-MIN_QUOTE_USDT = Decimal("10")   # желаемая сумма покупки (в USDT) на сделку
-TP_PCT = Decimal("0.010")        # 1.0% take profit
-SL_PCT = Decimal("0.007")        # 0.7% stop loss
+MIN_QUOTE_USDT = Decimal("10")   # покупка на эту сумму USDT
+TP_PCT = Decimal("0.010")        # 1.0%
+SL_PCT = Decimal("0.007")        # 0.7%
 EMA_FAST = 7
 EMA_SLOW = 14
 MIN_CANDLES = 5
-CHECK_INTERVAL = 30              # сек
+CHECK_INTERVAL = 30
 MAX_OPEN_POS = 2
-NO_SIGNAL_COOLDOWN_MIN = 60      # напоминание «сигнала нет» раз в N мин
+NO_SIGNAL_COOLDOWN_MIN = 60
 DAILY_REPORT_UTC = "20:47"
 
 # ---------- Логи ----------
@@ -75,8 +76,7 @@ def get_json_or_raise(method: str, path: str, params: dict=None, json_body: dict
     url = BITGET + path
     ts = _now_ms()
     body_str = json.dumps(json_body, separators=(",",":")) if json_body else ""
-    # при GET Bitget ожидает подпись без query (у v2 ок), но с самим path
-    sign = _sign(ts, method, path if not params else path, body_str)
+    sign = _sign(ts, method, path, body_str)
     kwargs = {"headers": _headers(ts, sign), "timeout": 20}
     if params: kwargs["params"] = params
     if json_body: kwargs["data"] = body_str
@@ -88,9 +88,8 @@ def get_json_or_raise(method: str, path: str, params: dict=None, json_body: dict
         raise RuntimeError(f"HTTP {r.status_code}: {txt}")
     if r.status_code >= 400:
         raise RuntimeError(f"HTTP {r.status_code}: {txt}")
-    if d.get("code") not in ("00000", "0", 0):
-        # Bitget иногда возвращает "code":"00000"
-        # Пробрасываем как исключение, чтобы наверх ушло в notify
+    code = str(d.get("code"))
+    if code not in ("00000","0"):
         raise RuntimeError(f"bitget_error:{d}")
     return d
 
@@ -100,9 +99,8 @@ class SymbolMeta:
     def __init__(self, d):
         self.symbol = d["symbol"]
         self.pricePrecision    = int(d.get("pricePrecision", d.get("priceScale", 6)))
-        self.quantityPrecision = int(d.get("quantityPrecision", d.get("quantityScale", 6))) # base
-        self.quotePrecision    = int(d.get("quotePrecision", 6))                            # quote(USDT)
-        # minTradeUSDT бывает в v2 сразу, а в v1/других — иногда нет
+        self.quantityPrecision = int(d.get("quantityPrecision", d.get("quantityScale", 6)))
+        self.quotePrecision    = int(d.get("quotePrecision", 6))
         mt = d.get("minTradeUSDT") or d.get("minTradeAmount") or "1"
         self.minTradeUSDT      = Decimal(str(mt))
 
@@ -114,22 +112,19 @@ def load_symbol_meta(force=False):
     if not force and (time.time() - _META_TS) < 600 and SYMBOL_META:
         return
     d = get_json_or_raise("GET", "/api/v2/spot/public/symbols")
-    data = d.get("data", [])
-    picked = 0
-    for row in data:
+    for row in d.get("data", []):
         sym = row.get("symbol")
         if sym in SYMBOLS:
             SYMBOL_META[sym] = SymbolMeta(row)
-            picked += 1
     _META_TS = time.time()
-    if picked == 0:
+    if not SYMBOL_META:
         raise RuntimeError("no symbols meta loaded")
 
 def meta(s: str) -> SymbolMeta:
     if s not in SYMBOL_META: load_symbol_meta()
     return SYMBOL_META[s]
 
-# ---------- Рынок/баланс ----------
+# ---------- Вспомогательные ----------
 def dg(x) -> Decimal: return Decimal(str(x))
 
 def last_price(symbol: str) -> Decimal:
@@ -143,19 +138,66 @@ def last_price(symbol: str) -> Decimal:
             return dg(v)
     raise RuntimeError("ticker no price")
 
-def candles_close(symbol: str, limit: int=120):
-    d = get_json_or_raise("GET", "/api/v2/spot/market/candles",
-                          params={"symbol": symbol, "period":"1min", "limit": limit})
-    rows = list(reversed(d.get("data") or []))
-    closes = []
-    for r in rows:
-        if isinstance(r, (list, tuple)) and len(r) >= 5:
-            closes.append(dg(r[4]))
-        elif isinstance(r, dict):
-            for k in ("close","last","c"):
-                if k in r:
-                    closes.append(dg(r[k])); break
-    return closes
+def candles_close(symbol: str, need: int=120):
+    """
+    Возвращает массив закрытий. Три попытки:
+      1) v2 + period=1min
+      2) v2 + period=1m
+      3) v1 + granularity=60
+    """
+    # ---- попытка 1: v2/period=1min
+    try:
+        d = get_json_or_raise("GET", "/api/v2/spot/market/candles",
+                              params={"symbol": symbol, "period":"1min", "limit": need})
+        rows = list(reversed(d.get("data") or []))
+        closes = []
+        for r in rows:
+            if isinstance(r, (list, tuple)) and len(r) >= 5:
+                closes.append(dg(r[4]))
+            elif isinstance(r, dict):
+                for k in ("close","last","c"):
+                    if r.get(k) not in (None,""): closes.append(dg(r[k])); break
+        if closes:
+            return closes
+    except Exception as e:
+        log.warning(f"{symbol} candles v2(1min) fail: {e}")
+
+    # ---- попытка 2: v2/period=1m
+    try:
+        d = get_json_or_raise("GET", "/api/v2/spot/market/candles",
+                              params={"symbol": symbol, "period":"1m", "limit": need})
+        rows = list(reversed(d.get("data") or []))
+        closes = []
+        for r in rows:
+            if isinstance(r, (list, tuple)) and len(r) >= 5:
+                closes.append(dg(r[4]))
+            elif isinstance(r, dict):
+                for k in ("close","last","c"):
+                    if r.get(k) not in (None,""): closes.append(dg(r[k])); break
+        if closes:
+            return closes
+    except Exception as e:
+        log.warning(f"{symbol} candles v2(1m) fail: {e}")
+
+    # ---- попытка 3: v1/granularity=60
+    try:
+        d = get_json_or_raise("GET", "/api/spot/v1/market/candles",
+                              params={"symbol": symbol, "granularity":"60", "limit": need})
+        rows = list(reversed(d.get("data") or []))
+        closes = []
+        for r in rows:
+            # v1: массивы вида [openTime,open,high,low,close,volume,...]
+            if isinstance(r, (list, tuple)) and len(r) >= 5:
+                closes.append(dg(r[4]))
+            elif isinstance(r, dict):
+                for k in ("close","last","c"):
+                    if r.get(k) not in (None,""): closes.append(dg(r[k])); break
+        if closes:
+            return closes
+    except Exception as e:
+        log.warning(f"{symbol} candles v1(60s) fail: {e}")
+
+    return []
 
 def free_balance(coin: str) -> Decimal:
     d = get_json_or_raise("GET", "/api/v2/spot/account/assets")
@@ -184,7 +226,7 @@ def ema_signal(closes):
     if f[-2] >= s[-2] and f[-1] < s[-1]: return "short"
     return None
 
-# ---------- Хранилища ----------
+# ---------- Состояние ----------
 STATE_FILE  = "positions.json"
 PROFIT_FILE = "profit.json"
 
@@ -200,7 +242,7 @@ positions = _load(STATE_FILE, {})
 profits   = _load(PROFIT_FILE, {"total":0.0,"trades":[]})
 _last_no_signal = datetime.now(timezone.utc) - timedelta(minutes=NO_SIGNAL_COOLDOWN_MIN+1)
 
-# ---------- Округления ----------
+# ---------- Округление ----------
 def round_down(val: Decimal, precision: int) -> Decimal:
     quant = Decimal(1).scaleb(-precision)
     return val.quantize(quant, rounding=ROUND_DOWN)
@@ -218,7 +260,6 @@ def place_order(symbol: str, side: str, order_type: str, size_str: str):
     return (r.get("data") or {}).get("orderId")
 
 def market_buy_quote(symbol: str, quote_usdt: Decimal):
-    """BUY: size = сумма в USDT (котируемая валюта)"""
     m = meta(symbol)
     need = max(quote_usdt, m.minTradeUSDT)
     size = round_down(need, m.quotePrecision)
@@ -236,7 +277,6 @@ def market_buy_quote(symbol: str, quote_usdt: Decimal):
     return oid
 
 def market_sell_base(symbol: str, qty: Decimal):
-    """SELL: size = количество базовой монеты"""
     m = meta(symbol)
     px = last_price(symbol)
     notional = qty * px
@@ -289,7 +329,7 @@ def try_open_position():
         if not oid: return
 
         px = last_price(s)
-        qty_rough = Decimal(MIN_QUOTE_USDT) / px  # только для оценки, позицию ведём в qty≈
+        qty_rough = Decimal(MIN_QUOTE_USDT) / px  # оценка
         positions[s] = {
             "qty": float(qty_rough),
             "avg": float(px),
@@ -331,7 +371,7 @@ def manage_positions():
     for s in to_close: positions.pop(s, None)
     if to_close: _save(STATE_FILE, positions)
 
-# ---------- Отчёт / команды ----------
+# ---------- Отчёты / команды ----------
 def profit_text():
     total = profits.get("total",0.0)
     rows  = profits.get("trades",[])
