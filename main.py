@@ -1,5 +1,5 @@
 # =========================
-# main.py — Bitget SPOT EMA 7/14 (стабильный buy)
+# main.py — Bitget SPOT EMA 7/14 (устойчивые ордера)
 # =========================
 import os, time, json, hmac, base64, hashlib, threading, logging, requests
 from datetime import datetime, timedelta, timezone
@@ -19,7 +19,7 @@ TELEGRAM_CHAT_ID = "5723086631"
 
 # ---- Настройки ----
 SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","PEPEUSDT","BGBUSDT"]
-BASE_TRADE_USDT = Decimal("10")      # базовая сумма заявки
+BASE_TRADE_USDT = Decimal("10")      # целевая сумма на вход
 TP_PCT = Decimal("0.010")            # 1.0%
 SL_PCT = Decimal("0.007")            # 0.7%
 EMA_FAST = 7
@@ -28,8 +28,10 @@ MIN_CANDLES = 5
 CHECK_INTERVAL = 30                  # сек
 MAX_OPEN_POS = 2
 NO_SIGNAL_COOLDOWN_MIN = 60
-MIN_NOTIONAL_BUFFER = Decimal("1.02")   # небольшой запас к минимуму
 DAILY_REPORT_UTC = "20:47"
+
+# Небольшой запас к минимально допустимой сумме
+MIN_NOTIONAL_BUFFER = Decimal("1.01")
 
 BITGET = "https://api.bitget.com"
 
@@ -172,6 +174,57 @@ def ema_signal(closes):
     if f[-2] >= s[-2] and f[-1] < s[-1]: return "short"
     return None
 
+# ---- Вспомогательная математика ----
+def _step(qscale: int) -> Decimal:
+    return Decimal(1).scaleb(-qscale)  # 10^-qscale
+
+def _ceil_to_step(x: Decimal, step: Decimal) -> Decimal:
+    # минимальное y = k*step такое, что y >= x
+    k = (x / step).to_integral_value(rounding="ROUND_CEILING")
+    return k * step
+
+def _floor_to_step(x: Decimal, step: Decimal) -> Decimal:
+    k = (x / step).to_integral_value(rounding="ROUND_FLOOR")
+    return k * step
+
+# ---- Планирование покупки (исключает 40019 и 45110) ----
+def plan_buy(sym: str, desired_usdt: Decimal, rules: dict, balance: Decimal):
+    """
+    Возвращает (qty, spend) или (None, reason).
+    qty кратно шагу; spend = qty*price.
+    """
+    px = get_price(sym)
+    step = _step(rules["quantityScale"])
+
+    # Минимальная сумма, исходя из правил биржи и из того, что нужно купить хотя бы 1 шаг
+    min_by_rules = rules["minTradeUSDT"]
+    min_for_one_step = (step * px)
+    min_required = (max(min_by_rules, min_for_one_step) * MIN_NOTIONAL_BUFFER)
+
+    if balance < min_required:
+        return None, f"недостаточно средств: баланс {balance} < минимум {min_required:.6f}"
+
+    target = max(desired_usdt, min_required)
+    # Идеальная qty (с верхним округлением, чтобы не попасть ниже минимума из-за шага)
+    qty_ceil = _ceil_to_step(target / px, step)
+    notional_ceil = qty_ceil * px
+
+    if notional_ceil <= balance:
+        return qty_ceil, notional_ceil
+
+    # Если не помещаемся в баланс — берём максимум, который влезает
+    qty_floor = _floor_to_step(balance / px, step)
+    notional_floor = qty_floor * px
+
+    if qty_floor <= 0:
+        return None, f"сумма меньше цены минимального шага: шаг={step}, цена={px}"
+
+    if notional_floor < min_required:
+        return None, (f"нельзя соблюсти минимум: нужно ≥{min_required:.6f} USDT, "
+                      f"влезает только {notional_floor:.6f} USDT")
+
+    return qty_floor, notional_floor
+
 # ---- Ордеры ----
 def _post_order(body: dict):
     ts = now_ms()
@@ -184,59 +237,30 @@ def _post_order(body: dict):
     except Exception:
         return r.status_code, {"code": f"HTTP{r.status_code}", "msg": r.text}
 
-def _step(qscale: int) -> Decimal:
-    return Decimal(1).scaleb(-qscale)  # 10^-qscale
+def place_market_buy(sym: str, qty: Decimal, rules: dict):
+    """Отправляем market ордер с количеством. Дублируем и size, и quantity для совместимости."""
+    step = _step(rules["quantityScale"])
+    size = _floor_to_step(qty, step)
+    if size <= 0: raise RuntimeError("buy_size_zero")
 
-def place_market_buy(sym: str, quote_usdt: Decimal, rules: dict, usdt_balance: Decimal):
-    """Покупка: сперва quoteOrderQty; при 40019 — фолбэк с дублированием size и quantity."""
-    min_usdt = rules["minTradeUSDT"]
-    need = max(quote_usdt, (min_usdt * MIN_NOTIONAL_BUFFER)).quantize(Decimal("0.0001"))
-    if need > usdt_balance:
-        raise RuntimeError(f"balance_low:{usdt_balance} need:{need}")
-
-    # 1) Основной путь — сумма в USDT
+    qty_str = f"{size.normalize()}"
     body = {
         "symbol": _sym_key(sym),
         "side": "buy",
         "orderType": "market",
         "force": "normal",
-        "clientOrderId": f"q-{sym}-{int(time.time()*1000)}",
-        "quoteOrderQty": f"{need}"          # <- строго строкой
+        "clientOrderId": f"s-{sym}-{int(time.time()*1000)}",
+        "size": qty_str,
+        "quantity": qty_str
     }
     st, d = _post_order(body)
-    code = str(d.get("code"))
-    if code == "00000":
-        return d.get("data")
-
-    # 2) Фолбэк: рассчитываем количество и передаём И size, И quantity
-    if code in {"40019","43010","43005","40034"}:
-        px = get_price(sym)
-        qscale = rules["quantityScale"]
-        step = _step(qscale)
-        qty = ((need/px) // step) * step
-        if qty <= 0:
-            raise RuntimeError(f"qty_zero_fallback need:{need} px:{px}")
-        qty_str = f"{qty.normalize()}"
-        body2 = {
-            "symbol": _sym_key(sym),
-            "side": "buy",
-            "orderType": "market",
-            "force": "normal",
-            "clientOrderId": f"s-{sym}-{int(time.time()*1000)}",
-            "size": qty_str,                 # Bitget
-            "quantity": qty_str              # на случай «привета» 40019 от шлюза
-        }
-        st2, d2 = _post_order(body2)
-        if str(d2.get("code")) != "00000":
-            raise RuntimeError(f"order_error_fallback:{st2}:{d2}")
-        return d2.get("data")
-
-    raise RuntimeError(f"order_error:{st}:{d}")
+    if str(d.get("code")) != "00000":
+        raise RuntimeError(f"order_error:{st}:{d}")
+    return d.get("data")
 
 def place_market_sell(sym: str, qty: Decimal, rules: dict):
-    qscale = rules["quantityScale"]
-    step = _step(qscale)
-    size = (qty // step) * step
+    step = _step(rules["quantityScale"])
+    size = _floor_to_step(qty, step)
     if size <= 0: raise RuntimeError("sell_size_zero")
     qty_str = f"{size.normalize()}"
     body = {
@@ -246,7 +270,7 @@ def place_market_sell(sym: str, qty: Decimal, rules: dict):
         "force": "normal",
         "clientOrderId": f"sl-{sym}-{int(time.time()*1000)}",
         "size": qty_str,
-        "quantity": qty_str                 # симметрично на продажу
+        "quantity": qty_str
     }
     st, d = _post_order(body)
     if str(d.get("code")) != "00000":
@@ -300,27 +324,24 @@ def ema_maybe_buy():
     try:
         rules = get_rules(sym)
         bal = get_usdt_balance()
-        want = min(BASE_TRADE_USDT, bal)
-        need = max(want, rules["minTradeUSDT"]*MIN_NOTIONAL_BUFFER).quantize(Decimal("0.0001"))
-        if need > bal:
-            tg(f"❕ {sym}: покупка пропущена — нужно {need} USDT (мин {rules['minTradeUSDT']}), баланс {bal}.")
+
+        plan = plan_buy(sym, BASE_TRADE_USDT, rules, bal)
+        if plan[0] is None:
+            tg(f"❕ {sym}: покупка пропущена — {plan[1]}. Баланс: {bal}.")
             return
 
-        place_market_buy(sym, need, rules, bal)
+        qty, spend = plan
+        place_market_buy(sym, qty, rules)
 
-        # оценим количество для статуса
         px = get_price(sym)
-        qscale = rules["quantityScale"]
-        step = _step(qscale)
-        qty_est = ((need/px) // step) * step
         positions[sym] = {
-            "qty": float(qty_est),
+            "qty": float(qty),
             "avg": float(px),
-            "amount": float(qty_est*px),
+            "amount": float(qty*px),
             "opened": datetime.now(timezone.utc).isoformat()
         }
         _save(STATE_FILE, positions)
-        tg(f"✅ Покупка {sym}: сумма={need} USDT, ~qty={qty_est}, цена≈{px}.")
+        tg(f"✅ Покупка {sym}: qty={qty}, цена≈{px}, сумма≈{(qty*px):.6f} USDT.")
     except Exception as e:
         tg(f"❗ Ошибка покупки {sym}: {e}")
 
