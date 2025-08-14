@@ -1,5 +1,2 @@
-Flask==3.0.3
-ccxt==4.3.72
-pandas==2.2.2
-numpy==1.26.4
+flask==3.0.2
 requests==2.32.3
