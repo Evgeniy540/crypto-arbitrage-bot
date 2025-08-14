@@ -1,218 +1,250 @@
-import os
-import time
-import math
-import json
-import threading
+import os, time, json, math, threading, socketserver, http.server
 from datetime import datetime, timezone
-from typing import List, Dict
-
+from typing import List, Dict, Tuple
 import requests
-from flask import Flask, jsonify
 
-# ==========[  НАСТРОЙКИ  ]==========
+# ===============================
+# НАСТРОЙКИ
+# ===============================
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
 
-# Монеты Bybit Spot (можешь менять)
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT", "PEPEUSDT", "BGBUSDT"]
+# Монеты для слежения (Spot)
+SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","PEPEUSDT","BGBUSDT"]
 
-# Таймфрейм и EMA
-INTERVAL      = "1"          # 1 = 1 minute (Bybit v5)
-EMA_FAST_LEN  = 7
-EMA_SLOW_LEN  = 14
+# Стратегия
+EMA_FAST = 7
+EMA_SLOW = 14
+TF_FAST  = "1min"   # рабочий ТФ
+TF_CONF  = "5min"   # подтверждение тренда
 
-# Ограничения и поведение
-POLL_SECONDS         = 8       # как часто опрашивать
-MIN_CANDLES_REQUIRED = 120     # сколько свечей тянуть (EMA, фильтры)
-SEND_ONLY_ON_CROSS   = True    # сигнал только при новом пересечении
-MIN_SLOPE_ABS        = 0.0     # фильтр: минимальный наклон EMA(fast) (0 = выключить)
-# ====================================
+TP_PCT = 0.40/100    # минимальный профит, чтобы отправить сигнал (напр. 0.40%)
+SL_PCT = 0.25/100    # виртуальный стоп для оценки R:R
+MIN_RR  = 1.2        # минимальное соотношение TP/SL (R>=1.2)
+ATR_LEN = 14         # длина ATR
+ATR_GATE = 0.8       # требуемая волатильность: ATR% >= TP_PCT*ATR_GATE
 
+POLL_SEC = 20        # период опроса символов
 
-# ---- Telegram ----
-def tg_send(text: str) -> None:
+BITGET = "https://api.bitget.com"
+HEADERS = {"User-Agent":"signal-bot/1.0"}
+
+# Память для антиспама (последнее направление кросса)
+last_cross_state: Dict[str, str] = {}   # symbol -> "long"/"short"/"none"
+
+# ===============================
+# ВСПОМОГАТЕЛЬНЫЕ
+# ===============================
+def ts_iso(ts_ms:int)->str:
+    return datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc).isoformat()
+
+def ema(series:List[float], n:int)->List[float]:
+    if len(series) < n: return []
+    k = 2/(n+1)
+    out = [None]*(n-1)
+    sm = sum(series[:n])/n
+    out.append(sm)
+    for i in range(n, len(series)):
+        sm = series[i]*k + sm*(1-k)
+        out.append(sm)
+    return out
+
+def true_range(h:List[float], l:List[float], c:List[float])->List[float]:
+    tr = [h[0]-l[0]]
+    for i in range(1,len(c)):
+        tr.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
+    return tr
+
+def atr(h:List[float], l:List[float], c:List[float], n:int)->List[float]:
+    tr = true_range(h,l,c)
+    return ema(tr, n)
+
+def pct(a:float, b:float)->float:
+    return (a-b)/b
+
+def get_candles(symbol:str, granularity:str, limit:int=200)->Tuple[List[int],List[float],List[float],List[float],List[float]]:
+    """
+    Возвращает (t, o, h, l, c) отсортированные по времени (старые -> новые).
+    Bitget v2 spot/market/candles: [ts, open, high, low, close, volume]
+    """
+    url = f"{BITGET}/api/v2/spot/market/candles"
+    params = {"symbol":symbol, "granularity":granularity, "limit":str(limit)}
+    r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    # Ожидаем {'code':'00000','data':[[...],...]}
+    if isinstance(data, dict) and "data" in data:
+        rows = data["data"]
+    else:
+        rows = data
+    # приходят от новых к старым -> перевернем
+    rows = list(reversed(rows))
+    t,o,h,l,c = [],[],[],[],[]
+    for row in rows:
+        # строки или числа - приведем
+        ts = int(row[0])
+        o1 = float(row[1]); h1=float(row[2]); l1=float(row[3]); c1=float(row[4])
+        t.append(ts); o.append(o1); h.append(h1); l.append(l1); c.append(c1)
+    return t,o,h,l,c
+
+def send_tg(text:str):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-        for _ in range(2):
-            r = requests.post(url, json=payload, timeout=10)
-            if r.ok:
-                return
-            time.sleep(1)
-    except Exception:
-        pass
-
-
-# ---- Bybit Market Data (v5) ----
-BYBIT_BASE = "https://api.bybit.com"
-
-def get_klines(symbol: str, interval: str = "1", limit: int = 200) -> List[Dict]:
-    """
-    Bybit v5 Kline:
-    GET /v5/market/kline?category=spot&symbol=BTCUSDT&interval=1&limit=200
-    Возвращает список свечей в хронологическом порядке (старые -> новые)
-    """
-    params = {
-        "category": "spot",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": str(limit),
-    }
-    url = f"{BYBIT_BASE}/v5/market/kline"
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    d = r.json()
-    if d.get("retCode") != 0:
-        raise RuntimeError(f"Bybit error: {d.get('retMsg')}")
-    # d['result']['list'] — массив свечей в ОБРАТНОМ порядке: newest first
-    raw = d["result"]["list"]
-    raw.reverse()  # теперь старые -> новые
-
-    kl = []
-    for it in raw:
-        # формат: [startTime, open, high, low, close, volume, turnover]
-        ts_ms = int(it[0])
-        kl.append({
-            "time": datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc),
-            "open": float(it[1]),
-            "high": float(it[2]),
-            "low":  float(it[3]),
-            "close":float(it[4]),
-            "vol":  float(it[5]),
-        })
-    return kl
-
-
-# ---- Индикаторы ----
-def ema(series: List[float], length: int) -> List[float]:
-    if length <= 1 or len(series) == 0:
-        return series[:]
-    k = 2 / (length + 1)
-    out = [series[0]]
-    for i in range(1, len(series)):
-        out.append(series[i] * k + out[-1] * (1 - k))
-    return out
-
-def slope(values: List[float], n: int = 3) -> float:
-    """Простой наклон последних n значений."""
-    if len(values) < 2:
-        return 0.0
-    n = min(n, len(values) - 1)
-    return values[-1] - values[-1 - n]
-
-
-# ---- Логика сигналов ----
-last_cross_state: Dict[str, int] = {}   # 1 = fast>slow, -1 = fast<slow
-last_signaled_candle_time: Dict[str, datetime] = {}
-
-def build_signal_text(side: str, symbol: str, price: float) -> str:
-    now = datetime.now(timezone.utc).isoformat()
-    bell = "🔔"
-    side_txt = "BUY" if side == "BUY" else "SELL"
-    return (
-        f"{bell} {side_txt} {symbol}\n"
-        f"Цена: {price:.6f}\n"
-        f"EMA{EMA_FAST_LEN} vs EMA{EMA_SLOW_LEN} (TF {INTERVAL}m)\n"
-        f"{now}"
-    )
-
-def process_symbol(symbol: str):
-    try:
-        kl = get_klines(symbol, INTERVAL, max(MIN_CANDLES_REQUIRED, 50))
-        if not kl:
-            return
-
-        closes = [x["close"] for x in kl]
-        ef = ema(closes, EMA_FAST_LEN)
-        es = ema(closes, EMA_SLOW_LEN)
-
-        # текущее состояние
-        fast = ef[-1]
-        slow = es[-1]
-        prev_fast = ef[-2] if len(ef) > 1 else fast
-        prev_slow = es[-2] if len(es) > 1 else slow
-
-        # отметка времени последней полной свечи
-        # в Bybit kline последняя запись — текущая формирующаяся свеча.
-        # Будем сигналить только когда сменился "время начала" текущей свечи,
-        # а пересечение было на закрытой.
-        last_closed_time = kl[-2]["time"] if len(kl) >= 2 else kl[-1]["time"]
-
-        # фильтры
-        ef_slope = slope(ef, 3)
-        if abs(ef_slope) < MIN_SLOPE_ABS:
-            return
-
-        # состояние: 1 если fast>slow, -1 если fast<slow
-        state_now = 1 if fast > slow else -1
-        state_prev = 1 if prev_fast > prev_slow else -1
-
-        sym_key = symbol.upper()
-        prev_state_recorded = last_cross_state.get(sym_key, 0)
-        last_candle_sent = last_signaled_candle_time.get(sym_key)
-
-        crossed_up = (state_prev == -1) and (state_now == 1)
-        crossed_dn = (state_prev == 1) and (state_now == -1)
-
-        if SEND_ONLY_ON_CROSS:
-            should_buy  = crossed_up
-            should_sell = crossed_dn
-        else:
-            should_buy  = state_now == 1 and prev_state_recorded != 1
-            should_sell = state_now == -1 and prev_state_recorded != -1
-
-        # чтобы не слать множество сообщений в рамках одной и той же закрытой свечи:
-        if last_candle_sent is not None and last_candle_sent == last_closed_time:
-            # уже слали по этой свече
-            pass
-        else:
-            price = closes[-1]
-            if should_buy:
-                tg_send(build_signal_text("BUY", sym_key, price))
-                last_signaled_candle_time[sym_key] = last_closed_time
-            elif should_sell:
-                tg_send(build_signal_text("SELL", sym_key, price))
-                last_signaled_candle_time[sym_key] = last_closed_time
-
-        # обновляем «память» состояния
-        last_cross_state[sym_key] = state_now
-
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        # тихий self-heal: просто пропускаем круг
-        # но раз в несколько минут было бы полезно слать предупр. сообщение — не спамим.
-        print(f"[WARN] {symbol} error: {e}")
+        print("TELEGRAM_ERROR:", e)
 
+def crossed_up(fast:List[float], slow:List[float])->bool:
+    if len(fast)<2 or len(slow)<2: return False
+    return fast[-2] is not None and slow[-2] is not None and fast[-1] is not None and slow[-1] is not None and fast[-2] < slow[-2] and fast[-1] > slow[-1]
 
-def worker_loop():
-    tg_send("🤖 Бот запущен! EMA {}/{}, TF {}m. Сообщения — только по факту новых пересечений."
-            .format(EMA_FAST_LEN, EMA_SLOW_LEN, INTERVAL))
+def crossed_down(fast:List[float], slow:List[float])->bool:
+    if len(fast)<2 or len(slow)<2: return False
+    return fast[-2] is not None and slow[-2] is not None and fast[-1] is not None and slow[-1] is not None and fast[-2] > slow[-2] and fast[-1] < slow[-1]
+
+def rr_okay(price:float, tp_pct:float, sl_pct:float, min_rr:float)->bool:
+    rr = tp_pct/sl_pct if sl_pct>0 else 0
+    return rr >= min_rr
+
+def enough_volatility(close:List[float])->bool:
+    # ATR% от цены
+    # Сгенерим High/Low как +- скользящий High/Low (если Bitget дал реальные high/low — ок, мы передаем их)
+    return True  # будет оценено выше в generate_signal (по реальным H/L)
+
+# ===============================
+# СИГНАЛЫ
+# ===============================
+def trend_confirmed(symbol:str)->str:
+    """Подтверждение тренда по 5m: возвращает 'bull'/'bear'/'none'"""
+    try:
+        t,o,h,l,c = get_candles(symbol, TF_CONF, 200)
+        ef = ema(c, EMA_FAST); es = ema(c, EMA_SLOW)
+        if not ef or not es: return "none"
+        if ef[-1] > es[-1]: return "bull"
+        if ef[-1] < es[-1]: return "bear"
+        return "none"
+    except Exception:
+        return "none"
+
+def generate_signal(symbol:str):
+    global last_cross_state
+    try:
+        # 1) Основные свечи 1m
+        t,o,h,l,c = get_candles(symbol, TF_FAST, 300)
+        ef = ema(c, EMA_FAST)
+        es = ema(c, EMA_SLOW)
+        if not ef or not es or len(ef)!=len(c) or len(es)!=len(c):
+            return
+
+        # 2) ATR на 1m (волатильность)
+        a = atr(h,l,c, ATR_LEN)
+        if not a or a[-1] is None:
+            return
+        atr_pct = a[-1] / c[-1]
+
+        # 3) Подтверждение тренда 5m
+        conf = trend_confirmed(symbol)
+
+        price = c[-1]
+        now_iso = ts_iso(t[-1])
+
+        # long-кросс
+        if crossed_up(ef, es):
+            # антиспам
+            if last_cross_state.get(symbol) == "long":
+                return
+            last_cross_state[symbol] = "long"
+
+            # фильтры
+            if conf != "bull":
+                return
+            if atr_pct < TP_PCT*ATR_GATE:
+                return
+            if not rr_okay(price, TP_PCT, SL_PCT, MIN_RR):
+                return
+
+            tp = price*(1+TP_PCT)
+            sl = price*(1-SL_PCT)
+
+            msg = (
+                f"🔔 BUY {symbol}\n"
+                f"Цена: {price:.6f}\n"
+                f"EMA{EMA_FAST} vs EMA{EMA_SLOW} (TF {TF_FAST}) + подтверждение {TF_CONF}\n"
+                f"ATR%≈{atr_pct*100:.2f}%  | TP {TP_PCT*100:.2f}%  SL {SL_PCT*100:.2f}%  R≈{TP_PCT/SL_PCT:.2f}\n"
+                f"TP: {tp:.6f}  | SL: {sl:.6f}\n"
+                f"{now_iso}"
+            )
+            send_tg(msg)
+
+        # short-кросс (для спота — это сигнал на ПРОДАЖУ/выход)
+        elif crossed_down(ef, es):
+            if last_cross_state.get(symbol) == "short":
+                return
+            last_cross_state[symbol] = "short"
+
+            if conf != "bear":
+                return
+            if atr_pct < TP_PCT*ATR_GATE:
+                return
+            if not rr_okay(price, TP_PCT, SL_PCT, MIN_RR):
+                return
+
+            tp = price*(1-TP_PCT)
+            sl = price*(1+SL_PCT)
+
+            msg = (
+                f"🔔 SELL {symbol}\n"
+                f"Цена: {price:.6f}\n"
+                f"EMA{EMA_FAST} vs EMA{EMA_SLOW} (TF {TF_FAST}) + подтверждение {TF_CONF}\n"
+                f"ATR%≈{atr_pct*100:.2f}%  | TP {TP_PCT*100:.2f}%  SL {SL_PCT*100:.2f}%  R≈{TP_PCT/SL_PCT:.2f}\n"
+                f"TP: {tp:.6f}  | SL: {sl:.6f}\n"
+                f"{now_iso}"
+            )
+            send_tg(msg)
+        # нет нового кросса — ничего не шлём
+    except requests.HTTPError as e:
+        print(f"{symbol} HTTP_ERROR:", e.response.text if e.response else e)
+    except Exception as e:
+        print(f"{symbol} ERROR:", e)
+
+# ===============================
+# ЛЁГКИЙ HEALTH-СЕРВЕР (для Render Web)
+# ===============================
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/","/health","/favicon.ico"):
+            self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404); self.end_headers()
+
+def start_http_if_needed():
+    port = os.getenv("PORT")
+    if not port: 
+        return
+    port = int(port)
+    def run():
+        with socketserver.TCPServer(("", port), Handler) as httpd:
+            print(f"Health server on :{port}")
+            httpd.serve_forever()
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+
+# ===============================
+# MAIN LOOP
+# ===============================
+def main():
+    start_http_if_needed()
+    send_tg(f"🤖 Бот запущен! EMA {EMA_FAST}/{EMA_SLOW}, TF {TF_FAST}. Сообщения — только по факту новых пересечений.")
+    for s in SYMBOLS:
+        last_cross_state.setdefault(s,"none")
+
     while True:
-        start = time.time()
-        for sym in SYMBOLS:
-            process_symbol(sym)
-        # равномерный цикл
-        dt = time.time() - start
-        time.sleep(max(1.0, POLL_SECONDS - dt))
+        for s in SYMBOLS:
+            generate_signal(s)
+            time.sleep(0.2)  # чуток между запросами
+        time.sleep(POLL_SEC)
 
-
-# ---- Flask (Render health + порт) ----
-app = Flask(__name__)
-
-@app.route("/")
-def root():
-    return jsonify({"ok": True, "time": datetime.now(timezone.utc).isoformat()})
-
-@app.route("/healthz")
-def healthz():
-    return "ok", 200
-
-
-# ---- Точка входа ----
 if __name__ == "__main__":
-    # Фоновый поток с сигналами
-    t = threading.Thread(target=worker_loop, daemon=True)
-    t.start()
-
-    # Веб-сервер для Render (важно: слушаем PORT и 0.0.0.0)
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    main()
