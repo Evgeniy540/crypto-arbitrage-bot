@@ -1,210 +1,202 @@
+# -*- coding: utf-8 -*-
 import os
 import time
 import threading
 from datetime import datetime, timezone
+from collections import defaultdict, deque
+
 import requests
 from flask import Flask, jsonify
 
-# ========= ПАРАМЕТРЫ =========
+# =============== ТВОИ ДАННЫЕ (вписано) ===============
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
+# =====================================================
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT", "PEPEUSDT", "BGBUSDT"]
-TF_SECONDS = 60                # 1m
-EMA_FAST, EMA_SLOW = 7, 14     # EMA 7/14
-CANDLES_LIMIT = 200            # сколько свечей тянем
-COOLDOWN_SEC = 60              # защита от частых повторов
-CHECK_INTERVAL = 5             # раз в N секунд пробегаемся по списку
-RENDER_PORT = int(os.getenv("PORT", "10000"))
+# -------- Настройки стратегии --------
+# USDT-M perpetual на Bitget => суффикс _UMCBL
+FUT_SUFFIX = "_UMCBL"
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]  # базовые без суффикса
+GRANULARITY = "1min"        # допустимые для futures: 1min,3min,5min,15min,30min,1h,4h,6h,12h,1day,1week,1M,
+                            # также 6Hutc,12Hutc,1Dutc,3Dutc,1Wutc,1Mutc
+EMA_FAST, EMA_SLOW = 7, 14
+CANDLES_LIMIT = 220
+COOLDOWN_SEC = 60           # антиспам на один символ
+REQUEST_TIMEOUT = 12
+SLEEP_BETWEEN_SYMBOLS = 0.5
+LOOP_SLEEP = 3
 
-# ========= ВСПОМОГАТОРЫ =========
-session = requests.Session()
-session.headers.update({"User-Agent": "ema-bot/1.0"})
+# -------- Служебные хранилища --------
+last_cross = {}                                   # "BUY"/"SELL"/None
+last_alert_time = defaultdict(lambda: 0.0)        # антиспам
+cl_buf = defaultdict(lambda: deque(maxlen=CANDLES_LIMIT))  # закрытия для EMA
 
+BASE_URL = "https://api.bitget.com"
+app = Flask(__name__)
+
+# ================= Утилиты =================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def tsend(text: str):
-    """Отправка сообщения в Telegram со страховкой от ошибок сети."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+def send_telegram(text: str):
     try:
-        r = session.post(url, json=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"[TELEGRAM] HTTP {r.status_code}: {r.text[:200]}")
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
     except Exception as e:
-        print(f"[TELEGRAM] exception: {e}")
+        print(f"[TG] send error: {e}")
 
-def ema_series(closes, period):
-    """Возвращает ряд EMA с тем же размером, что и closes."""
-    k = 2 / (period + 1)
-    ema = []
-    s = None
-    for i, c in enumerate(closes):
-        if s is None:
-            # стартуем с простой средней по первым 'period' точкам,
-            # если данных меньше — берём обычное среднее из доступных
-            wnd = closes[max(0, i - period + 1):i + 1]
-            s = sum(wnd) / len(wnd)
-        else:
-            s = c * k + s * (1 - k)
-        ema.append(s)
-    return ema
+# ================= Доступ к Bitget (Futures/MIX) =================
+def _parse_v2(data):
+    rows = data.get("data", [])
+    out = []
+    for row in rows:
+        ts = int(float(row[0]))
+        o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
+        v = float(row[5]) if len(row) > 5 else 0.0
+        out.append([ts, o, h, l, c, v])
+    out.sort(key=lambda x: x[0])
+    return out
 
-def parse_float(x):
+def _parse_v1(data):
+    rows = data.get("data", [])
+    out = []
+    for row in rows:
+        ts = int(float(row[0]))
+        o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
+        v = float(row[5]) if len(row) > 5 else 0.0
+        out.append([ts, o, h, l, c, v])
+    out.sort(key=lambda x: x[0])
+    return out
+
+def bitget_get_futures_candles(symbol_base: str, granularity: str, limit: int):
+    """
+    Пытаемся получить свечи фьючерсов (USDT-M):
+      1) v2: /api/v2/mix/market/candles?symbol=BTCUSDT_UMCBL
+      2) v1: /api/mix/v1/market/candles?symbol=BTCUSDT_UMCBL
+    Возвращаем [[ts_ms,o,h,l,c,v], ...] по возрастанию ts.
+    """
+    symbol = symbol_base + FUT_SUFFIX
+
+    # --- v2 ---
     try:
-        return float(x)
+        url = f"{BASE_URL}/api/v2/mix/market/candles"
+        params = {"symbol": symbol, "granularity": granularity, "limit": str(limit)}
+        r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        data = r.json()
+        if str(data.get("code")) == "00000":
+            return _parse_v2(data)
+        else:
+            code = str(data.get("code")); msg = data.get("msg")
+            # если ошибка о неверной гранулярности
+            if code in {"400171", "400170"}:
+                raise RuntimeError(f"Invalid granularity for futures: {msg}")
+            # в остальных случаях попробуем v1
+            # print(f"[{symbol}] v2 fail {code}: {msg}")
     except Exception:
-        return None
+        pass
 
-def get_candles_bitget(symbol: str, granularity: int, limit: int):
-    """
-    Пытаемся v2: /api/v2/spot/market/candles?symbol=BTCUSDT&granularity=60&limit=200
-    Если код != 00000 или 400 — пробуем v1: /api/spot/v1/market/candles?symbol=BTCUSDT&period=1min&limit=200
-    Возвращает список кортежей [(ts, open, high, low, close, volume), ...] по возрастанию ts.
-    """
-    # ---- v2
-    try:
-        url_v2 = "https://api.bitget.com/api/v2/spot/market/candles"
-        params = {"symbol": symbol, "granularity": str(granularity), "limit": str(limit)}
-        r = session.get(url_v2, params=params, timeout=10)
-        data = r.json()
-        if r.status_code == 200 and data.get("code") == "00000":
-            rows = data.get("data", [])
-            out = []
-            # v2 формат: ["1700793600000","43019.9","43034.9","43019.9","43022.7","6.3"] (ts, o,h,l,c,vol) — ts в ms
-            for row in rows:
-                ts = int(row[0]) // 1000
-                o = parse_float(row[1]); h = parse_float(row[2]); l = parse_float(row[3]); c = parse_float(row[4])
-                v = parse_float(row[5])
-                if None not in (o, h, l, c, v):
-                    out.append((ts, o, h, l, c, v))
-            out.sort(key=lambda x: x[0])
-            if len(out) > 0:
-                return out
-        else:
-            print(f"[{symbol}] v2 err: HTTP {r.status_code}, code={data.get('code')} msg={data.get('msg')}")
-    except Exception as e:
-        print(f"[{symbol}] v2 exception: {e}")
+    # --- v1 (бэкап) ---
+    url = f"{BASE_URL}/api/mix/v1/market/candles"
+    params = {"symbol": symbol, "granularity": granularity, "limit": str(limit)}
+    r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    data = r.json()
+    if str(data.get("code")) == "00000":
+        return _parse_v1(data)
+    code = str(data.get("code")); msg = data.get("msg")
+    raise RuntimeError(f"futures candles fail: {code} {msg}")
 
-    # ---- v1 fallback
-    try:
-        url_v1 = "https://api.bitget.com/api/spot/v1/market/candles"
-        period = {60: "1min", 300: "5min", 900: "15min", 3600: "1hour", 86400: "1day"}.get(granularity, "1min")
-        params = {"symbol": symbol, "period": period, "limit": str(limit)}
-        r = session.get(url_v1, params=params, timeout=10)
-        data = r.json()
-        # v1 тоже возвращает {"code":"00000", "data": [...]}
-        if r.status_code == 200 and data.get("code") == "00000":
-            rows = data.get("data", [])
-            out = []
-            # v1 формат, как правило, тот же порядок полей
-            for row in rows:
-                ts = int(row[0]) // 1000
-                o = parse_float(row[1]); h = parse_float(row[2]); l = parse_float(row[3]); c = parse_float(row[4])
-                v = parse_float(row[5])
-                if None not in (o, h, l, c, v):
-                    out.append((ts, o, h, l, c, v))
-            out.sort(key=lambda x: x[0])
-            if len(out) > 0:
-                return out
-        else:
-            print(f"[{symbol}] v1 err: HTTP {r.status_code}, code={data.get('code')} msg={data.get('msg')}")
-    except Exception as e:
-        print(f"[{symbol}] v1 exception: {e}")
+# ================= EMA =================
+def ema_pair(series, fast, slow):
+    if len(series) < slow:
+        return None, None
+    def ema_full(prices, p):
+        k = 2/(p+1)
+        e = prices[0]
+        for x in prices[1:]:
+            e = x*k + e*(1-k)
+        return e
+    return ema_full(series, fast), ema_full(series, slow)
 
-    return []
+# ================= Логика сигналов =================
+def analyze_and_alert(sym_base: str, candles):
+    closes = [c[4] for c in candles]
+    for px in closes:
+        if not cl_buf[sym_base] or px != cl_buf[sym_base][-1]:
+            cl_buf[sym_base].append(px)
 
-# сохраняем последнее зафиксированное состояние, чтобы не спамить
-last_state = {}     # symbol -> {"side":"buy"/"sell","ts":close_ts}
-last_sent  = {}     # symbol -> last send ts
-
-def check_symbol(symbol: str):
-    candles = get_candles_bitget(symbol, TF_SECONDS, CANDLES_LIMIT)
-    if len(candles) < max(EMA_SLOW + 1, 25):
-        print(f"[{symbol}] мало свечей: {len(candles)}")
+    if len(cl_buf[sym_base]) < EMA_SLOW:
         return
 
-    closes = [c[4] for c in candles]
-    fast = ema_series(closes, EMA_FAST)
-    slow = ema_series(closes, EMA_SLOW)
+    fast, slow = ema_pair(list(cl_buf[sym_base]), EMA_FAST, EMA_SLOW)
+    if fast is None or slow is None:
+        return
 
-    # берём две последние точки, чтобы отлавливать факт нового пересечения
-    f_prev, f_now = fast[-2], fast[-1]
-    s_prev, s_now = slow[-2], slow[-1]
-    cross_up = f_prev <= s_prev and f_now > s_now
-    cross_dn = f_prev >= s_prev and f_now < s_now
+    prev_state = last_cross.get(sym_base)
+    state = "BUY" if fast > slow else "SELL" if fast < slow else prev_state
 
-    close_ts = candles[-1][0]
-    price = closes[-1]
+    if state and state != prev_state:
+        last_ts = candles[-1][0]
+        ts_iso = datetime.fromtimestamp(last_ts/1000, tz=timezone.utc).isoformat()
+        price = candles[-1][4]
 
-    state = last_state.get(symbol)
-    cool_ok = (time.time() - last_sent.get(symbol, 0)) >= COOLDOWN_SEC
+        tnow = time.time()
+        if tnow - last_alert_time[sym_base] >= COOLDOWN_SEC:
+            side = "LONG (покупать/открывать лонг)" if state == "BUY" else "SHORT (продавать/открывать шорт)"
+            text = (
+                f"🔔 {state} {sym_base}{FUT_SUFFIX}\n"
+                f"Режим: Futures USDT-M\n"
+                f"Идея: {side}\n"
+                f"Цена: {price:.6f}\n"
+                f"EMA {EMA_FAST}/{EMA_SLOW} (TF {GRANULARITY})\n"
+                f"{ts_iso}"
+            )
+            print(text)
+            send_telegram(text)
+            last_alert_time[sym_base] = tnow
 
-    if cross_up and cool_ok and (not state or state.get("side") != "buy" or state.get("ts") != close_ts):
-        txt = (
-            f"🔔 BUY {symbol}\n"
-            f"Цена: {price}\n"
-            f"EMA{EMA_FAST} пересекла EMA{EMA_SLOW} ВВЕРХ (TF 1m)\n"
-            f"{now_iso()}"
-        )
-        tsend(txt)
-        last_state[symbol] = {"side": "buy", "ts": close_ts}
-        last_sent[symbol] = time.time()
-        print(f"[{symbol}] BUY signal sent")
+    last_cross[sym_base] = state
 
-    elif cross_dn and cool_ok and (not state or state.get("side") != "sell" or state.get("ts") != close_ts):
-        txt = (
-            f"🔔 SELL {symbol}\n"
-            f"Цена: {price}\n"
-            f"EMA{EMA_FAST} пересекла EMA{EMA_SLOW} ВНИЗ (TF 1m)\n"
-            f"{now_iso()}"
-        )
-        tsend(txt)
-        last_state[symbol] = {"side": "sell", "ts": close_ts}
-        last_sent[symbol] = time.time()
-        print(f"[{symbol}] SELL signal sent")
-
+# ================= Рабочий цикл =================
 def worker_loop():
-    # стартовое сообщение
-    tsend(f"🤖 Бот запущен! EMA {EMA_FAST}/{EMA_SLOW}, TF 1m. Сообщения — только по факту новых пересечений.")
-    print("Worker started")
+    hdr = (f"🤖 Фьючерсный сигнальный бот запущен! "
+           f"EMA {EMA_FAST}/{EMA_SLOW}, TF {GRANULARITY}. "
+           f"Сообщения — только при новых пересечениях.")
+    print(f"[{now_iso()}] worker started. Futures symbols={SYMBOLS}, TF={GRANULARITY}")
+    send_telegram(hdr)
+
     while True:
-        start = time.time()
-        for sym in SYMBOLS:
+        for base in SYMBOLS:
             try:
-                check_symbol(sym)
+                candles = bitget_get_futures_candles(base, GRANULARITY, CANDLES_LIMIT)
+                analyze_and_alert(base, candles)
             except Exception as e:
-                print(f"[{sym}] loop exception: {e}")
-        # поддерживаем частоту проверки
-        sleep_left = CHECK_INTERVAL - (time.time() - start)
-        if sleep_left > 0:
-            time.sleep(sleep_left)
+                print(f"[{base}{FUT_SUFFIX}] fetch/analyze error: {e}")
+            time.sleep(SLEEP_BETWEEN_SYMBOLS)
+        time.sleep(LOOP_SLEEP)
 
-# ========= FLASK для Render =========
-app = Flask(__name__)
-
-@app.get("/")
-def root_ok():
+# ================= HTTP keep-alive =================
+@app.route("/")
+def root():
     return "ok"
 
-@app.get("/status")
+@app.route("/status")
 def status():
     return jsonify({
         "ok": True,
-        "time": now_iso(),
-        "tf": "1m",
+        "mode": "futures-umcbl",
+        "symbols": [s + FUT_SUFFIX for s in SYMBOLS],
+        "tf": GRANULARITY,
         "ema": f"{EMA_FAST}/{EMA_SLOW}",
-        "symbols": SYMBOLS,
-        "cooldown_sec": COOLDOWN_SEC
+        "cooldown_sec": COOLDOWN_SEC,
+        "time": now_iso()
     })
 
-def run_http():
-    # Хост 0.0.0.0 обязателен на Render
-    app.run(host="0.0.0.0", port=RENDER_PORT, debug=False, use_reloader=False)
+def run():
+    th = threading.Thread(target=worker_loop, daemon=True)
+    th.start()
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    # HTTP сервер в отдельном потоке
-    threading.Thread(target=run_http, daemon=True).start()
-    # рабочий цикл сигналов
-    worker_loop()
+    run()
