@@ -1,3 +1,5 @@
-ccxt==4.3.75
 Flask==3.0.3
+ccxt==4.3.72
+pandas==2.2.2
+numpy==1.26.4
 requests==2.32.3
