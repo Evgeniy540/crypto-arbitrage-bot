@@ -14,10 +14,10 @@ TELEGRAM_CHAT_ID   = "5723086631"
 # ===============================
 
 # -------- Настройки --------
-FUT_SUFFIX = "_UMCBL"
+FUT_SUFFIX = "_UMCBL"   # USDT-M perpetual на Bitget
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]
 
-GRANULARITY = "1min"           # желаемый ТФ; код подберёт правильный формат сам
+GRANULARITY = "1min"    # желаемый ТФ; код сам подберёт рабочий формат
 EMA_FAST, EMA_SLOW = 9, 21
 CANDLES_LIMIT = 220
 
@@ -35,7 +35,7 @@ SLEEP_BETWEEN_SYMBOLS = 0.25
 LOOP_SLEEP = 1.5
 
 BASE_URL = "https://api.bitget.com"
-_REQ_HEADERS = {"User-Agent": "futures-signal-bot/1.3", "Accept": "application/json"}
+_REQ_HEADERS = {"User-Agent": "futures-signal-bot/1.4", "Accept": "application/json"}
 
 # -------- Служебные --------
 last_cross = {}
@@ -44,6 +44,9 @@ last_alert_time = defaultdict(lambda: 0.0)
 last_near_time = defaultdict(lambda: 0.0)
 last_heartbeat_time = defaultdict(lambda: 0.0)
 cl_buf = defaultdict(lambda: deque(maxlen=CANDLES_LIMIT))
+
+# Запоминаем, какие параметры «зашли», чтобы потом не перебирать каждый раз
+accepted_params = {}   # key = symbol_base -> dict{ endpoint:'v1'|'v2', symbol, gran, productType? }
 
 app = Flask(__name__)
 
@@ -90,54 +93,8 @@ def _parse_ohlcv_payload(data):
     out.sort(key=lambda x: x[0])
     return out
 
-def _try_mix_v2(symbol_full: str, gran_candidates, limit: int):
-    """Перебираем форматы granularity для v2 до успеха."""
-    url = f"{BASE_URL}/api/v2/mix/market/candles"
-    for gran in gran_candidates:
-        try:
-            r = requests.get(
-                url,
-                params={"symbol": symbol_full, "granularity": gran, "limit": limit},
-                headers=_REQ_HEADERS, timeout=REQUEST_TIMEOUT,
-            )
-            data = r.json()
-            code = str(data.get("code"))
-            if code == "00000":
-                if gran != gran_candidates[0]:
-                    print(f"[{symbol_full}] v2 accepted gran='{gran}'")
-                return _parse_ohlcv_payload(data)
-            else:
-                print(f"[{symbol_full}] v2 fail {code}: {data.get('msg')} (gran={gran})")
-        except Exception as e:
-            print(f"[{symbol_full}] v2 exception (gran={gran}): {e}")
-    return None
-
-def _try_mix_v1(symbol_full: str, gran_candidates, limit: int):
-    """Перебираем форматы granularity для v1 до успеха."""
-    url = f"{BASE_URL}/api/mix/v1/market/candles"
-    for gran in gran_candidates:
-        try:
-            r = requests.get(
-                url,
-                params={"symbol": symbol_full, "granularity": gran, "limit": limit},
-                headers=_REQ_HEADERS, timeout=REQUEST_TIMEOUT,
-            )
-            data = r.json()
-            code = str(data.get("code"))
-            if code == "00000":
-                if gran != gran_candidates[0]:
-                    print(f"[{symbol_full}] v1 accepted gran='{gran}'")
-                return _parse_ohlcv_payload(data)
-            else:
-                print(f"[{symbol_full}] v1 fail {code}: {data.get('msg')} (gran={gran})")
-        except Exception as e:
-            print(f"[{symbol_full}] v1 exception (gran={gran}): {e}")
-    return None
-
-# Наборы кандидатов. Видел инсталляции Bitget, где:
-# - v2 принимает "1min" ИЛИ "60";
-# - v1 принимает "1min" ИЛИ "60" ИЛИ "1".
-V2_GRAN_CANDIDATES_MAP = {
+# Маппинги эквивалентов гранулярности
+V2_GRAN_CANDS = {
     "1min": ["1min", "60"],
     "3min": ["3min", "180"],
     "5min": ["5min", "300"],
@@ -151,7 +108,7 @@ V2_GRAN_CANDIDATES_MAP = {
     "1week": ["1week", "604800"],
     "1M": ["1M", "2592000"],
 }
-V1_GRAN_CANDIDATES_MAP = {
+V1_GRAN_CANDS = {
     "1min": ["1min", "60", "1"],
     "3min": ["3min", "180", "3"],
     "5min": ["5min", "300", "5"],
@@ -166,23 +123,94 @@ V1_GRAN_CANDIDATES_MAP = {
     "1M": ["1M", "2592000", "1M"],
 }
 
+def _try_v2(symbol_str: str, gran: str, product_type: str | None, limit: int):
+    url = f"{BASE_URL}/api/v2/mix/market/candles"
+    params = {"symbol": symbol_str, "granularity": gran, "limit": limit}
+    if product_type:
+        params["productType"] = product_type
+    try:
+        r = requests.get(url, params=params, headers=_REQ_HEADERS, timeout=REQUEST_TIMEOUT)
+        data = r.json()
+        code = str(data.get("code"))
+        if code == "00000":
+            return _parse_ohlcv_payload(data)
+        print(f"[v2] fail {code} (symbol={symbol_str}, gran={gran}, productType={product_type}, msg={data.get('msg')})")
+    except Exception as e:
+        print(f"[v2] exception (symbol={symbol_str}, gran={gran}, productType={product_type}): {e}")
+    return None
+
+def _try_v1(symbol_str: str, gran: str, limit: int):
+    url = f"{BASE_URL}/api/mix/v1/market/candles"
+    params = {"symbol": symbol_str, "granularity": gran, "limit": limit}
+    try:
+        r = requests.get(url, params=params, headers=_REQ_HEADERS, timeout=REQUEST_TIMEOUT)
+        data = r.json()
+        code = str(data.get("code"))
+        if code == "00000":
+            return _parse_ohlcv_payload(data)
+        print(f"[v1] fail {code} (symbol={symbol_str}, gran={gran}, msg={data.get('msg')})")
+    except Exception as e:
+        print(f"[v1] exception (symbol={symbol_str}, gran={gran}): {e}")
+    return None
+
 def bitget_get_futures_candles(symbol_base: str, granularity: str, limit: int):
-    symbol = symbol_base + FUT_SUFFIX
-    v2_cands = V2_GRAN_CANDIDATES_MAP.get(granularity, ["1min", "60"])
-    v1_cands = V1_GRAN_CANDIDATES_MAP.get(granularity, ["1min", "60", "1"])
+    """
+    Пытаемся все разумные комбинации:
+      v2:  [symbol_with_suffix | symbol_base] × [gran-cands] × [productType=None|umcbl]
+      v1:  [symbol_with_suffix | symbol_base] × [gran-cands]   (productType не нужен)
+    Как только что-то сработало — запоминаем и используем дальше.
+    """
+    # если уже знаем рабочие настройки — используем их
+    if symbol_base in accepted_params:
+        cfg = accepted_params[symbol_base]
+        try:
+            if cfg["endpoint"] == "v2":
+                return _try_v2(cfg["symbol"], cfg["gran"], cfg.get("productType"), limit) or \
+                       _try_fallback_all(symbol_base, granularity, limit)  # если внезапно перестало работать
+            else:
+                return _try_v1(cfg["symbol"], cfg["gran"], limit) or \
+                       _try_fallback_all(symbol_base, granularity, limit)
+        except Exception:
+            # упадём в полный перебор
+            pass
 
-    # 1) v2 с подбором формата
-    data = _try_mix_v2(symbol, v2_cands, limit)
-    if data is not None:
-        return data
+    return _try_fallback_all(symbol_base, granularity, limit)
 
-    # 2) v1 с подбором формата
-    data = _try_mix_v1(symbol, v1_cands, limit)
-    if data is not None:
-        return data
+def _try_fallback_all(symbol_base: str, granularity: str, limit: int):
+    symbol_with = symbol_base + FUT_SUFFIX
+    symbol_plain = symbol_base
 
-    # 3) не удалось
-    raise RuntimeError(f"[{symbol}] candles fail for all formats: v2{v2_cands} / v1{v1_cands}")
+    v2_grans = V2_GRAN_CANDS.get(granularity, ["1min", "60"])
+    v1_grans = V1_GRAN_CANDS.get(granularity, ["1min", "60", "1"])
+
+    # v2: все комбинации
+    for sym in (symbol_with, symbol_plain):
+        for prod in (None, "umcbl", "UMCBL"):     # встречаются оба кейса
+            for gran in v2_grans:
+                data = _try_v2(sym, gran, prod, limit)
+                if data:
+                    accepted_params[symbol_base] = {
+                        "endpoint": "v2", "symbol": sym, "gran": gran, "productType": prod
+                    }
+                    print(f"[{symbol_base}] ACCEPT v2: symbol={sym}, gran={gran}, productType={prod}")
+                    return data
+
+    # v1: все комбинации
+    for sym in (symbol_with, symbol_plain):
+        for gran in v1_grans:
+            data = _try_v1(sym, gran, limit)
+            if data:
+                accepted_params[symbol_base] = {
+                    "endpoint": "v1", "symbol": sym, "gran": gran
+                }
+                print(f"[{symbol_base}] ACCEPT v1: symbol={sym}, gran={gran}")
+                return data
+
+    raise RuntimeError(
+        f"[{symbol_base}] свечи не удалось получить во всех форматах: "
+        f"v2(sym=[{symbol_with}|{symbol_plain}], gran={v2_grans}, productType=[None,umcbl,UMCBL]) / "
+        f"v1(sym=[{symbol_with}|{symbol_plain}], gran={v1_grans})"
+    )
 
 # ========= Логика сигналов =========
 def analyze_and_alert(sym_base: str, candles):
@@ -296,6 +324,7 @@ def status():
         "near_cooldown_sec": NEAR_COOLDOWN_SEC,
         "heartbeat_sec": HEARTBEAT_SEC,
         "send_initial_bias": SEND_INITIAL_BIAS,
+        "accepted_params": accepted_params,
         "time": now_iso(),
         "last_cross": last_cross,
         "last_band_state": last_band_state,
