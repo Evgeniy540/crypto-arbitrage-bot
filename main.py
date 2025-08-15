@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from collections import defaultdict, deque
 
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request  # <- request добавлен
 
 # ========= ТВОИ ДАННЫЕ =========
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
@@ -22,7 +22,7 @@ EMA_FAST, EMA_SLOW = 9, 21
 CANDLES_LIMIT = 220
 
 # Near-cross (уменьшаем «процент»)
-EPS_PCT = 0.001          # 0.1%
+EPS_PCT = 0.001          # 0.10%
 NEAR_CROSS_ALERTS = True
 NEAR_COOLDOWN_SEC = 300
 
@@ -342,6 +342,36 @@ def ping():
     ok = send_telegram(f"🧪 Ping от сервера: {now_iso()}")
     return jsonify({"sent": ok, "time": now_iso()})
 
+# --- Вебхук Telegram: чтобы не было 404 и можно было слать команды ---
+@app.route("/telegram", methods=["POST", "GET"])
+def telegram_webhook():
+    if request.method == "GET":
+        # полезно для теста из браузера
+        return "telegram webhook ok", 200
+
+    try:
+        upd = request.get_json(force=True, silent=True) or {}
+        msg = (upd.get("message") or upd.get("edited_message")) or {}
+        text = (msg.get("text") or "").strip()
+        chat_id = (msg.get("chat", {}) or {}).get("id") or TELEGRAM_CHAT_ID
+
+        # простые команды
+        if text in ("/start", "/help"):
+            send_telegram("✅ Бот запущен. Команды: /status — показать текущее состояние.")
+        elif text == "/status":
+            state_lines = []
+            for b in SYMBOLS:
+                band = last_band_state.get(b, "unknown")
+                state_lines.append(f"{b}{FUT_SUFFIX}: {band}")
+            send_telegram("📊 Статус:\n" + "\n".join(state_lines))
+        else:
+            # игнорируем прочее, но отвечаем 200 чтобы Telegram не ретраил
+            pass
+    except Exception as e:
+        print(f"[telegram_webhook] error: {e}")
+
+    return "OK", 200
+
 def run():
     th = threading.Thread(target=worker_loop, daemon=True)
     th.start()
@@ -349,4 +379,4 @@ def run():
     app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    run()
+    run()   # <- запускаем сервер и воркер
