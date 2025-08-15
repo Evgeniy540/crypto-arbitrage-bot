@@ -22,7 +22,7 @@ EMA_FAST, EMA_SLOW = 9, 21
 CANDLES_LIMIT = 220
 
 # Near-cross (уменьшаем «процент»)
-EPS_PCT = 0.001          # 0.10%
+EPS_PCT = 0.003          # 0.30%
 NEAR_CROSS_ALERTS = True
 NEAR_COOLDOWN_SEC = 300
 
