@@ -8,62 +8,54 @@ from collections import defaultdict, deque
 import requests
 from flask import Flask, jsonify
 
-# ========= ТВОИ ДАННЫЕ (вписано) =========
+# ========= ТВОИ ДАННЫЕ =========
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
-# ========================================
+# ===============================
 
-# -------- Настройки стратегии / опроса --------
-FUT_SUFFIX = "_UMCBL"                          # USDT-M Futures у Bitget
+# -------- Настройки --------
+FUT_SUFFIX = "_UMCBL"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]
 
-# TF: можно "1min","3min","5min","15min","30min","1h","4h","6h","12h","1day","1week","1M"
-GRANULARITY = "1min"
+GRANULARITY = "1min"           # желаемый ТФ; код подберёт правильный формат сам
 EMA_FAST, EMA_SLOW = 9, 21
 CANDLES_LIMIT = 220
 
-# ==== «уменьшаем процент» для генерации сигналов ====
-# Порог близости EMA: если |EMA_fast - EMA_slow| / EMA_slow <= EPS_PCT,
-# считаем, что линии "почти пересеклись" → отправляем «near-cross» (мягкий) сигнал.
-EPS_PCT = 0.001          # 0.1%  (0.0005 = 0.05%, 0.002 = 0.2%)
-NEAR_CROSS_ALERTS = True # включить мягкие сигналы
-NEAR_COOLDOWN_SEC = 300  # не чаще одного мягкого сигнала раз в 5 минут по символу
-# ====================================================
+# Near-cross (уменьшаем «процент»)
+EPS_PCT = 0.001          # 0.1%
+NEAR_CROSS_ALERTS = True
+NEAR_COOLDOWN_SEC = 300
 
-COOLDOWN_SEC = 60                              # минимальный интервал между ЖЁСТКИМИ сигналами по символу
-HEARTBEAT_SEC = 3600                           # «нет нового пересечения» не чаще 1/час
-SEND_INITIAL_BIAS = True                       # прислать стартовую сторону после запуска
+COOLDOWN_SEC = 60
+HEARTBEAT_SEC = 3600
+SEND_INITIAL_BIAS = True
 
 REQUEST_TIMEOUT = 12
-SLEEP_BETWEEN_SYMBOLS = 0.25                   # пауза между монетами
-LOOP_SLEEP = 1.5                               # пауза между кругами
+SLEEP_BETWEEN_SYMBOLS = 0.25
+LOOP_SLEEP = 1.5
 
 BASE_URL = "https://api.bitget.com"
-_REQ_HEADERS = {
-    "User-Agent": "futures-signal-bot/1.2",
-    "Accept": "application/json",
-}
+_REQ_HEADERS = {"User-Agent": "futures-signal-bot/1.3", "Accept": "application/json"}
 
-# -------- Служебные хранилища --------
-last_cross = {}                                   # последняя ЖЁСТКАЯ сторона "BUY"/"SELL"
-last_band_state = {}                              # последняя "зона": BUY / NEUTRAL / SELL
-last_alert_time = defaultdict(lambda: 0.0)        # антиспам для жёстких сигналов
-last_near_time = defaultdict(lambda: 0.0)         # антиспам для мягких сигналов
-last_heartbeat_time = defaultdict(lambda: 0.0)    # антиспам для «нет нового пересечения»
-cl_buf = defaultdict(lambda: deque(maxlen=CANDLES_LIMIT))  # буфер закрытий по символу
+# -------- Служебные --------
+last_cross = {}
+last_band_state = {}
+last_alert_time = defaultdict(lambda: 0.0)
+last_near_time = defaultdict(lambda: 0.0)
+last_heartbeat_time = defaultdict(lambda: 0.0)
+cl_buf = defaultdict(lambda: deque(maxlen=CANDLES_LIMIT))
 
-# -------- Flask --------
 app = Flask(__name__)
 
-# ================= Утилиты =================
+# ========= Утилиты =========
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def send_telegram(text: str) -> bool:
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         r = requests.post(
-            url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             timeout=REQUEST_TIMEOUT,
         )
         r.raise_for_status()
@@ -75,36 +67,15 @@ def send_telegram(text: str) -> bool:
 def ema_pair(series, fast, slow):
     if len(series) < slow:
         return None, None
-
     def ema_full(prices, p):
-        k = 2 / (p + 1.0)
+        k = 2/(p+1.0)
         e = float(prices[0])
         for x in prices[1:]:
-            e = x * k + e * (1 - k)
+            e = x*k + e*(1-k)
         return e
-
     return ema_full(series, fast), ema_full(series, slow)
 
-# ---- маппинги гранулярностей для Bitget ----
-# v2 ожидает секунды, v1 принимает строковый формат
-_V2_GRAN_MAP = {
-    "1min": "60",
-    "3min": "180",
-    "5min": "300",
-    "15min": "900",
-    "30min": "1800",
-    "1h": "3600",
-    "4h": "14400",
-    "6h": "21600",
-    "12h": "43200",
-    "1day": "86400",
-    "1week": "604800",
-    "1M": "2592000",
-}
-def _to_v2_granularity(g: str) -> str:
-    return _V2_GRAN_MAP.get(g, "60")  # по умолчанию 1min
-
-# ================= Bitget: чтение свечей (Futures/MIX) =================
+# ========= Bitget =========
 def _parse_ohlcv_payload(data):
     rows = data.get("data", []) or []
     out = []
@@ -119,52 +90,102 @@ def _parse_ohlcv_payload(data):
     out.sort(key=lambda x: x[0])
     return out
 
+def _try_mix_v2(symbol_full: str, gran_candidates, limit: int):
+    """Перебираем форматы granularity для v2 до успеха."""
+    url = f"{BASE_URL}/api/v2/mix/market/candles"
+    for gran in gran_candidates:
+        try:
+            r = requests.get(
+                url,
+                params={"symbol": symbol_full, "granularity": gran, "limit": limit},
+                headers=_REQ_HEADERS, timeout=REQUEST_TIMEOUT,
+            )
+            data = r.json()
+            code = str(data.get("code"))
+            if code == "00000":
+                if gran != gran_candidates[0]:
+                    print(f"[{symbol_full}] v2 accepted gran='{gran}'")
+                return _parse_ohlcv_payload(data)
+            else:
+                print(f"[{symbol_full}] v2 fail {code}: {data.get('msg')} (gran={gran})")
+        except Exception as e:
+            print(f"[{symbol_full}] v2 exception (gran={gran}): {e}")
+    return None
+
+def _try_mix_v1(symbol_full: str, gran_candidates, limit: int):
+    """Перебираем форматы granularity для v1 до успеха."""
+    url = f"{BASE_URL}/api/mix/v1/market/candles"
+    for gran in gran_candidates:
+        try:
+            r = requests.get(
+                url,
+                params={"symbol": symbol_full, "granularity": gran, "limit": limit},
+                headers=_REQ_HEADERS, timeout=REQUEST_TIMEOUT,
+            )
+            data = r.json()
+            code = str(data.get("code"))
+            if code == "00000":
+                if gran != gran_candidates[0]:
+                    print(f"[{symbol_full}] v1 accepted gran='{gran}'")
+                return _parse_ohlcv_payload(data)
+            else:
+                print(f"[{symbol_full}] v1 fail {code}: {data.get('msg')} (gran={gran})")
+        except Exception as e:
+            print(f"[{symbol_full}] v1 exception (gran={gran}): {e}")
+    return None
+
+# Наборы кандидатов. Видел инсталляции Bitget, где:
+# - v2 принимает "1min" ИЛИ "60";
+# - v1 принимает "1min" ИЛИ "60" ИЛИ "1".
+V2_GRAN_CANDIDATES_MAP = {
+    "1min": ["1min", "60"],
+    "3min": ["3min", "180"],
+    "5min": ["5min", "300"],
+    "15min": ["15min", "900"],
+    "30min": ["30min", "1800"],
+    "1h": ["1h", "3600"],
+    "4h": ["4h", "14400"],
+    "6h": ["6h", "21600"],
+    "12h": ["12h", "43200"],
+    "1day": ["1day", "86400"],
+    "1week": ["1week", "604800"],
+    "1M": ["1M", "2592000"],
+}
+V1_GRAN_CANDIDATES_MAP = {
+    "1min": ["1min", "60", "1"],
+    "3min": ["3min", "180", "3"],
+    "5min": ["5min", "300", "5"],
+    "15min": ["15min", "900", "15"],
+    "30min": ["30min", "1800", "30"],
+    "1h": ["1h", "3600", "60"],
+    "4h": ["4h", "14400", "240"],
+    "6h": ["6h", "21600", "360"],
+    "12h": ["12h", "43200", "720"],
+    "1day": ["1day", "86400", "1D"],
+    "1week": ["1week", "604800", "1W"],
+    "1M": ["1M", "2592000", "1M"],
+}
+
 def bitget_get_futures_candles(symbol_base: str, granularity: str, limit: int):
-    """
-    Сначала пробуем v2: /api/v2/mix/market/candles  (granularity = секунды)
-    Если код != 00000 — откатываемся на v1: /api/mix/v1/market/candles (granularity = "1min"/...)
-    """
     symbol = symbol_base + FUT_SUFFIX
-    gran_v2 = _to_v2_granularity(granularity)
+    v2_cands = V2_GRAN_CANDIDATES_MAP.get(granularity, ["1min", "60"])
+    v1_cands = V1_GRAN_CANDIDATES_MAP.get(granularity, ["1min", "60", "1"])
 
-    # v2
-    try:
-        r = requests.get(
-            f"{BASE_URL}/api/v2/mix/market/candles",
-            params={"symbol": symbol, "granularity": gran_v2, "limit": str(limit)},
-            headers=_REQ_HEADERS,
-            timeout=REQUEST_TIMEOUT,
-        )
-        data = r.json()
-        code = str(data.get("code"))
-        if code == "00000":
-            return _parse_ohlcv_payload(data)
-        else:
-            # Логируем и откатываемся на v1
-            print(f"[{symbol}] v2 fail {code}: {data.get('msg')} (gran={gran_v2})")
-    except Exception as e:
-        print(f"[{symbol}] v2 exception: {e}")
+    # 1) v2 с подбором формата
+    data = _try_mix_v2(symbol, v2_cands, limit)
+    if data is not None:
+        return data
 
-    # v1 (backup)
-    try:
-        r = requests.get(
-            f"{BASE_URL}/api/mix/v1/market/candles",
-            params={"symbol": symbol, "granularity": granularity, "limit": str(limit)},
-            headers=_REQ_HEADERS,
-            timeout=REQUEST_TIMEOUT,
-        )
-        data = r.json()
-        code = str(data.get("code"))
-        if code == "00000":
-            return _parse_ohlcv_payload(data)
-        raise RuntimeError(f"[{symbol}] v1 fail {code}: {data.get('msg')} (gran={granularity})")
-    except Exception as e:
-        # пусть поднимем исключение в верх — оно залогируется и цикл продолжится
-        raise
+    # 2) v1 с подбором формата
+    data = _try_mix_v1(symbol, v1_cands, limit)
+    if data is not None:
+        return data
 
-# ================= Логика сигналов =================
+    # 3) не удалось
+    raise RuntimeError(f"[{symbol}] candles fail for all formats: v2{v2_cands} / v1{v1_cands}")
+
+# ========= Логика сигналов =========
 def analyze_and_alert(sym_base: str, candles):
-    # Поддерживаем буфер закрытий
     closes = [c[4] for c in candles]
     for px in closes:
         if not cl_buf[sym_base] or px != cl_buf[sym_base][-1]:
@@ -177,10 +198,7 @@ def analyze_and_alert(sym_base: str, candles):
     if fast is None or slow is None or slow == 0:
         return
 
-    # Разница в процентах между EMA
-    diff_pct = (fast - slow) / slow  # положит. -> BUY, отрицат. -> SELL
-
-    # Определяем "зону": BUY/NEUTRAL/SELL с гистерезисом EPS_PCT
+    diff_pct = (fast - slow) / slow
     if diff_pct > EPS_PCT:
         band = "BUY"
     elif diff_pct < -EPS_PCT:
@@ -189,9 +207,8 @@ def analyze_and_alert(sym_base: str, candles):
         band = "NEUTRAL"
 
     prev_band = last_band_state.get(sym_base)
-    prev_hard = last_cross.get(sym_base)
 
-    # 1) Стартовый статус один раз
+    # стартовый статус
     if prev_band is None and SEND_INITIAL_BIAS and band in ("BUY", "SELL"):
         price = candles[-1][4]
         side = "LONG (лонг)" if band == "BUY" else "SHORT (шорт)"
@@ -202,7 +219,7 @@ def analyze_and_alert(sym_base: str, candles):
                f"Δ={diff_pct*100:.3f}% (порог {EPS_PCT*100:.2f}%)")
         print(msg); send_telegram(msg)
 
-    # 2) МЯГКИЙ сигнал (near-cross) при входе в нейтральную зону рядом с противоположной стороной
+    # мягкий сигнал
     if NEAR_CROSS_ALERTS and band == "NEUTRAL" and prev_band in ("BUY", "SELL"):
         tnow = time.time()
         if tnow - last_near_time[sym_base] >= NEAR_COOLDOWN_SEC:
@@ -214,7 +231,7 @@ def analyze_and_alert(sym_base: str, candles):
             print(msg); send_telegram(msg)
             last_near_time[sym_base] = tnow
 
-    # 3) ЖЁСТКИЙ сигнал при выходе из нейтральной зоны в противоположную сторону
+    # жёсткий сигнал
     if prev_band is not None and prev_band != band and band in ("BUY", "SELL"):
         tnow = time.time()
         if tnow - last_alert_time[sym_base] >= COOLDOWN_SEC:
@@ -229,11 +246,11 @@ def analyze_and_alert(sym_base: str, candles):
             last_alert_time[sym_base] = tnow
             last_cross[sym_base] = band
 
-    # 4) Heartbeat раз в час
+    # heartbeat
     hb_now = time.time()
     if band and hb_now - last_heartbeat_time[sym_base] >= HEARTBEAT_SEC:
         price = candles[-1][4]
-        side = {"BUY": "LONG", "SELL": "SHORT", "NEUTRAL": "NEUTRAL"}[band]
+        side = {"BUY":"LONG","SELL":"SHORT","NEUTRAL":"NEUTRAL"}[band]
         hb = (f"ℹ️ {sym_base}{FUT_SUFFIX}: новых пересечений нет. Сейчас {side}, "
               f"цена {price:.6f}. Δ={diff_pct*100:.3f}% (порог {EPS_PCT*100:.2f}%), TF {GRANULARITY}, EMA {EMA_FAST}/{EMA_SLOW}.")
         print(hb); send_telegram(hb)
@@ -241,15 +258,14 @@ def analyze_and_alert(sym_base: str, candles):
 
     last_band_state[sym_base] = band
 
-# ================= Рабочий цикл =================
+# ========= Цикл =========
 def worker_loop():
     hdr = (f"🤖 Фьючерсный сигнальный бот запущен\n"
            f"Пары: {', '.join(s + FUT_SUFFIX for s in SYMBOLS)}\n"
            f"TF: {GRANULARITY} • EMA {EMA_FAST}/{EMA_SLOW}\n"
            f"«Near-cross» порог: ±{EPS_PCT*100:.2f}% (cooldown {NEAR_COOLDOWN_SEC}s)\n"
            f"Жёсткие сигналы только при смене стороны (cooldown {COOLDOWN_SEC}s).")
-    print(f"[{now_iso()}] worker started.")
-    send_telegram(hdr)
+    print(f"[{now_iso()}] worker started."); send_telegram(hdr)
 
     while True:
         for base in SYMBOLS:
@@ -261,7 +277,7 @@ def worker_loop():
             time.sleep(SLEEP_BETWEEN_SYMBOLS)
         time.sleep(LOOP_SLEEP)
 
-# ================= HTTP keep-alive & сервисные маршруты =================
+# ========= HTTP =========
 @app.route("/")
 def root():
     return "ok"
