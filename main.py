@@ -14,10 +14,10 @@ TELEGRAM_CHAT_ID   = "5723086631"
 # ===============================
 
 # -------- Настройки --------
-FUT_SUFFIX = "_UMCBL"   # USDT-M perpetual на Bitget
+FUT_SUFFIX = "_UMCBL"                 # USDT-M perpetual на Bitget
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]
 
-GRANULARITY = "1min"    # желаемый ТФ; код сам подберёт рабочий формат
+GRANULARITY = "1min"                  # желаемый ТФ; код сам подберёт рабочий формат
 EMA_FAST, EMA_SLOW = 9, 21
 CANDLES_LIMIT = 220
 
@@ -34,8 +34,11 @@ REQUEST_TIMEOUT = 12
 SLEEP_BETWEEN_SYMBOLS = 0.25
 LOOP_SLEEP = 1.5
 
+# Сколько держать пару отключенной перед повторной попыткой (сек)
+RECHECK_FAIL_SEC = 15 * 60
+
 BASE_URL = "https://api.bitget.com"
-_REQ_HEADERS = {"User-Agent": "futures-signal-bot/1.4", "Accept": "application/json"}
+_REQ_HEADERS = {"User-Agent": "futures-signal-bot/1.5", "Accept": "application/json"}
 
 # -------- Служебные --------
 last_cross = {}
@@ -45,8 +48,9 @@ last_near_time = defaultdict(lambda: 0.0)
 last_heartbeat_time = defaultdict(lambda: 0.0)
 cl_buf = defaultdict(lambda: deque(maxlen=CANDLES_LIMIT))
 
-# Запоминаем, какие параметры «зашли», чтобы потом не перебирать каждый раз
-accepted_params = {}   # key = symbol_base -> dict{ endpoint:'v1'|'v2', symbol, gran, productType? }
+# Запоминаем удачные параметры и отключённые пары
+accepted_params = {}     # symbol_base -> dict(endpoint, symbol, gran, productType?)
+disabled_symbols = {}    # symbol_base -> dict(reason, until_ts)
 
 app = Flask(__name__)
 
@@ -93,34 +97,18 @@ def _parse_ohlcv_payload(data):
     out.sort(key=lambda x: x[0])
     return out
 
-# Маппинги эквивалентов гранулярности
+# Эквиваленты гранулярности
 V2_GRAN_CANDS = {
-    "1min": ["1min", "60"],
-    "3min": ["3min", "180"],
-    "5min": ["5min", "300"],
-    "15min": ["15min", "900"],
-    "30min": ["30min", "1800"],
-    "1h": ["1h", "3600"],
-    "4h": ["4h", "14400"],
-    "6h": ["6h", "21600"],
-    "12h": ["12h", "43200"],
-    "1day": ["1day", "86400"],
-    "1week": ["1week", "604800"],
-    "1M": ["1M", "2592000"],
+    "1min": ["1min", "60"], "3min": ["3min", "180"], "5min": ["5min", "300"],
+    "15min": ["15min", "900"], "30min": ["30min", "1800"], "1h": ["1h", "3600"],
+    "4h": ["4h", "14400"], "6h": ["6h", "21600"], "12h": ["12h", "43200"],
+    "1day": ["1day", "86400"], "1week": ["1week", "604800"], "1M": ["1M", "2592000"],
 }
 V1_GRAN_CANDS = {
-    "1min": ["1min", "60", "1"],
-    "3min": ["3min", "180", "3"],
-    "5min": ["5min", "300", "5"],
-    "15min": ["15min", "900", "15"],
-    "30min": ["30min", "1800", "30"],
-    "1h": ["1h", "3600", "60"],
-    "4h": ["4h", "14400", "240"],
-    "6h": ["6h", "21600", "360"],
-    "12h": ["12h", "43200", "720"],
-    "1day": ["1day", "86400", "1D"],
-    "1week": ["1week", "604800", "1W"],
-    "1M": ["1M", "2592000", "1M"],
+    "1min": ["1min", "60", "1"], "3min": ["3min", "180", "3"], "5min": ["5min", "300", "5"],
+    "15min": ["15min", "900", "15"], "30min": ["30min", "1800", "30"],
+    "1h": ["1h", "3600", "60"], "4h": ["4h", "14400", "240"], "6h": ["6h", "21600", "360"],
+    "12h": ["12h", "43200", "720"], "1day": ["1day", "86400", "1D"], "1week": ["1week", "604800", "1W"], "1M": ["1M", "2592000", "1M"],
 }
 
 def _try_v2(symbol_str: str, gran: str, product_type: str | None, limit: int):
@@ -153,29 +141,6 @@ def _try_v1(symbol_str: str, gran: str, limit: int):
         print(f"[v1] exception (symbol={symbol_str}, gran={gran}): {e}")
     return None
 
-def bitget_get_futures_candles(symbol_base: str, granularity: str, limit: int):
-    """
-    Пытаемся все разумные комбинации:
-      v2:  [symbol_with_suffix | symbol_base] × [gran-cands] × [productType=None|umcbl]
-      v1:  [symbol_with_suffix | symbol_base] × [gran-cands]   (productType не нужен)
-    Как только что-то сработало — запоминаем и используем дальше.
-    """
-    # если уже знаем рабочие настройки — используем их
-    if symbol_base in accepted_params:
-        cfg = accepted_params[symbol_base]
-        try:
-            if cfg["endpoint"] == "v2":
-                return _try_v2(cfg["symbol"], cfg["gran"], cfg.get("productType"), limit) or \
-                       _try_fallback_all(symbol_base, granularity, limit)  # если внезапно перестало работать
-            else:
-                return _try_v1(cfg["symbol"], cfg["gran"], limit) or \
-                       _try_fallback_all(symbol_base, granularity, limit)
-        except Exception:
-            # упадём в полный перебор
-            pass
-
-    return _try_fallback_all(symbol_base, granularity, limit)
-
 def _try_fallback_all(symbol_base: str, granularity: str, limit: int):
     symbol_with = symbol_base + FUT_SUFFIX
     symbol_plain = symbol_base
@@ -185,13 +150,11 @@ def _try_fallback_all(symbol_base: str, granularity: str, limit: int):
 
     # v2: все комбинации
     for sym in (symbol_with, symbol_plain):
-        for prod in (None, "umcbl", "UMCBL"):     # встречаются оба кейса
+        for prod in (None, "umcbl", "UMCBL"):
             for gran in v2_grans:
                 data = _try_v2(sym, gran, prod, limit)
                 if data:
-                    accepted_params[symbol_base] = {
-                        "endpoint": "v2", "symbol": sym, "gran": gran, "productType": prod
-                    }
+                    accepted_params[symbol_base] = {"endpoint": "v2", "symbol": sym, "gran": gran, "productType": prod}
                     print(f"[{symbol_base}] ACCEPT v2: symbol={sym}, gran={gran}, productType={prod}")
                     return data
 
@@ -200,17 +163,47 @@ def _try_fallback_all(symbol_base: str, granularity: str, limit: int):
         for gran in v1_grans:
             data = _try_v1(sym, gran, limit)
             if data:
-                accepted_params[symbol_base] = {
-                    "endpoint": "v1", "symbol": sym, "gran": gran
-                }
+                accepted_params[symbol_base] = {"endpoint": "v1", "symbol": sym, "gran": gran}
                 print(f"[{symbol_base}] ACCEPT v1: symbol={sym}, gran={gran}")
                 return data
 
-    raise RuntimeError(
-        f"[{symbol_base}] свечи не удалось получить во всех форматах: "
-        f"v2(sym=[{symbol_with}|{symbol_plain}], gran={v2_grans}, productType=[None,umcbl,UMCBL]) / "
-        f"v1(sym=[{symbol_with}|{symbol_plain}], gran={v1_grans})"
-    )
+    return None  # ничего не нашли
+
+def bitget_get_futures_candles(symbol_base: str, granularity: str, limit: int):
+    # Если пара отключена — проверим, пора ли пробовать снова
+    if symbol_base in disabled_symbols:
+        if time.time() < disabled_symbols[symbol_base]["until_ts"]:
+            # ещё рано — не трогаем
+            raise RuntimeError(f"{symbol_base} disabled: {disabled_symbols[symbol_base]['reason']}")
+        else:
+            # время пришло — пробуем снова, но сначала снимаем «disabled»
+            disabled_info = disabled_symbols.pop(symbol_base, None)
+            send_telegram(f"✅ Повторная попытка включения {symbol_base}{FUT_SUFFIX}")
+            print(f"[{symbol_base}] recheck after disable: {disabled_info}")
+
+    # Если уже есть рабочие параметры — используем их
+    if symbol_base in accepted_params:
+        cfg = accepted_params[symbol_base]
+        if cfg["endpoint"] == "v2":
+            data = _try_v2(cfg["symbol"], cfg["gran"], cfg.get("productType"), limit)
+        else:
+            data = _try_v1(cfg["symbol"], cfg["gran"], limit)
+        if data:
+            return data
+        # если внезапно сломалось — забудем и пойдём в полный перебор
+        accepted_params.pop(symbol_base, None)
+
+    # Полный перебор
+    data = _try_fallback_all(symbol_base, granularity, limit)
+    if data is not None:
+        return data
+
+    # Если совсем не получилось — отключаем пару на время
+    reason = f"свечи не отдаются для всех форматов TF={granularity}"
+    until_ts = time.time() + RECHECK_FAIL_SEC
+    disabled_symbols[symbol_base] = {"reason": reason, "until_ts": until_ts}
+    send_telegram(f"⛔ Отключаю {symbol_base}{FUT_SUFFIX} на {RECHECK_FAIL_SEC//60} мин: {reason}")
+    raise RuntimeError(f"[{symbol_base}] disabled: {reason}")
 
 # ========= Логика сигналов =========
 def analyze_and_alert(sym_base: str, candles):
@@ -301,7 +294,11 @@ def worker_loop():
                 candles = bitget_get_futures_candles(base, GRANULARITY, CANDLES_LIMIT)
                 analyze_and_alert(base, candles)
             except Exception as e:
-                print(f"[{base}{FUT_SUFFIX}] fetch/analyze error: {e}")
+                # Если пара отключена — сообщение уже отправили в bitget_get_futures_candles
+                if "disabled:" in str(e):
+                    print(f"[{base}{FUT_SUFFIX}] {e}")
+                else:
+                    print(f"[{base}{FUT_SUFFIX}] fetch/analyze error: {e}")
             time.sleep(SLEEP_BETWEEN_SYMBOLS)
         time.sleep(LOOP_SLEEP)
 
@@ -312,6 +309,15 @@ def root():
 
 @app.route("/status")
 def status():
+    # красиво показываем disabled до какого времени
+    disabled_view = {
+        k: {
+            "reason": v["reason"],
+            "until_ts": v["until_ts"],
+            "until_iso": datetime.fromtimestamp(v["until_ts"], tz=timezone.utc).isoformat()
+        }
+        for k, v in disabled_symbols.items()
+    }
     return jsonify({
         "ok": True,
         "mode": "futures-umcbl",
@@ -325,6 +331,7 @@ def status():
         "heartbeat_sec": HEARTBEAT_SEC,
         "send_initial_bias": SEND_INITIAL_BIAS,
         "accepted_params": accepted_params,
+        "disabled_symbols": disabled_view,
         "time": now_iso(),
         "last_cross": last_cross,
         "last_band_state": last_band_state,
