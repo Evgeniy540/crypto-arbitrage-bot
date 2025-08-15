@@ -17,17 +17,18 @@ TELEGRAM_CHAT_ID   = "5723086631"
 FUT_SUFFIX = "_UMCBL"                          # USDT-M Futures у Bitget
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]
 
-GRANULARITY = "1min"                           # 1min,3min,5min,15min,30min,1h,4h,6h,12h,1day...
+# TF: можно "1min","3min","5min","15min","30min","1h","4h","6h","12h","1day","1week","1M"
+GRANULARITY = "1min"
 EMA_FAST, EMA_SLOW = 9, 21
 CANDLES_LIMIT = 220
 
-# ==== НОВОЕ: «уменьшаем процент» для генерации сигналов ====
+# ==== «уменьшаем процент» для генерации сигналов ====
 # Порог близости EMA: если |EMA_fast - EMA_slow| / EMA_slow <= EPS_PCT,
 # считаем, что линии "почти пересеклись" → отправляем «near-cross» (мягкий) сигнал.
-EPS_PCT = 0.001          # 0.1% (поменяй на 0.0005 для 0.05% или 0.002 для 0.2%)
+EPS_PCT = 0.001          # 0.1%  (0.0005 = 0.05%, 0.002 = 0.2%)
 NEAR_CROSS_ALERTS = True # включить мягкие сигналы
 NEAR_COOLDOWN_SEC = 300  # не чаще одного мягкого сигнала раз в 5 минут по символу
-# ===========================================================
+# ====================================================
 
 COOLDOWN_SEC = 60                              # минимальный интервал между ЖЁСТКИМИ сигналами по символу
 HEARTBEAT_SEC = 3600                           # «нет нового пересечения» не чаще 1/час
@@ -39,7 +40,7 @@ LOOP_SLEEP = 1.5                               # пауза между круг�
 
 BASE_URL = "https://api.bitget.com"
 _REQ_HEADERS = {
-    "User-Agent": "futures-signal-bot/1.1",
+    "User-Agent": "futures-signal-bot/1.2",
     "Accept": "application/json",
 }
 
@@ -84,6 +85,25 @@ def ema_pair(series, fast, slow):
 
     return ema_full(series, fast), ema_full(series, slow)
 
+# ---- маппинги гранулярностей для Bitget ----
+# v2 ожидает секунды, v1 принимает строковый формат
+_V2_GRAN_MAP = {
+    "1min": "60",
+    "3min": "180",
+    "5min": "300",
+    "15min": "900",
+    "30min": "1800",
+    "1h": "3600",
+    "4h": "14400",
+    "6h": "21600",
+    "12h": "43200",
+    "1day": "86400",
+    "1week": "604800",
+    "1M": "2592000",
+}
+def _to_v2_granularity(g: str) -> str:
+    return _V2_GRAN_MAP.get(g, "60")  # по умолчанию 1min
+
 # ================= Bitget: чтение свечей (Futures/MIX) =================
 def _parse_ohlcv_payload(data):
     rows = data.get("data", []) or []
@@ -100,13 +120,18 @@ def _parse_ohlcv_payload(data):
     return out
 
 def bitget_get_futures_candles(symbol_base: str, granularity: str, limit: int):
+    """
+    Сначала пробуем v2: /api/v2/mix/market/candles  (granularity = секунды)
+    Если код != 00000 — откатываемся на v1: /api/mix/v1/market/candles (granularity = "1min"/...)
+    """
     symbol = symbol_base + FUT_SUFFIX
+    gran_v2 = _to_v2_granularity(granularity)
 
     # v2
     try:
         r = requests.get(
             f"{BASE_URL}/api/v2/mix/market/candles",
-            params={"symbol": symbol, "granularity": granularity, "limit": str(limit)},
+            params={"symbol": symbol, "granularity": gran_v2, "limit": str(limit)},
             headers=_REQ_HEADERS,
             timeout=REQUEST_TIMEOUT,
         )
@@ -115,22 +140,27 @@ def bitget_get_futures_candles(symbol_base: str, granularity: str, limit: int):
         if code == "00000":
             return _parse_ohlcv_payload(data)
         else:
-            print(f"[{symbol}] v2 fail {code}: {data.get('msg')}")
+            # Логируем и откатываемся на v1
+            print(f"[{symbol}] v2 fail {code}: {data.get('msg')} (gran={gran_v2})")
     except Exception as e:
         print(f"[{symbol}] v2 exception: {e}")
 
     # v1 (backup)
-    r = requests.get(
-        f"{BASE_URL}/api/mix/v1/market/candles",
-        params={"symbol": symbol, "granularity": granularity, "limit": str(limit)},
-        headers=_REQ_HEADERS,
-        timeout=REQUEST_TIMEOUT,
-    )
-    data = r.json()
-    code = str(data.get("code"))
-    if code == "00000":
-        return _parse_ohlcv_payload(data)
-    raise RuntimeError(f"[{symbol}] v1 fail {code}: {data.get('msg')}")
+    try:
+        r = requests.get(
+            f"{BASE_URL}/api/mix/v1/market/candles",
+            params={"symbol": symbol, "granularity": granularity, "limit": str(limit)},
+            headers=_REQ_HEADERS,
+            timeout=REQUEST_TIMEOUT,
+        )
+        data = r.json()
+        code = str(data.get("code"))
+        if code == "00000":
+            return _parse_ohlcv_payload(data)
+        raise RuntimeError(f"[{symbol}] v1 fail {code}: {data.get('msg')} (gran={granularity})")
+    except Exception as e:
+        # пусть поднимем исключение в верх — оно залогируется и цикл продолжится
+        raise
 
 # ================= Логика сигналов =================
 def analyze_and_alert(sym_base: str, candles):
@@ -159,7 +189,7 @@ def analyze_and_alert(sym_base: str, candles):
         band = "NEUTRAL"
 
     prev_band = last_band_state.get(sym_base)
-    prev_hard = last_cross.get(sym_base)  # предыдущая жёсткая сторона
+    prev_hard = last_cross.get(sym_base)
 
     # 1) Стартовый статус один раз
     if prev_band is None and SEND_INITIAL_BIAS and band in ("BUY", "SELL"):
@@ -186,7 +216,6 @@ def analyze_and_alert(sym_base: str, candles):
 
     # 3) ЖЁСТКИЙ сигнал при выходе из нейтральной зоны в противоположную сторону
     if prev_band is not None and prev_band != band and band in ("BUY", "SELL"):
-        # это «реальное» смена стороны
         tnow = time.time()
         if tnow - last_alert_time[sym_base] >= COOLDOWN_SEC:
             price = candles[-1][4]
@@ -198,7 +227,7 @@ def analyze_and_alert(sym_base: str, candles):
                    f"Δ={diff_pct*100:.3f}% (порог {EPS_PCT*100:.2f}%)")
             print(msg); send_telegram(msg)
             last_alert_time[sym_base] = tnow
-            last_cross[sym_base] = band  # обновляем жёсткое состояние
+            last_cross[sym_base] = band
 
     # 4) Heartbeat раз в час
     hb_now = time.time()
@@ -233,8 +262,6 @@ def worker_loop():
         time.sleep(LOOP_SLEEP)
 
 # ================= HTTP keep-alive & сервисные маршруты =================
-app = Flask(__name__)
-
 @app.route("/")
 def root():
     return "ok"
