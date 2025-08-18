@@ -22,7 +22,7 @@ EMA_FAST, EMA_SLOW = 9, 21
 CANDLES_LIMIT = 300                   # побольше истории для «гладких» EMA
 
 # Near-cross (мягкие сигналы при близости кросса)
-EPS_PCT = 0.003          # 0.30%
+EPS_PCT = 0.004          # 0.40%
 NEAR_CROSS_ALERTS = True
 NEAR_COOLDOWN_SEC = 300
 
