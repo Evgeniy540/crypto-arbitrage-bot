@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import time
 import threading
@@ -17,15 +18,19 @@ FUT_SUFFIX = "_UMCBL"                         # USDT-M perpetual на Bitget
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]
 
 WORK_TF = "5min"                              # рабочий ТФ для входов
-HTF_TF  = "15min"                             # первый фильтр тренда
-HTF2_TF = "1h"                                # второй фильтр тренда (НОВОЕ)
+HTF_TF  = "15min"                             # 1-й фильтр тренда
+HTF2_TF = "1h"                                # 2-й фильтр тренда
 
 EMA_FAST, EMA_SLOW = 9, 21
 CANDLES_LIMIT = 600                           # глубокая история
 
-STRENGTH_PCT = 0.002                          # 0.20% мин. «сила» кросса (было 0.15%)
+STRENGTH_PCT = 0.002                          # 0.20% мин. «сила» кросса
 RSI_PERIOD = 14
 RSI_MID = 50                                  # порог RSI
+
+# --- ATR-фильтр волатильности (НОВОЕ) ---
+ATR_MIN_PCT = 0.0015                          # 0.15% — слишком «тонкий» рынок режем
+ATR_MAX_PCT = 0.03                            # 3.00% — слишком «штормовой» рынок режем
 
 ALERT_COOLDOWN_SEC = 15 * 60                  # не чаще 1/15 мин/символ
 HEARTBEAT_SEC = 60 * 60                       # статус раз в час
@@ -33,23 +38,20 @@ REQUEST_TIMEOUT = 12
 SLEEP_BETWEEN_SYMBOLS = 0.25
 LOOP_SLEEP = 1.5
 
-# Сколько держать пару отключенной перед повторной попыткой (сек)
-RECHECK_FAIL_SEC = 15 * 60
+RECHECK_FAIL_SEC = 15 * 60                    # через сколько пробовать отключённую пару
 
 BASE_URL = "https://api.bitget.com"
 _REQ_HEADERS = {"User-Agent": "futures-signal-bot/2.0", "Accept": "application/json"}
 
 # -------- Служебные --------
-last_alert_time = defaultdict(lambda: 0.0)         # антиспам по символу
+last_alert_time = defaultdict(lambda: 0.0)
 last_heartbeat_time = defaultdict(lambda: 0.0)
 last_band_state = {}                                # LONG/SHORT/NEUTRAL (5m)
-
-# Запоминаем удачные параметры и отключённые пары (по ключу (symbol, tf))
-accepted_params = {}     # (sym_base, tf) -> dict(endpoint, symbol, gran, productType?)
-disabled_symbols = {}    # (sym_base, tf) -> dict(reason, until_ts)
-
-# Для контроля «сколько свечей пришло»
+accepted_params = {}                                # (sym_base, tf) -> dict(...)
+disabled_symbols = {}                               # (sym_base, tf) -> dict(...)
 last_candles_count = defaultdict(lambda: {"5m": 0, "15m": 0, "1h": 0})
+last_filter_gate = defaultdict(lambda: "unknown")   # 'allow' | 'block' | 'unknown'
+last_atr_info = defaultdict(lambda: {"atr": None, "atr_pct": None})  # для /status
 
 app = Flask(__name__)
 
@@ -107,21 +109,19 @@ def _safe_json(resp) -> dict:
 
 # ========= Индикаторы =========
 def ema_series(values, period):
-    out = []
-    k = 2.0 / (period + 1.0)
-    ema = None
+    out, k, ema = [], 2.0/(period+1.0), None
     for v in values:
-        ema = v if ema is None else (v * k + ema * (1 - k))
+        ema = v if ema is None else (v*k + ema*(1-k))
         out.append(ema)
     return out
 
 def rsi_series(close, period=14):
     if len(close) < period + 2:
-        return [50.0] * len(close)
+        return [50.0]*len(close)
     gains = [max(0.0, close[i]-close[i-1]) for i in range(1, len(close))]
     losses = [max(0.0, close[i-1]-close[i]) for i in range(1, len(close))]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    avg_gain = sum(gains[:period])/period
+    avg_loss = sum(losses[:period])/period
     rsis = [50.0]*(period+1)
     rs = (avg_gain/avg_loss) if avg_loss != 0 else 9999
     rsis.append(100 - 100/(1+rs))
@@ -139,13 +139,16 @@ def atr_series(high, low, close, period=14):
         if i == 0:
             trs.append(high[i]-low[i])
         else:
-            tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
-            trs.append(tr)
+            trs.append(max(
+                high[i]-low[i],
+                abs(high[i]-close[i-1]),
+                abs(low[i]-close[i-1])
+            ))
     if len(trs) < period:
         return [None]*len(close)
-    out = [None]*(period-1) + [sum(trs[:period]) / period]
+    out = [None]*(period-1) + [sum(trs[:period])/period]
     for i in range(period, len(trs)):
-        out.append((out[-1]*(period-1) + trs[i]) / period)
+        out.append((out[-1]*(period-1)+trs[i])/period)
     return out
 
 # ========= Bitget candles =========
@@ -166,8 +169,7 @@ def _parse_ohlcv_payload(data):
 def _try_v2(symbol_str: str, gran: str, product_type, limit: int):
     url = f"{BASE_URL}/api/v2/mix/market/candles"
     params = {"symbol": symbol_str, "granularity": gran, "limit": limit}
-    if product_type:
-        params["productType"] = product_type
+    if product_type: params["productType"] = product_type
     try:
         r = requests.get(url, params=params, headers=_REQ_HEADERS, timeout=REQUEST_TIMEOUT)
         data = _safe_json(r)
@@ -191,8 +193,6 @@ def _try_v1(symbol_str: str, gran: str, limit: int):
 
 def fetch_candles_exact(sym_base: str, tf: str, limit: int):
     key = (sym_base, tf)
-
-    # Если пара отключена — проверим, пора ли пробовать снова
     if key in disabled_symbols:
         if time.time() < disabled_symbols[key]["until_ts"]:
             raise RuntimeError(f"{sym_base}{FUT_SUFFIX}/{tf} disabled: {disabled_symbols[key]['reason']}")
@@ -200,16 +200,13 @@ def fetch_candles_exact(sym_base: str, tf: str, limit: int):
             disabled_symbols.pop(key, None)
             send_telegram(f"✅ Повторная попытка включения {sym_base}{FUT_SUFFIX} [{tf}]")
 
-    # Если уже есть рабочие параметры — используем их
     if key in accepted_params:
         cfg = accepted_params[key]
         data = _try_v2(cfg["symbol"], cfg["gran"], cfg.get("productType"), limit) if cfg["endpoint"]=="v2" \
                else _try_v1(cfg["symbol"], cfg["gran"], limit)
-        if data:
-            return data
-        accepted_params.pop(key, None)  # сломалось — забудем
+        if data: return data
+        accepted_params.pop(key, None)
 
-    # Полный перебор: v2, затем v1
     v2_grans = V2_GRAN_CANDS.get(tf, ["5min","300"])
     v1_grans = V1_GRAN_CANDS.get(tf, ["5min","300","5"])
     for sym in (sym_base + FUT_SUFFIX, sym_base):
@@ -228,7 +225,6 @@ def fetch_candles_exact(sym_base: str, tf: str, limit: int):
                 print(f"[{sym_base} {tf}] ACCEPT v1: symbol={sym}, gran={gran}")
                 return data
 
-    # Если совсем не получилось — отключаем пару на время
     reason = f"свечи не отдаются для TF={tf}"
     until_ts = time.time() + RECHECK_FAIL_SEC
     disabled_symbols[key] = {"reason": reason, "until_ts": until_ts}
@@ -237,13 +233,11 @@ def fetch_candles_exact(sym_base: str, tf: str, limit: int):
 
 def get_closed_ohlcv(sym_base: str, tf: str, limit: int):
     data = fetch_candles_exact(sym_base, tf, limit)
-    if not data:
-        return [], [], []
+    if not data: return [], [], []
     gran_sec = _GRAN_TO_SEC.get(tf, 300)
-    now_ms = int(time.time() * 1000)
-    closed = [r for r in data if (now_ms - int(r[0])) >= gran_sec * 1000]   # только ЗАКРЫТЫЕ
-    if not closed:
-        return [], [], []
+    now_ms = int(time.time()*1000)
+    closed = [r for r in data if (now_ms - int(r[0])) >= gran_sec*1000]
+    if not closed: return [], [], []
     highs = [r[2] for r in closed]
     lows  = [r[3] for r in closed]
     closes= [r[4] for r in closed]
@@ -251,28 +245,25 @@ def get_closed_ohlcv(sym_base: str, tf: str, limit: int):
 
 # ========= Логика сигналов =========
 def analyze_and_alert(sym_base: str):
-    # 5m
-    h5, l5, c5 = get_closed_ohlcv(sym_base, WORK_TF, CANDLES_LIMIT)
-    # 15m
-    h15, l15, c15 = get_closed_ohlcv(sym_base, HTF_TF, CANDLES_LIMIT//2)
-    # 1h (НОВОЕ)
-    h1h, l1h, c1h = get_closed_ohlcv(sym_base, HTF2_TF, max(200, CANDLES_LIMIT//3))
+    # 5m, 15m, 1h
+    h5, l5, c5   = get_closed_ohlcv(sym_base, WORK_TF, CANDLES_LIMIT)
+    h15, l15, c15= get_closed_ohlcv(sym_base, HTF_TF, CANDLES_LIMIT//2)
+    h1h, l1h, c1h= get_closed_ohlcv(sym_base, HTF2_TF, max(200, CANDLES_LIMIT//3))
 
-    # обновим счётчики для /status
     last_candles_count[sym_base] = {"5m": len(c5), "15m": len(c15), "1h": len(c1h)}
-
     if len(c5) < max(EMA_SLOW+5, 60) or len(c15) < max(EMA_SLOW+5, 40) or len(c1h) < 60:
+        last_filter_gate[sym_base] = "unknown"
         return
 
-    # индикаторы
-    ema9_5  = ema_series(c5, EMA_FAST);   ema21_5  = ema_series(c5, EMA_SLOW)
-    ema9_15 = ema_series(c15, EMA_FAST);  ema21_15 = ema_series(c15, EMA_SLOW)
-    ema9_1h = ema_series(c1h, EMA_FAST);  ema21_1h = ema_series(c1h, EMA_SLOW)
+    ema9_5, ema21_5   = ema_series(c5, EMA_FAST),  ema_series(c5, EMA_SLOW)
+    ema9_15, ema21_15 = ema_series(c15, EMA_FAST), ema_series(c15, EMA_SLOW)
+    ema9_1h, ema21_1h = ema_series(c1h, EMA_FAST), ema_series(c1h, EMA_SLOW)
     rsi5 = rsi_series(c5, RSI_PERIOD)
     atr5 = atr_series(h5, l5, c5, 14)
 
-    i = len(c5)-1; j = len(c15)-1; k = len(c1h)-1
+    i, j, k = len(c5)-1, len(c15)-1, len(c1h)-1
     if i < 2 or j < 1 or k < 1:
+        last_filter_gate[sym_base] = "unknown"
         return
 
     # Подтверждённый кросс и удержание 2 свечи
@@ -281,59 +272,71 @@ def analyze_and_alert(sym_base: str):
     hold_up   = (ema9_5[i] > ema21_5[i]) and (ema9_5[i-1] > ema21_5[i-1])
     hold_down = (ema9_5[i] < ema21_5[i]) and (ema9_5[i-1] < ema21_5[i-1])
 
-    # Сила кросса
     strength_now = abs(ema9_5[i] - ema21_5[i]) / c5[i] >= STRENGTH_PCT
-
-    # Трендовые фильтры (оба старших ТФ должны подтверждать)
     trend_up   = (ema9_15[j] > ema21_15[j]) and (ema9_1h[k] > ema21_1h[k])
     trend_down = (ema9_15[j] < ema21_15[j]) and (ema9_1h[k] < ema21_1h[k])
 
-    # Цена относительно EMA
     price_above = c5[i] > max(ema9_5[i], ema21_5[i])
     price_below = c5[i] < min(ema9_5[i], ema21_5[i])
 
-    # RSI фильтр
     rsi_ok_long  = (rsi5[i] >= RSI_MID) and (rsi5[i] > rsi5[i-1])
     rsi_ok_short = (rsi5[i] <= RSI_MID) and (rsi5[i] < rsi5[i-1])
+
+    # --- ATR-фильтр (НОВОЕ) ---
+    entry = c5[i]
+    this_atr = atr5[i] if atr5[i] else entry * 0.01
+    atr_pct = this_atr / entry if entry > 0 else None
+    atr_ok = (atr_pct is not None) and (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT)
+    last_atr_info[sym_base] = {"atr": this_atr, "atr_pct": atr_pct}
 
     side_5m = "LONG" if hold_up else ("SHORT" if hold_down else "NEUTRAL")
     last_band_state[sym_base] = side_5m
 
+    allow_long  = hold_up   and strength_now and trend_up   and price_above and rsi_ok_long  and atr_ok
+    allow_short = hold_down and strength_now and trend_down and price_below and rsi_ok_short and atr_ok
+    last_filter_gate[sym_base] = "allow" if (allow_long or allow_short) else "block"
+
     now = time.time()
-    entry = c5[i]
-    this_atr = atr5[i] if atr5[i] else entry * 0.01
     tp_dist = 1.5 * this_atr
     sl_dist = 1.0 * this_atr
 
     # LONG
-    if cross_up_prev and hold_up and strength_now and trend_up and price_above and rsi_ok_long:
+    if cross_up_prev and allow_long:
         if now - last_alert_time[sym_base] >= ALERT_COOLDOWN_SEC:
             msg = (f"🔔 BUY/LONG {sym_base}{FUT_SUFFIX} (5m подтверждённый)\n"
                    f"Цена: {entry:.6f}\n"
-                   f"TF 5m • EMA {EMA_FAST}/{EMA_SLOW} • Тренды 15m/1h OK\n"
+                   f"Тренды: 15m/1h OK • Сила ≥ {STRENGTH_PCT*100:.2f}%\n"
                    f"Цена выше EMA • RSI≥{RSI_MID}\n"
+                   f"ATR={this_atr:.6f} ({atr_pct*100:.2f}%) • Диапазон OK [{ATR_MIN_PCT*100:.2f}–{ATR_MAX_PCT*100:.2f}%]\n"
                    f"TP ≈ {entry+tp_dist:.6f} • SL ≈ {entry-sl_dist:.6f}")
             print(msg); send_telegram(msg)
             last_alert_time[sym_base] = now
         return
 
     # SHORT
-    if cross_down_prev and hold_down and strength_now and trend_down and price_below and rsi_ok_short:
+    if cross_down_prev and allow_short:
         if now - last_alert_time[sym_base] >= ALERT_COOLDOWN_SEC:
             msg = (f"🔔 SELL/SHORT {sym_base}{FUT_SUFFIX} (5m подтверждённый)\n"
                    f"Цена: {entry:.6f}\n"
-                   f"TF 5m • EMA {EMA_FAST}/{EMA_SLOW} • Тренды 15m/1h OK\n"
+                   f"Тренды: 15m/1h OK • Сила ≥ {STRENGTH_PCT*100:.2f}%\n"
                    f"Цена ниже EMA • RSI≤{RSI_MID}\n"
+                   f"ATR={this_atr:.6f} ({atr_pct*100:.2f}%) • Диапазон OK [{ATR_MIN_PCT*100:.2f}–{ATR_MAX_PCT*100:.2f}%]\n"
                    f"TP ≈ {entry-tp_dist:.6f} • SL ≈ {entry+sl_dist:.6f}")
             print(msg); send_telegram(msg)
             last_alert_time[sym_base] = now
         return
 
-    # Heartbeat: редкий статус
+    # Heartbeat
     if now - last_heartbeat_time[sym_base] >= HEARTBEAT_SEC:
         trend_txt = "UP" if trend_up else ("DOWN" if trend_down else "FLAT")
-        hb = (f"ℹ️ {sym_base}{FUT_SUFFIX}: новых входов нет. Сейчас {side_5m} (5m), "
-              f"цена {entry:.6f}. Тренд 15m/1h: {trend_txt}.")
+        gate_txt = "✅ Сигналы разрешены (условия совпадают)" if last_filter_gate[sym_base]=="allow" \
+                   else ("⛔ Сигналы заблокированы фильтрами" if last_filter_gate[sym_base]=="block"
+                         else "ℹ️ Недостаточно данных для фильтров")
+        atr_txt = f"ATR={this_atr:.6f} ({(atr_pct*100 if atr_pct is not None else 0):.2f}%), коридор [{ATR_MIN_PCT*100:.2f}–{ATR_MAX_PCT*100:.2f}%]"
+        hb = (f"ℹ️ {sym_base}{FUT_SUFFIX}: новых входов нет.\n"
+              f"Сейчас: {side_5m} (5m), цена {entry:.6f}\n"
+              f"Тренд 15m/1h: {trend_txt}\n"
+              f"{atr_txt}\n{gate_txt}")
         print(hb); send_telegram(hb)
         last_heartbeat_time[sym_base] = now
 
@@ -344,6 +347,7 @@ def worker_loop():
            f"Входы: TF {WORK_TF} • EMA {EMA_FAST}/{EMA_SLOW}\n"
            f"Фильтры тренда: {HTF_TF} и {HTF2_TF}\n"
            f"Мин. сила кросса: {STRENGTH_PCT*100:.2f}%\n"
+           f"ATR-коридор: {ATR_MIN_PCT*100:.2f}%–{ATR_MAX_PCT*100:.2f}%\n"
            f"Кулдаун на сигналы: {ALERT_COOLDOWN_SEC//60} мин.")
     print(f"[{now_iso()}] worker started."); send_telegram(hdr)
 
@@ -352,7 +356,6 @@ def worker_loop():
             try:
                 analyze_and_alert(base)
             except Exception as e:
-                # сообщения об отключении уже отправлены в fetch_candles_exact
                 print(f"[{base}{FUT_SUFFIX}] analyze error: {e}")
             time.sleep(SLEEP_BETWEEN_SYMBOLS)
         time.sleep(LOOP_SLEEP)
@@ -371,6 +374,20 @@ def status():
             "until_iso": datetime.fromtimestamp(v["until_ts"], tz=timezone.utc).isoformat()
         } for k, v in disabled_symbols.items()
     }
+    # собираем строки для быстрого чтения в Telegram
+    status_lines = []
+    for b in SYMBOLS:
+        band = last_band_state.get(b, 'unknown')
+        cnt = last_candles_count[b]
+        gate = last_filter_gate[b]
+        gate_icon = "✅ allow" if gate=="allow" else ("⛔ block" if gate=="block" else "ℹ️ unknown")
+        atr_info = last_atr_info[b]
+        atr_pct_view = f"{(atr_info['atr_pct']*100):.2f}%" if atr_info['atr_pct'] is not None else "n/a"
+        status_lines.append(
+            f"{b}{FUT_SUFFIX}: {band} • candles 5m={cnt['5m']}, 15m={cnt['15m']}, 1h={cnt['1h']} • "
+            f"ATR={atr_info['atr'] if atr_info['atr'] is not None else 'n/a'} ({atr_pct_view}) • {gate_icon}"
+        )
+
     return jsonify({
         "ok": True,
         "mode": "futures-umcbl",
@@ -380,6 +397,8 @@ def status():
         "htf2": HTF2_TF,
         "ema": {"fast": EMA_FAST, "slow": EMA_SLOW},
         "strength_pct": STRENGTH_PCT,
+        "atr_min_pct": ATR_MIN_PCT,
+        "atr_max_pct": ATR_MAX_PCT,
         "cooldown_sec": ALERT_COOLDOWN_SEC,
         "heartbeat_sec": HEARTBEAT_SEC,
         "accepted_params": accepted_params,
@@ -387,6 +406,9 @@ def status():
         "time": now_iso(),
         "last_band_state": last_band_state,
         "candles_count": last_candles_count,
+        "filter_gate": last_filter_gate,
+        "atr_info": last_atr_info,
+        "status_lines": status_lines,
     })
 
 @app.route("/ping")
@@ -409,10 +431,15 @@ def telegram_webhook():
             lines = []
             for b in SYMBOLS:
                 band = last_band_state.get(b, 'unknown')
-                cnt5  = last_candles_count[b]["5m"]
-                cnt15 = last_candles_count[b]["15m"]
-                cnt1h = last_candles_count[b]["1h"]
-                lines.append(f"{b}{FUT_SUFFIX}: {band} • candles 5m={cnt5}, 15m={cnt15}, 1h={cnt1h}")
+                cnt  = last_candles_count[b]
+                gate = last_filter_gate[b]
+                gate_icon = "✅ allow" if gate=="allow" else ("⛔ block" if gate=="block" else "ℹ️ unknown")
+                atr_info = last_atr_info[b]
+                atr_pct_view = f"{(atr_info['atr_pct']*100):.2f}%" if atr_info['atr_pct'] is not None else "n/a"
+                lines.append(
+                    f"{b}{FUT_SUFFIX}: {band} • candles 5m={cnt['5m']}, 15m={cnt['15m']}, 1h={cnt['1h']} • "
+                    f"ATR={atr_info['atr'] if atr_info['atr'] is not None else 'n/a'} ({atr_pct_view}) • {gate_icon}"
+                )
             send_telegram("📊 Статус:\n" + "\n".join(lines))
     except Exception as e:
         print(f"[telegram_webhook] error: {e}")
