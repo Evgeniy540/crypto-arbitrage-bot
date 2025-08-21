@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import os
 import time
 import threading
@@ -20,7 +19,7 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]
 WORK_TF = "5min"                              # рабочий ТФ для входов
 HTF_TF  = "15min"                             # фильтр тренда
 EMA_FAST, EMA_SLOW = 9, 21
-CANDLES_LIMIT = 300
+CANDLES_LIMIT = 600                           # ГЛУБИНА ИСТОРИИ (было 300)
 
 STRENGTH_PCT = 0.0015                         # мин. «сила» кросса 0.15%
 RSI_PERIOD = 14
@@ -44,6 +43,9 @@ last_band_state = {}                                # LONG/SHORT/NEUTRAL (5m)
 # Запоминаем удачные параметры и отключённые пары (по ключу (symbol, tf))
 accepted_params = {}     # (sym_base, tf) -> dict(endpoint, symbol, gran, productType?)
 disabled_symbols = {}    # (sym_base, tf) -> dict(reason, until_ts)
+
+# Для контроля «сколько свечей пришло»
+last_candles_count = defaultdict(lambda: {"5m": 0, "15m": 0})
 
 app = Flask(__name__)
 
@@ -250,12 +252,14 @@ def get_closed_ohlcv(sym_base: str, tf: str, limit: int):
 def analyze_and_alert(sym_base: str):
     # 5m данные
     h5, l5, c5 = get_closed_ohlcv(sym_base, WORK_TF, CANDLES_LIMIT)
-    if len(c5) < max(EMA_SLOW+5, 60):
-        return
-
     # 15m тренд
     h15, l15, c15 = get_closed_ohlcv(sym_base, HTF_TF, CANDLES_LIMIT//2)
-    if len(c15) < max(EMA_SLOW+5, 40):
+
+    # обновим счётчики для /status
+    last_candles_count[sym_base] = {"5m": len(c5), "15m": len(c15)}
+
+    if len(c5) < max(EMA_SLOW+5, 60) or len(c15) < max(EMA_SLOW+5, 40):
+        # недост. данных — просто пропустим без шума
         return
 
     # индикаторы
@@ -372,6 +376,7 @@ def status():
         "disabled_symbols": disabled_view,
         "time": now_iso(),
         "last_band_state": last_band_state,
+        "candles_count": last_candles_count,   # <- Сколько свечей получили по 5m и 15m
     })
 
 @app.route("/ping")
@@ -393,7 +398,10 @@ def telegram_webhook():
         elif text == "/status":
             lines = []
             for b in SYMBOLS:
-                lines.append(f"{b}{FUT_SUFFIX}: {last_band_state.get(b, 'unknown')}")
+                band = last_band_state.get(b, 'unknown')
+                cnt5 = last_candles_count[b]["5m"]
+                cnt15 = last_candles_count[b]["15m"]
+                lines.append(f"{b}{FUT_SUFFIX}: {band} • candles 5m={cnt5}, 15m={cnt15}")
             send_telegram("📊 Статус:\n" + "\n".join(lines))
     except Exception as e:
         print(f"[telegram_webhook] error: {e}")
