@@ -17,12 +17,16 @@ FUT_SUFFIX = "_UMCBL"                         # USDT-M perpetual на Bitget
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]
 
 WORK_TF = "5min"                              # рабочий ТФ для входов
-HTF_TF  = "15min"                             # фильтр тренда
-EMA_FAST, EMA_SLOW = 9, 21
-CANDLES_LIMIT = 600                           # ГЛУБИНА ИСТОРИИ (было 300)
+HTF_TF  = "15min"                             # первый фильтр тренда
+HTF2_TF = "1h"                                # второй фильтр тренда (НОВОЕ)
 
-STRENGTH_PCT = 0.0015                         # мин. «сила» кросса 0.15%
+EMA_FAST, EMA_SLOW = 9, 21
+CANDLES_LIMIT = 600                           # глубокая история
+
+STRENGTH_PCT = 0.002                          # 0.20% мин. «сила» кросса (было 0.15%)
 RSI_PERIOD = 14
+RSI_MID = 50                                  # порог RSI
+
 ALERT_COOLDOWN_SEC = 15 * 60                  # не чаще 1/15 мин/символ
 HEARTBEAT_SEC = 60 * 60                       # статус раз в час
 REQUEST_TIMEOUT = 12
@@ -45,7 +49,7 @@ accepted_params = {}     # (sym_base, tf) -> dict(endpoint, symbol, gran, produc
 disabled_symbols = {}    # (sym_base, tf) -> dict(reason, until_ts)
 
 # Для контроля «сколько свечей пришло»
-last_candles_count = defaultdict(lambda: {"5m": 0, "15m": 0})
+last_candles_count = defaultdict(lambda: {"5m": 0, "15m": 0, "1h": 0})
 
 app = Flask(__name__)
 
@@ -137,14 +141,11 @@ def atr_series(high, low, close, period=14):
         else:
             tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
             trs.append(tr)
-    out = []
     if len(trs) < period:
         return [None]*len(close)
-    s = sum(trs[:period]) / period
-    out = [None]*(period-1) + [s]
+    out = [None]*(period-1) + [sum(trs[:period]) / period]
     for i in range(period, len(trs)):
-        s = (out[-1]*(period-1) + trs[i]) / period
-        out.append(s)
+        out.append((out[-1]*(period-1) + trs[i]) / period)
     return out
 
 # ========= Bitget candles =========
@@ -250,42 +251,50 @@ def get_closed_ohlcv(sym_base: str, tf: str, limit: int):
 
 # ========= Логика сигналов =========
 def analyze_and_alert(sym_base: str):
-    # 5m данные
+    # 5m
     h5, l5, c5 = get_closed_ohlcv(sym_base, WORK_TF, CANDLES_LIMIT)
-    # 15m тренд
+    # 15m
     h15, l15, c15 = get_closed_ohlcv(sym_base, HTF_TF, CANDLES_LIMIT//2)
+    # 1h (НОВОЕ)
+    h1h, l1h, c1h = get_closed_ohlcv(sym_base, HTF2_TF, max(200, CANDLES_LIMIT//3))
 
     # обновим счётчики для /status
-    last_candles_count[sym_base] = {"5m": len(c5), "15m": len(c15)}
+    last_candles_count[sym_base] = {"5m": len(c5), "15m": len(c15), "1h": len(c1h)}
 
-    if len(c5) < max(EMA_SLOW+5, 60) or len(c15) < max(EMA_SLOW+5, 40):
-        # недост. данных — просто пропустим без шума
+    if len(c5) < max(EMA_SLOW+5, 60) or len(c15) < max(EMA_SLOW+5, 40) or len(c1h) < 60:
         return
 
     # индикаторы
-    ema9_5  = ema_series(c5, EMA_FAST)
-    ema21_5 = ema_series(c5, EMA_SLOW)
-    ema9_15  = ema_series(c15, EMA_FAST)
-    ema21_15 = ema_series(c15, EMA_SLOW)
+    ema9_5  = ema_series(c5, EMA_FAST);   ema21_5  = ema_series(c5, EMA_SLOW)
+    ema9_15 = ema_series(c15, EMA_FAST);  ema21_15 = ema_series(c15, EMA_SLOW)
+    ema9_1h = ema_series(c1h, EMA_FAST);  ema21_1h = ema_series(c1h, EMA_SLOW)
     rsi5 = rsi_series(c5, RSI_PERIOD)
     atr5 = atr_series(h5, l5, c5, 14)
 
-    i = len(c5) - 1
-    j = len(c15) - 1
-    if i < 2 or j < 1:
+    i = len(c5)-1; j = len(c15)-1; k = len(c1h)-1
+    if i < 2 or j < 1 or k < 1:
         return
 
-    # Подтверждённый сигнал: кросс был НА предыдущей свече и сохраняется сейчас
-    cross_up_prev   = ema9_5[i-2] <= ema21_5[i-2] and ema9_5[i-1] > ema21_5[i-1]
-    cross_down_prev = ema9_5[i-2] >= ema21_5[i-2] and ema9_5[i-1] < ema21_5[i-1]
-    hold_up   = ema9_5[i] > ema21_5[i]
-    hold_down = ema9_5[i] < ema21_5[i]
+    # Подтверждённый кросс и удержание 2 свечи
+    cross_up_prev   = ema9_5[i-2] <= ema21_5[i-2] and ema9_5[i-1] >  ema21_5[i-1]
+    cross_down_prev = ema9_5[i-2] >= ema21_5[i-2] and ema9_5[i-1] <  ema21_5[i-1]
+    hold_up   = (ema9_5[i] > ema21_5[i]) and (ema9_5[i-1] > ema21_5[i-1])
+    hold_down = (ema9_5[i] < ema21_5[i]) and (ema9_5[i-1] < ema21_5[i-1])
 
+    # Сила кросса
     strength_now = abs(ema9_5[i] - ema21_5[i]) / c5[i] >= STRENGTH_PCT
-    trend_up   = ema9_15[j] > ema21_15[j]
-    trend_down = ema9_15[j] < ema21_15[j]
-    rsi_ok_long  = rsi5[i] <= 55 and rsi5[i] > rsi5[i-1]
-    rsi_ok_short = rsi5[i] >= 45 and rsi5[i] < rsi5[i-1]
+
+    # Трендовые фильтры (оба старших ТФ должны подтверждать)
+    trend_up   = (ema9_15[j] > ema21_15[j]) and (ema9_1h[k] > ema21_1h[k])
+    trend_down = (ema9_15[j] < ema21_15[j]) and (ema9_1h[k] < ema21_1h[k])
+
+    # Цена относительно EMA
+    price_above = c5[i] > max(ema9_5[i], ema21_5[i])
+    price_below = c5[i] < min(ema9_5[i], ema21_5[i])
+
+    # RSI фильтр
+    rsi_ok_long  = (rsi5[i] >= RSI_MID) and (rsi5[i] > rsi5[i-1])
+    rsi_ok_short = (rsi5[i] <= RSI_MID) and (rsi5[i] < rsi5[i-1])
 
     side_5m = "LONG" if hold_up else ("SHORT" if hold_down else "NEUTRAL")
     last_band_state[sym_base] = side_5m
@@ -297,33 +306,34 @@ def analyze_and_alert(sym_base: str):
     sl_dist = 1.0 * this_atr
 
     # LONG
-    if cross_up_prev and hold_up and strength_now and trend_up and rsi_ok_long:
+    if cross_up_prev and hold_up and strength_now and trend_up and price_above and rsi_ok_long:
         if now - last_alert_time[sym_base] >= ALERT_COOLDOWN_SEC:
             msg = (f"🔔 BUY/LONG {sym_base}{FUT_SUFFIX} (5m подтверждённый)\n"
                    f"Цена: {entry:.6f}\n"
-                   f"TF 5m • EMA {EMA_FAST}/{EMA_SLOW} • Тренд 15m OK\n"
-                   f"Сила ≥ {STRENGTH_PCT*100:.2f}% • RSI(14) подтверждает\n"
-                   f"TP ≈ {entry+tp_dist:.6f} (+{tp_dist:.6f}) • SL ≈ {entry-sl_dist:.6f} (−{sl_dist:.6f})")
+                   f"TF 5m • EMA {EMA_FAST}/{EMA_SLOW} • Тренды 15m/1h OK\n"
+                   f"Цена выше EMA • RSI≥{RSI_MID}\n"
+                   f"TP ≈ {entry+tp_dist:.6f} • SL ≈ {entry-sl_dist:.6f}")
             print(msg); send_telegram(msg)
             last_alert_time[sym_base] = now
         return
 
     # SHORT
-    if cross_down_prev and hold_down and strength_now and trend_down and rsi_ok_short:
+    if cross_down_prev and hold_down and strength_now and trend_down and price_below and rsi_ok_short:
         if now - last_alert_time[sym_base] >= ALERT_COOLDOWN_SEC:
             msg = (f"🔔 SELL/SHORT {sym_base}{FUT_SUFFIX} (5m подтверждённый)\n"
                    f"Цена: {entry:.6f}\n"
-                   f"TF 5m • EMA {EMA_FAST}/{EMA_SLOW} • Тренд 15m OK\n"
-                   f"Сила ≥ {STRENGTH_PCT*100:.2f}% • RSI(14) подтверждает\n"
-                   f"TP ≈ {entry-tp_dist:.6f} (−{tp_dist:.6f}) • SL ≈ {entry+sl_dist:.6f} (+{sl_dist:.6f})")
+                   f"TF 5m • EMA {EMA_FAST}/{EMA_SLOW} • Тренды 15m/1h OK\n"
+                   f"Цена ниже EMA • RSI≤{RSI_MID}\n"
+                   f"TP ≈ {entry-tp_dist:.6f} • SL ≈ {entry+sl_dist:.6f}")
             print(msg); send_telegram(msg)
             last_alert_time[sym_base] = now
         return
 
-    # Heartbeat: редкий статус без «почти сигналов»
+    # Heartbeat: редкий статус
     if now - last_heartbeat_time[sym_base] >= HEARTBEAT_SEC:
+        trend_txt = "UP" if trend_up else ("DOWN" if trend_down else "FLAT")
         hb = (f"ℹ️ {sym_base}{FUT_SUFFIX}: новых входов нет. Сейчас {side_5m} (5m), "
-              f"цена {entry:.6f}. Тренд 15m: {'UP' if trend_up else ('DOWN' if trend_down else 'FLAT')}.")
+              f"цена {entry:.6f}. Тренд 15m/1h: {trend_txt}.")
         print(hb); send_telegram(hb)
         last_heartbeat_time[sym_base] = now
 
@@ -332,8 +342,8 @@ def worker_loop():
     hdr = (f"🤖 Фьючерсный сигнальный бот запущен\n"
            f"Пары: {', '.join(s + FUT_SUFFIX for s in SYMBOLS)}\n"
            f"Входы: TF {WORK_TF} • EMA {EMA_FAST}/{EMA_SLOW}\n"
-           f"Фильтр тренда: {HTF_TF}\n"
-           f"Минимальная сила кросса: {STRENGTH_PCT*100:.2f}%\n"
+           f"Фильтры тренда: {HTF_TF} и {HTF2_TF}\n"
+           f"Мин. сила кросса: {STRENGTH_PCT*100:.2f}%\n"
            f"Кулдаун на сигналы: {ALERT_COOLDOWN_SEC//60} мин.")
     print(f"[{now_iso()}] worker started."); send_telegram(hdr)
 
@@ -354,7 +364,6 @@ def root():
 
 @app.route("/status")
 def status():
-    # красиво показываем disabled до какого времени
     disabled_view = {
         f"{k[0]}[{k[1]}]": {
             "reason": v["reason"],
@@ -368,6 +377,7 @@ def status():
         "symbols": [s + FUT_SUFFIX for s in SYMBOLS],
         "work_tf": WORK_TF,
         "htf": HTF_TF,
+        "htf2": HTF2_TF,
         "ema": {"fast": EMA_FAST, "slow": EMA_SLOW},
         "strength_pct": STRENGTH_PCT,
         "cooldown_sec": ALERT_COOLDOWN_SEC,
@@ -376,7 +386,7 @@ def status():
         "disabled_symbols": disabled_view,
         "time": now_iso(),
         "last_band_state": last_band_state,
-        "candles_count": last_candles_count,   # <- Сколько свечей получили по 5m и 15m
+        "candles_count": last_candles_count,
     })
 
 @app.route("/ping")
@@ -384,7 +394,7 @@ def ping():
     ok = send_telegram(f"🧪 Ping от сервера: {now_iso()}")
     return jsonify({"sent": ok, "time": now_iso()})
 
-# --- Вебхук Telegram: чтобы не было 404 и можно было слать команды ---
+# --- Вебхук Telegram ---
 @app.route("/telegram", methods=["POST", "GET"])
 def telegram_webhook():
     if request.method == "GET":
@@ -399,9 +409,10 @@ def telegram_webhook():
             lines = []
             for b in SYMBOLS:
                 band = last_band_state.get(b, 'unknown')
-                cnt5 = last_candles_count[b]["5m"]
+                cnt5  = last_candles_count[b]["5m"]
                 cnt15 = last_candles_count[b]["15m"]
-                lines.append(f"{b}{FUT_SUFFIX}: {band} • candles 5m={cnt5}, 15m={cnt15}")
+                cnt1h = last_candles_count[b]["1h"]
+                lines.append(f"{b}{FUT_SUFFIX}: {band} • candles 5m={cnt5}, 15m={cnt15}, 1h={cnt1h}")
             send_telegram("📊 Статус:\n" + "\n".join(lines))
     except Exception as e:
         print(f"[telegram_webhook] error: {e}")
