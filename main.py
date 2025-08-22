@@ -28,9 +28,9 @@ STRENGTH_PCT = 0.002                          # 0.20% мин. «сила» кр�
 RSI_PERIOD = 14
 RSI_MID = 50                                  # порог RSI
 
-# --- ATR-фильтр волатильности (НОВОЕ) ---
-ATR_MIN_PCT = 0.0015                          # 0.15% — слишком «тонкий» рынок режем
-ATR_MAX_PCT = 0.03                            # 3.00% — слишком «штормовой» рынок режем
+# --- ATR-фильтр волатильности ---
+ATR_MIN_PCT = 0.0015                          # 0.15% — тонко => блок
+ATR_MAX_PCT = 0.03                            # 3.00% — шторм => блок
 
 ALERT_COOLDOWN_SEC = 15 * 60                  # не чаще 1/15 мин/символ
 HEARTBEAT_SEC = 60 * 60                       # статус раз в час
@@ -51,7 +51,8 @@ accepted_params = {}                                # (sym_base, tf) -> dict(...
 disabled_symbols = {}                               # (sym_base, tf) -> dict(...)
 last_candles_count = defaultdict(lambda: {"5m": 0, "15m": 0, "1h": 0})
 last_filter_gate = defaultdict(lambda: "unknown")   # 'allow' | 'block' | 'unknown'
-last_atr_info = defaultdict(lambda: {"atr": None, "atr_pct": None})  # для /status
+last_atr_info = defaultdict(lambda: {"atr": None, "atr_pct": None})
+last_block_reasons = defaultdict(list)              # список причин блокировки по символу
 
 app = Flask(__name__)
 
@@ -253,6 +254,7 @@ def analyze_and_alert(sym_base: str):
     last_candles_count[sym_base] = {"5m": len(c5), "15m": len(c15), "1h": len(c1h)}
     if len(c5) < max(EMA_SLOW+5, 60) or len(c15) < max(EMA_SLOW+5, 40) or len(c1h) < 60:
         last_filter_gate[sym_base] = "unknown"
+        last_block_reasons[sym_base] = ["недостаточно данных"]
         return
 
     ema9_5, ema21_5   = ema_series(c5, EMA_FAST),  ema_series(c5, EMA_SLOW)
@@ -264,6 +266,7 @@ def analyze_and_alert(sym_base: str):
     i, j, k = len(c5)-1, len(c15)-1, len(c1h)-1
     if i < 2 or j < 1 or k < 1:
         last_filter_gate[sym_base] = "unknown"
+        last_block_reasons[sym_base] = ["недостаточно данных"]
         return
 
     # Подтверждённый кросс и удержание 2 свечи
@@ -282,7 +285,7 @@ def analyze_and_alert(sym_base: str):
     rsi_ok_long  = (rsi5[i] >= RSI_MID) and (rsi5[i] > rsi5[i-1])
     rsi_ok_short = (rsi5[i] <= RSI_MID) and (rsi5[i] < rsi5[i-1])
 
-    # --- ATR-фильтр (НОВОЕ) ---
+    # --- ATR-фильтр ---
     entry = c5[i]
     this_atr = atr5[i] if atr5[i] else entry * 0.01
     atr_pct = this_atr / entry if entry > 0 else None
@@ -294,7 +297,48 @@ def analyze_and_alert(sym_base: str):
 
     allow_long  = hold_up   and strength_now and trend_up   and price_above and rsi_ok_long  and atr_ok
     allow_short = hold_down and strength_now and trend_down and price_below and rsi_ok_short and atr_ok
-    last_filter_gate[sym_base] = "allow" if (allow_long or allow_short) else "block"
+    allow_any = (allow_long or allow_short)
+    last_filter_gate[sym_base] = "allow" if allow_any else "block"
+
+    # --- причины блокировки (для статусов) ---
+    reasons = []
+    if not atr_ok:
+        if atr_pct is None:
+            reasons.append("ATR недоступен")
+        elif atr_pct < ATR_MIN_PCT:
+            reasons.append(f"ATR ниже минимума ({ATR_MIN_PCT*100:.2f}%)")
+        else:
+            reasons.append(f"ATR выше максимума ({ATR_MAX_PCT*100:.2f}%)")
+    # трендовый конфликт
+    if not (trend_up or trend_down):
+        reasons.append("тренд 15m/1h = FLAT")
+    # если 5m LONG, но старшие не UP
+    if side_5m == "LONG" and not trend_up:
+        reasons.append("конфликт трендов (5m=LONG vs 15m/1h≠UP)")
+    # если 5m SHORT, но старшие не DOWN
+    if side_5m == "SHORT" and not trend_down:
+        reasons.append("конфликт трендов (5m=SHORT vs 15m/1h≠DOWN)")
+    # сила кросса
+    if not strength_now:
+        reasons.append(f"сила кросса < {STRENGTH_PCT*100:.2f}%")
+    # цена по сторону EMA
+    if side_5m == "LONG" and not price_above:
+        reasons.append("цена не выше EMA")
+    if side_5m == "SHORT" and not price_below:
+        reasons.append("цена не ниже EMA")
+    # RSI
+    if side_5m == "LONG" and not rsi_ok_long:
+        reasons.append(f"RSI < {RSI_MID} или падает")
+    if side_5m == "SHORT" and not rsi_ok_short:
+        reasons.append(f"RSI > {RSI_MID} или растёт")
+    # кросс не подтверждён 2 свечами
+    if side_5m == "LONG" and not (cross_up_prev and hold_up):
+        reasons.append("нет подтверждённого кросса EMA ↑")
+    if side_5m == "SHORT" and not (cross_down_prev and hold_down):
+        reasons.append("нет подтверждённого кросса EMA ↓")
+
+    # сохраняем компактно (удалим повторы)
+    last_block_reasons[sym_base] = sorted(set(reasons)) if not allow_any else []
 
     now = time.time()
     tp_dist = 1.5 * this_atr
@@ -332,11 +376,14 @@ def analyze_and_alert(sym_base: str):
         gate_txt = "✅ Сигналы разрешены (условия совпадают)" if last_filter_gate[sym_base]=="allow" \
                    else ("⛔ Сигналы заблокированы фильтрами" if last_filter_gate[sym_base]=="block"
                          else "ℹ️ Недостаточно данных для фильтров")
+        reasons_txt = ""
+        if last_block_reasons[sym_base]:
+            reasons_txt = "🚫 Причины: " + "; ".join(last_block_reasons[sym_base])
         atr_txt = f"ATR={this_atr:.6f} ({(atr_pct*100 if atr_pct is not None else 0):.2f}%), коридор [{ATR_MIN_PCT*100:.2f}–{ATR_MAX_PCT*100:.2f}%]"
         hb = (f"ℹ️ {sym_base}{FUT_SUFFIX}: новых входов нет.\n"
               f"Сейчас: {side_5m} (5m), цена {entry:.6f}\n"
               f"Тренд 15m/1h: {trend_txt}\n"
-              f"{atr_txt}\n{gate_txt}")
+              f"{atr_txt}\n{gate_txt}\n{reasons_txt}".rstrip())
         print(hb); send_telegram(hb)
         last_heartbeat_time[sym_base] = now
 
@@ -383,9 +430,11 @@ def status():
         gate_icon = "✅ allow" if gate=="allow" else ("⛔ block" if gate=="block" else "ℹ️ unknown")
         atr_info = last_atr_info[b]
         atr_pct_view = f"{(atr_info['atr_pct']*100):.2f}%" if atr_info['atr_pct'] is not None else "n/a"
+        reasons = last_block_reasons[b]
+        reasons_txt = (" | причины: " + "; ".join(reasons)) if reasons else ""
         status_lines.append(
             f"{b}{FUT_SUFFIX}: {band} • candles 5m={cnt['5m']}, 15m={cnt['15m']}, 1h={cnt['1h']} • "
-            f"ATR={atr_info['atr'] if atr_info['atr'] is not None else 'n/a'} ({atr_pct_view}) • {gate_icon}"
+            f"ATR={atr_info['atr'] if atr_info['atr'] is not None else 'n/a'} ({atr_pct_view}) • {gate_icon}{reasons_txt}"
         )
 
     return jsonify({
@@ -408,6 +457,7 @@ def status():
         "candles_count": last_candles_count,
         "filter_gate": last_filter_gate,
         "atr_info": last_atr_info,
+        "block_reasons": last_block_reasons,
         "status_lines": status_lines,
     })
 
@@ -436,9 +486,12 @@ def telegram_webhook():
                 gate_icon = "✅ allow" if gate=="allow" else ("⛔ block" if gate=="block" else "ℹ️ unknown")
                 atr_info = last_atr_info[b]
                 atr_pct_view = f"{(atr_info['atr_pct']*100):.2f}%" if atr_info['atr_pct'] is not None else "n/a"
+                reasons = last_block_reasons[b]
+                reasons_txt = (" | причины: " + "; ".join(reasons)) if reasons else ""
                 lines.append(
                     f"{b}{FUT_SUFFIX}: {band} • candles 5m={cnt['5m']}, 15m={cnt['15m']}, 1h={cnt['1h']} • "
-                    f"ATR={atr_info['atr'] if atr_info['atr'] is not None else 'n/a'} ({atr_pct_view}) • {gate_icon}"
+                    f"ATR={atr_info['atr'] if atr_info['atr'] is not None else 'n/a'} ({atr_pct_view}) • "
+                    f"{gate_icon}{reasons_txt}"
                 )
             send_telegram("📊 Статус:\n" + "\n".join(lines))
     except Exception as e:
