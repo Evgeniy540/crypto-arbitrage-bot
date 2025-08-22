@@ -30,7 +30,9 @@ HTF_TF  = "15min"      # 1-й фильтр тренда
 HTF2_TF = "1h"         # 2-й фильтр тренда
 
 EMA_FAST, EMA_SLOW = 9, 21
-CANDLES_LIMIT = 600    # глубокая история
+EMA_DIR_PERIOD = 50                # <— EMA50 фильтр направления
+EMA50_NEEDS_SLOPE = False          # True => требовать наклон EMA50 по направлению
+CANDLES_LIMIT = 600                # глубокая история
 
 STRENGTH_PCT = 0.002   # 0.20% мин. «сила» кросса
 RSI_PERIOD = 14
@@ -44,7 +46,7 @@ ALERT_COOLDOWN_SEC = 15 * 60
 HEARTBEAT_SEC = 60 * 60
 REQUEST_TIMEOUT = 12
 
-# Чуть увеличил интервалы, чтобы не упереться в лимиты при 25 парах
+# Чуть увеличены интервалы, чтобы не упереться в лимиты при 25 парах
 SLEEP_BETWEEN_SYMBOLS = 0.35
 LOOP_SLEEP = 1.8
 
@@ -271,7 +273,9 @@ def analyze_and_alert(sym_base: str):
         last_block_reasons[sym_base] = ["недостаточно данных"]
         return
 
+    # EMA/RSI/ATR
     ema9_5, ema21_5   = ema_series(c5, EMA_FAST),  ema_series(c5, EMA_SLOW)
+    ema50_5           = ema_series(c5, EMA_DIR_PERIOD)            # <-- EMA50
     ema9_15, ema21_15 = ema_series(c15, EMA_FAST), ema_series(c15, EMA_SLOW)
     ema9_1h, ema21_1h = ema_series(c1h, EMA_FAST), ema_series(c1h, EMA_SLOW)
     rsi5 = rsi_series(c5, RSI_PERIOD)
@@ -296,6 +300,10 @@ def analyze_and_alert(sym_base: str):
     price_above = c5[i] > max(ema9_5[i], ema21_5[i])
     price_below = c5[i] < min(ema9_5[i], ema21_5[i])
 
+    # --- Фильтр направления по EMA50 ---
+    dir_long_ok  = (c5[i] > ema50_5[i])  and ((not EMA50_NEEDS_SLOPE) or (ema50_5[i] >= ema50_5[i-1]))
+    dir_short_ok = (c5[i] < ema50_5[i])  and ((not EMA50_NEEDS_SLOPE) or (ema50_5[i] <= ema50_5[i-1]))
+
     rsi_ok_long  = (rsi5[i] >= RSI_MID) and (rsi5[i] > rsi5[i-1])
     rsi_ok_short = (rsi5[i] <= RSI_MID) and (rsi5[i] < rsi5[i-1])
 
@@ -312,8 +320,8 @@ def analyze_and_alert(sym_base: str):
     # Предыдущее состояние ворот
     prev_gate = last_filter_gate[sym_base]
 
-    allow_long  = hold_up   and strength_now and trend_up   and price_above and rsi_ok_long  and atr_ok
-    allow_short = hold_down and strength_now and trend_down and price_below and rsi_ok_short and atr_ok
+    allow_long  = (hold_up   and strength_now and trend_up   and price_above and rsi_ok_long  and atr_ok and dir_long_ok)
+    allow_short = (hold_down and strength_now and trend_down and price_below and rsi_ok_short and atr_ok and dir_short_ok)
     allow_any = (allow_long or allow_short)
     last_filter_gate[sym_base] = "allow" if allow_any else "block"
 
@@ -346,6 +354,11 @@ def analyze_and_alert(sym_base: str):
         reasons.append("нет подтверждённого кросса EMA ↑")
     if side_5m == "SHORT" and not (cross_down_prev and hold_down):
         reasons.append("нет подтверждённого кросса EMA ↓")
+    # EMA50 направление
+    if side_5m == "LONG" and not dir_long_ok:
+        reasons.append("цена ниже EMA50 (фильтр направления)")
+    if side_5m == "SHORT" and not dir_short_ok:
+        reasons.append("цена выше EMA50 (фильтр направления)")
 
     last_block_reasons[sym_base] = sorted(set(reasons)) if not allow_any else []
 
@@ -358,13 +371,13 @@ def analyze_and_alert(sym_base: str):
             f"🟢 {sym_base}{FUT_SUFFIX}: фильтры ЗЕЛЁНЫЕ\n"
             f"5m: {side_5m} • тренды 15m/1h OK • сила ≥ {STRENGTH_PCT*100:.2f}% • "
             f"RSI {(('≥' if side_5m=='LONG' else '≤') + str(RSI_MID))} • "
-            f"ATR {(atr_pct*100 if atr_pct is not None else 0):.2f}% в коридоре"
+            f"ATR {(atr_pct*100 if atr_pct is not None else 0):.2f}% в коридоре • EMA50 OK"
         )
         last_setup_time[sym_base] = now
 
     # Сетап: всё ОК, но ждём подтверждённого кросса
-    setup_long  = (strength_now and trend_up   and price_above and rsi_ok_long  and atr_ok) and not (cross_up_prev and hold_up)
-    setup_short = (strength_now and trend_down and price_below and rsi_ok_short and atr_ok) and not (cross_down_prev and hold_down)
+    setup_long  = (strength_now and trend_up   and price_above and rsi_ok_long  and atr_ok and dir_long_ok)  and not (cross_up_prev and hold_up)
+    setup_short = (strength_now and trend_down and price_below and rsi_ok_short and atr_ok and dir_short_ok) and not (cross_down_prev and hold_down)
 
     if (setup_long or setup_short) and now - last_setup_time[sym_base] >= SETUP_COOLDOWN_SEC:
         setup_dir = "LONG" if setup_long else "SHORT"
@@ -373,7 +386,7 @@ def analyze_and_alert(sym_base: str):
             f"⚡ Возможен вход {setup_dir} по {sym_base}{FUT_SUFFIX}\n"
             f"Цена: {entry:.6f} • 5m: {side_5m}\n"
             f"Тренды 15m/1h: OK • Сила={(abs(ema9_5[i]-ema21_5[i])/entry*100):.2f}% (≥ {STRENGTH_PCT*100:.2f}%)\n"
-            f"RSI(14)={rsi5[i]:.1f} • ATR={(atr_pct*100 if atr_pct is not None else 0):.2f}% в коридоре\n"
+            f"RSI(14)={rsi5[i]:.1f} • ATR={(atr_pct*100 if atr_pct is not None else 0):.2f}% в коридоре • EMA50 OK\n"
             f"⏳ {wait_txt}"
         )
         last_setup_time[sym_base] = now
@@ -387,7 +400,7 @@ def analyze_and_alert(sym_base: str):
         if now - last_alert_time[sym_base] >= ALERT_COOLDOWN_SEC:
             msg = (f"🔔 BUY/LONG {sym_base}{FUT_SUFFIX} (5m подтверждённый)\n"
                    f"Цена: {entry:.6f}\n"
-                   f"Тренды: 15m/1h OK • Сила ≥ {STRENGTH_PCT*100:.2f}%\n"
+                   f"Тренды: 15m/1h OK • Сила ≥ {STRENGTH_PCT*100:.2f}% • EMA50 OK\n"
                    f"Цена выше EMA • RSI≥{RSI_MID}\n"
                    f"ATR={this_atr:.6f} ({atr_pct*100:.2f}%) • Диапазон OK [{ATR_MIN_PCT*100:.2f}–{ATR_MAX_PCT*100:.2f}%]\n"
                    f"TP ≈ {entry+tp_dist:.6f} • SL ≈ {entry-sl_dist:.6f}")
@@ -400,7 +413,7 @@ def analyze_and_alert(sym_base: str):
         if now - last_alert_time[sym_base] >= ALERT_COOLDOWN_SEC:
             msg = (f"🔔 SELL/SHORT {sym_base}{FUT_SUFFIX} (5m подтверждённый)\n"
                    f"Цена: {entry:.6f}\n"
-                   f"Тренды: 15m/1h OK • Сила ≥ {STRENGTH_PCT*100:.2f}%\n"
+                   f"Тренды: 15m/1h OK • Сила ≥ {STRENGTH_PCT*100:.2f}% • EMA50 OK\n"
                    f"Цена ниже EMA • RSI≤{RSI_MID}\n"
                    f"ATR={this_atr:.6f} ({atr_pct*100:.2f}%) • Диапазон OK [{ATR_MIN_PCT*100:.2f}–{ATR_MAX_PCT*100:.2f}%]\n"
                    f"TP ≈ {entry-tp_dist:.6f} • SL ≈ {entry+sl_dist:.6f}")
@@ -429,7 +442,7 @@ def analyze_and_alert(sym_base: str):
 def worker_loop():
     hdr = (f"🤖 Фьючерсный сигнальный бот запущен\n"
            f"Пары: {', '.join(s + FUT_SUFFIX for s in SYMBOLS)}\n"
-           f"Входы: TF {WORK_TF} • EMA {EMA_FAST}/{EMA_SLOW}\n"
+           f"Входы: TF {WORK_TF} • EMA {EMA_FAST}/{EMA_SLOW} (+ EMA{EMA_DIR_PERIOD} фильтр)\n"
            f"Фильтры тренда: {HTF_TF} и {HTF2_TF}\n"
            f"Мин. сила кросса: {STRENGTH_PCT*100:.2f}%\n"
            f"ATR-коридор: {ATR_MIN_PCT*100:.2f}%–{ATR_MAX_PCT*100:.2f}%\n"
@@ -482,7 +495,7 @@ def status():
         "work_tf": WORK_TF,
         "htf": HTF_TF,
         "htf2": HTF2_TF,
-        "ema": {"fast": EMA_FAST, "slow": EMA_SLOW},
+        "ema": {"fast": EMA_FAST, "slow": EMA_SLOW, "dir": EMA_DIR_PERIOD},
         "strength_pct": STRENGTH_PCT,
         "atr_min_pct": ATR_MIN_PCT,
         "atr_max_pct": ATR_MAX_PCT,
