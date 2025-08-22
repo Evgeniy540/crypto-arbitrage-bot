@@ -14,31 +14,44 @@ TELEGRAM_CHAT_ID   = "5723086631"
 # ===============================
 
 # -------- Настройки --------
-FUT_SUFFIX = "_UMCBL"                         # USDT-M perpetual на Bitget
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]
+FUT_SUFFIX = "_UMCBL"  # USDT-M perpetual на Bitget
 
-WORK_TF = "5min"                              # рабочий ТФ для входов
-HTF_TF  = "15min"                             # 1-й фильтр тренда
-HTF2_TF = "1h"                                # 2-й фильтр тренда
+# РАСШИРЕННЫЙ СПИСОК МОНЕТ (25)
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT",
+    "BNBUSDT", "ADAUSDT", "DOGEUSDT", "MATICUSDT", "AVAXUSDT",
+    "DOTUSDT", "LTCUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
+    "LINKUSDT", "ATOMUSDT", "NEARUSDT", "FILUSDT", "SUIUSDT",
+    "PEPEUSDT", "SHIBUSDT", "ETCUSDT", "ICPUSDT", "INJUSDT"
+]
+
+WORK_TF = "5min"       # рабочий ТФ для входов
+HTF_TF  = "15min"      # 1-й фильтр тренда
+HTF2_TF = "1h"         # 2-й фильтр тренда
 
 EMA_FAST, EMA_SLOW = 9, 21
-CANDLES_LIMIT = 600                           # глубокая история
+CANDLES_LIMIT = 600    # глубокая история
 
-STRENGTH_PCT = 0.002                          # 0.20% мин. «сила» кросса
+STRENGTH_PCT = 0.002   # 0.20% мин. «сила» кросса
 RSI_PERIOD = 14
-RSI_MID = 50                                  # порог RSI
+RSI_MID = 50           # порог RSI
 
 # --- ATR-фильтр волатильности ---
-ATR_MIN_PCT = 0.0015                          # 0.15% — тонко => блок
-ATR_MAX_PCT = 0.03                            # 3.00% — шторм => блок
+ATR_MIN_PCT = 0.0015   # 0.15% — тонко => блок
+ATR_MAX_PCT = 0.03     # 3.00% — шторм => блок
 
-ALERT_COOLDOWN_SEC = 15 * 60                  # не чаще 1/15 мин/символ
-HEARTBEAT_SEC = 60 * 60                       # статус раз в час
+ALERT_COOLDOWN_SEC = 15 * 60
+HEARTBEAT_SEC = 60 * 60
 REQUEST_TIMEOUT = 12
-SLEEP_BETWEEN_SYMBOLS = 0.25
-LOOP_SLEEP = 1.5
 
-RECHECK_FAIL_SEC = 15 * 60                    # через сколько пробовать отключённую пару
+# Чуть увеличил интервалы, чтобы не упереться в лимиты при 25 парах
+SLEEP_BETWEEN_SYMBOLS = 0.35
+LOOP_SLEEP = 1.8
+
+RECHECK_FAIL_SEC = 15 * 60
+
+# --- ПРЕДСИГНАЛЫ ---
+SETUP_COOLDOWN_SEC = 20 * 60
 
 BASE_URL = "https://api.bitget.com"
 _REQ_HEADERS = {"User-Agent": "futures-signal-bot/2.0", "Accept": "application/json"}
@@ -52,7 +65,8 @@ disabled_symbols = {}                               # (sym_base, tf) -> dict(...
 last_candles_count = defaultdict(lambda: {"5m": 0, "15m": 0, "1h": 0})
 last_filter_gate = defaultdict(lambda: "unknown")   # 'allow' | 'block' | 'unknown'
 last_atr_info = defaultdict(lambda: {"atr": None, "atr_pct": None})
-last_block_reasons = defaultdict(list)              # список причин блокировки по символу
+last_block_reasons = defaultdict(list)
+last_setup_time = defaultdict(lambda: 0.0)
 
 app = Flask(__name__)
 
@@ -295,12 +309,15 @@ def analyze_and_alert(sym_base: str):
     side_5m = "LONG" if hold_up else ("SHORT" if hold_down else "NEUTRAL")
     last_band_state[sym_base] = side_5m
 
+    # Предыдущее состояние ворот
+    prev_gate = last_filter_gate[sym_base]
+
     allow_long  = hold_up   and strength_now and trend_up   and price_above and rsi_ok_long  and atr_ok
     allow_short = hold_down and strength_now and trend_down and price_below and rsi_ok_short and atr_ok
     allow_any = (allow_long or allow_short)
     last_filter_gate[sym_base] = "allow" if allow_any else "block"
 
-    # --- причины блокировки (для статусов) ---
+    # Причины блокировки
     reasons = []
     if not atr_ok:
         if atr_pct is None:
@@ -309,38 +326,59 @@ def analyze_and_alert(sym_base: str):
             reasons.append(f"ATR ниже минимума ({ATR_MIN_PCT*100:.2f}%)")
         else:
             reasons.append(f"ATR выше максимума ({ATR_MAX_PCT*100:.2f}%)")
-    # трендовый конфликт
     if not (trend_up or trend_down):
         reasons.append("тренд 15m/1h = FLAT")
-    # если 5m LONG, но старшие не UP
     if side_5m == "LONG" and not trend_up:
         reasons.append("конфликт трендов (5m=LONG vs 15m/1h≠UP)")
-    # если 5m SHORT, но старшие не DOWN
     if side_5m == "SHORT" and not trend_down:
         reasons.append("конфликт трендов (5m=SHORT vs 15m/1h≠DOWN)")
-    # сила кросса
     if not strength_now:
         reasons.append(f"сила кросса < {STRENGTH_PCT*100:.2f}%")
-    # цена по сторону EMA
     if side_5m == "LONG" and not price_above:
         reasons.append("цена не выше EMA")
     if side_5m == "SHORT" and not price_below:
         reasons.append("цена не ниже EMA")
-    # RSI
     if side_5m == "LONG" and not rsi_ok_long:
         reasons.append(f"RSI < {RSI_MID} или падает")
     if side_5m == "SHORT" and not rsi_ok_short:
         reasons.append(f"RSI > {RSI_MID} или растёт")
-    # кросс не подтверждён 2 свечами
     if side_5m == "LONG" and not (cross_up_prev and hold_up):
         reasons.append("нет подтверждённого кросса EMA ↑")
     if side_5m == "SHORT" and not (cross_down_prev and hold_down):
         reasons.append("нет подтверждённого кросса EMA ↓")
 
-    # сохраняем компактно (удалим повторы)
     last_block_reasons[sym_base] = sorted(set(reasons)) if not allow_any else []
 
+    # --- ПРЕДСИГНАЛЫ и смена статуса ---
     now = time.time()
+
+    # Ворота стали allow -> «фильтры зелёные»
+    if allow_any and prev_gate != "allow" and now - last_setup_time[sym_base] >= SETUP_COOLDOWN_SEC:
+        send_telegram(
+            f"🟢 {sym_base}{FUT_SUFFIX}: фильтры ЗЕЛЁНЫЕ\n"
+            f"5m: {side_5m} • тренды 15m/1h OK • сила ≥ {STRENGTH_PCT*100:.2f}% • "
+            f"RSI {(('≥' if side_5m=='LONG' else '≤') + str(RSI_MID))} • "
+            f"ATR {(atr_pct*100 if atr_pct is not None else 0):.2f}% в коридоре"
+        )
+        last_setup_time[sym_base] = now
+
+    # Сетап: всё ОК, но ждём подтверждённого кросса
+    setup_long  = (strength_now and trend_up   and price_above and rsi_ok_long  and atr_ok) and not (cross_up_prev and hold_up)
+    setup_short = (strength_now and trend_down and price_below and rsi_ok_short and atr_ok) and not (cross_down_prev and hold_down)
+
+    if (setup_long or setup_short) and now - last_setup_time[sym_base] >= SETUP_COOLDOWN_SEC:
+        setup_dir = "LONG" if setup_long else "SHORT"
+        wait_txt = "ждём подтверждения кросса EMA ↑" if setup_long else "ждём подтверждения кросса EMA ↓"
+        send_telegram(
+            f"⚡ Возможен вход {setup_dir} по {sym_base}{FUT_SUFFIX}\n"
+            f"Цена: {entry:.6f} • 5m: {side_5m}\n"
+            f"Тренды 15m/1h: OK • Сила={(abs(ema9_5[i]-ema21_5[i])/entry*100):.2f}% (≥ {STRENGTH_PCT*100:.2f}%)\n"
+            f"RSI(14)={rsi5[i]:.1f} • ATR={(atr_pct*100 if atr_pct is not None else 0):.2f}% в коридоре\n"
+            f"⏳ {wait_txt}"
+        )
+        last_setup_time[sym_base] = now
+
+    # --- Реальные сигналы ---
     tp_dist = 1.5 * this_atr
     sl_dist = 1.0 * this_atr
 
@@ -395,7 +433,8 @@ def worker_loop():
            f"Фильтры тренда: {HTF_TF} и {HTF2_TF}\n"
            f"Мин. сила кросса: {STRENGTH_PCT*100:.2f}%\n"
            f"ATR-коридор: {ATR_MIN_PCT*100:.2f}%–{ATR_MAX_PCT*100:.2f}%\n"
-           f"Кулдаун на сигналы: {ALERT_COOLDOWN_SEC//60} мин.")
+           f"Кулдаун на сигналы: {ALERT_COOLDOWN_SEC//60} мин.\n"
+           f"Предсигналы: кулдаун {SETUP_COOLDOWN_SEC//60} мин.")
     print(f"[{now_iso()}] worker started."); send_telegram(hdr)
 
     while True:
@@ -421,7 +460,6 @@ def status():
             "until_iso": datetime.fromtimestamp(v["until_ts"], tz=timezone.utc).isoformat()
         } for k, v in disabled_symbols.items()
     }
-    # собираем строки для быстрого чтения в Telegram
     status_lines = []
     for b in SYMBOLS:
         band = last_band_state.get(b, 'unknown')
@@ -450,6 +488,7 @@ def status():
         "atr_max_pct": ATR_MAX_PCT,
         "cooldown_sec": ALERT_COOLDOWN_SEC,
         "heartbeat_sec": HEARTBEAT_SEC,
+        "setup_cooldown_sec": SETUP_COOLDOWN_SEC,
         "accepted_params": accepted_params,
         "disabled_symbols": disabled_view,
         "time": now_iso(),
