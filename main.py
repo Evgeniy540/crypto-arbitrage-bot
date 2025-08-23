@@ -25,7 +25,7 @@ SYMBOLS = [
     "PEPEUSDT", "SHIBUSDT", "ETCUSDT", "ICPUSDT", "INJUSDT"
 ]
 
-WORK_TF = "5min"       # рабочий ТФ для входов
+WORK_TF = "10min"       # рабочий ТФ для входов
 HTF_TF  = "15min"      # 1-й фильтр тренда
 HTF2_TF = "1h"         # 2-й фильтр тренда
 
