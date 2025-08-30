@@ -22,9 +22,9 @@ SEND_STARTUP     = True
 # Пороги фильтров
 RSI_MIN_LONG  = 50          # LONG: RSI >= 50
 RSI_MAX_SHORT = 50          # SHORT: RSI <= 50
-STRENGTH_MIN  = 0.0020      # 0.20% расстояние между EMA50 и EMA200 относительно цены
+STRENGTH_MIN  = 0.0020      # 0.20% расстояние EMA50..EMA200 от цены
 ATR_MIN_PCT   = 0.0030      # 0.30%  нижняя граница волатильности
-ATR_MAX_PCT   = 0.0150      # 1.50%  верхняя граница волатильности
+ATR_MAX_PCT   = 0.0150      # 1.50%  верхняя граница
 
 # ---------- infra ----------
 app = Flask(__name__)
@@ -39,8 +39,7 @@ def tg(text: str):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=10
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10
         )
     except Exception:
         pass
@@ -88,35 +87,34 @@ def atr_pct(candles, n=14):
 
 # ---------- данные ----------
 def _granularity(tf: str) -> str:
-    """Bitget принимает секунды, а не '5min'."""
     tf = tf.lower().strip()
     mapping = {
-        "1m":"60", "1min":"60",
-        "3m":"180", "3min":"180",
-        "5m":"300", "5min":"300",
-        "15m":"900", "15min":"900",
-        "30m":"1800", "30min":"1800",
-        "1h":"3600",
-        "4h":"14400",
-        "1d":"86400", "1day":"86400"
+        "1m":"60","1min":"60",
+        "3m":"180","3min":"180",
+        "5m":"300","5min":"300",
+        "15m":"900","15min":"900",
+        "30m":"1800","30min":"1800",
+        "1h":"3600","4h":"14400","1d":"86400","1day":"86400"
     }
-    return mapping.get(tf, "300")  # по умолчанию 5m
+    return mapping.get(tf, "300")  # default 5m
 
 def bitget_candles(symbol, tf="5m", futures=True):
     """
-    Возвращает свечи (ts, o, h, l, c, v) от старых к новым.
-    ВНИМАНИЕ: history-candles НЕ принимает limit — убрано.
+    Возвращает свечи (ts,o,h,l,c,v) от старых к новым.
+    Важно: history-candles НЕ принимает limit — не передаём его вообще.
     """
     base = "https://api.bitget.com/api/mix/v1/market/history-candles" if futures \
            else "https://api.bitget.com/api/spot/v1/market/history-candles"
-    params = {"symbol": symbol + (FUT_SUFFIX if futures else ""),
-              "granularity": _granularity(tf)}
+    params = {
+        "symbol": symbol + (FUT_SUFFIX if futures else ""),
+        "granularity": _granularity(tf)
+    }
     r = requests.get(base, params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
     r.raise_for_status()
     js = r.json()
     if js.get("code") != "00000" or "data" not in js:
         raise RuntimeError(f"Bitget API error: {js}")
-    rows = js["data"]           # от новых к старым
+    rows = js["data"]  # от новых к старым
     rows.reverse()
     out=[]
     for R in rows:
@@ -135,7 +133,7 @@ def get_close_series(symbol, tf, need=210):
     c = bitget_candles(symbol, tf=tf, futures=True)
     if not c: return [], []
     if len(c) > need + 10:
-        c = c[-(need+10):]  # небольшой запас для EMA
+        c = c[-(need+10):]  # оставляем «хвост» с запасом для EMA
     if len(c) < need: return [], []
     closes=[x[4] for x in c]
     return c, closes
@@ -152,7 +150,7 @@ def strength_pct(e_fast, e_slow, close):
     return abs(e_fast - e_slow)/close
 
 def analyze_symbol(sym):
-    # 5m базовый ТФ
+    # базовый ТФ
     c5, cls5 = get_close_series(sym, BASE_TF, need=210)
     if not cls5: return f"{sym}_UMCBL: недостаточно данных на {BASE_TF}"
 
@@ -166,7 +164,7 @@ def analyze_symbol(sym):
     strength = strength_pct(e50_5[-1], e200_5[-1], close5)
     atrp     = atr_pct(c5,14)
 
-    # тренды на 15m/1h для согласования
+    # тренды на 15m/1h
     _, cls15 = get_close_series(sym, "15m", need=210)
     _, cls1h = get_close_series(sym, "1h",  need=210)
     dir15, _, _ = trend_dir(cls15) if cls15 else (None, [], [])
@@ -230,7 +228,7 @@ def check_once():
 
 def loop():
     if SEND_STARTUP:
-        tg("🤖 Бот запущен (LONG/SHORT: EMA50/200 + RSI + ATR; исправлен history-candles без limit).")
+        tg("🤖 Бот запущен (LONG/SHORT: EMA50/200 + RSI + ATR; history-candles без limit).")
     while True:
         try:
             check_once()
