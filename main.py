@@ -14,15 +14,16 @@ SYMBOLS = [
     "LINKUSDT","NEARUSDT","ATOMUSDT","INJUSDT","SUIUSDT",
     "DOTUSDT","OPUSDT","ARBUSDT","APTUSDT","LTCUSDT","PEPEUSDT"
 ]
-CHECK_INTERVAL_SEC = 60
-SEND_STARTUP_MESSAGE = True
+BASE_TF          = "5m"   # 1m / 3m / 5m / 15m / 30m / 1h / 4h / 1d
+CHECK_INTERVAL_S = 60
+SEND_STARTUP     = True
 
-# Пороги
+# Пороги фильтров
 RSI_MIN_LONG  = 50          # LONG: RSI >= 50
 RSI_MAX_SHORT = 50          # SHORT: RSI <= 50
-STRENGTH_MIN  = 0.0020      # 0.20% расстояние EMA50..EMA200 от цены
+STRENGTH_MIN  = 0.0020      # 0.20% расстояние между EMA50 и EMA200 относительно цены
 ATR_MIN_PCT   = 0.0030      # 0.30%  нижняя граница волатильности
-ATR_MAX_PCT   = 0.0150      # 1.50%  верхняя граница
+ATR_MAX_PCT   = 0.0150      # 1.50%  верхняя граница волатильности
 
 # ---------- infra ----------
 app = Flask(__name__)
@@ -33,17 +34,19 @@ def run_flask():
     port = int(os.environ.get("PORT","8000"))
     app.run(host="0.0.0.0", port=port)
 
-def tg(text):
+def tg(text: str):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=10
         )
-    except: pass
+    except Exception:
+        pass
 
 # ---------- индикаторы ----------
 def ema(vals, n):
-    if len(vals)<n: return [math.nan]*len(vals)
+    if len(vals) < n: return [math.nan]*len(vals)
     k = 2/(n+1)
     out = [math.nan]*(n-1)
     s  = sum(vals[:n])/n
@@ -80,25 +83,45 @@ def atr_pct(candles, n=14):
         trs.append(true_range(h,l,c0))
     atr = sum(trs[-n:])/n
     close = candles[-1][4]
-    return atr/close
+    return atr/close  # доля (0.0042 = 0.42%)
 
 # ---------- данные ----------
-def bitget_candles(symbol, tf="5min", limit=320, futures=True):
+def _granularity(tf: str) -> str:
+    """Bitget принимает секунды, а не '5min'."""
+    tf = tf.lower().strip()
+    mapping = {
+        "1m":"60", "1min":"60",
+        "3m":"180", "3min":"180",
+        "5m":"300", "5min":"300",
+        "15m":"900", "15min":"900",
+        "30m":"1800", "30min":"1800",
+        "1h":"3600",
+        "4h":"14400",
+        "1d":"86400", "1day":"86400"
+    }
+    return mapping.get(tf, "300")  # по умолчанию 5m
+
+def bitget_candles(symbol, tf="5m", limit=320, futures=True):
     base = "https://api.bitget.com/api/mix/v1/market/history-candles" if futures \
            else "https://api.bitget.com/api/spot/v1/market/history-candles"
-    params = {"symbol": symbol+(FUT_SUFFIX if futures else ""), "granularity": tf, "limit": str(limit)}
+    params = {"symbol": symbol + (FUT_SUFFIX if futures else ""),
+              "granularity": _granularity(tf),
+              "limit": str(limit)}
     r = requests.get(base, params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
     r.raise_for_status()
     js = r.json()
-    if js.get("code") != "00000" or "data" not in js: return []
-    rows = js["data"]; rows.reverse()
+    if js.get("code") != "00000" or "data" not in js:
+        raise RuntimeError(f"Bitget API error: {js}")
+    rows = js["data"]           # от новых к старым
+    rows.reverse()
     out=[]
     for R in rows:
         try:
             ts=int(R[0])//1000
             o,h,l,c,v = map(float, R[1:6])
             out.append((ts,o,h,l,c,v))
-        except: continue
+        except Exception:
+            continue
     return out
 
 def get_close_series(symbol, tf, need=210):
@@ -120,22 +143,22 @@ def strength_pct(e_fast, e_slow, close):
 
 def analyze_symbol(sym):
     # 5m базовый ТФ
-    c5, cls5 = get_close_series(sym, "5min", need=210)
-    if not cls5: return f"{sym}_UMCBL: недостаточно данных на 5m"
+    c5, cls5 = get_close_series(sym, BASE_TF, need=210)
+    if not cls5: return f"{sym}_UMCBL: недостаточно данных на {BASE_TF}"
 
     e50_5 = ema(cls5, 50); e200_5 = ema(cls5, 200)
     rsi5  = rsi(cls5, 14)
     if math.isnan(e200_5[-1]) or math.isnan(rsi5[-1]):
-        return f"{sym}_UMCBL: недостаточно данных для индикаторов (5m)"
+        return f"{sym}_UMCBL: недостаточно данных для индикаторов ({BASE_TF})"
 
-    close5 = cls5[-1]
-    dir5   = "LONG" if e50_5[-1] > e200_5[-1] else "SHORT"
+    close5   = cls5[-1]
+    dir5     = "LONG" if e50_5[-1] > e200_5[-1] else "SHORT"
     strength = strength_pct(e50_5[-1], e200_5[-1], close5)
-    atrp = atr_pct(c5,14)
+    atrp     = atr_pct(c5,14)
 
     # тренды на 15m/1h для согласования
-    _, cls15 = get_close_series(sym, "15min", need=210)
-    _, cls1h = get_close_series(sym, "1h",    need=210)
+    _, cls15 = get_close_series(sym, "15m", need=210)
+    _, cls1h = get_close_series(sym, "1h",  need=210)
     dir15, _, _ = trend_dir(cls15) if cls15 else (None, [], [])
     dir1h, _, _ = trend_dir(cls1h) if cls1h else (None, [], [])
 
@@ -164,7 +187,7 @@ def analyze_symbol(sym):
                 f"{'OK' if (dir15=='LONG') else '–'}/{ 'OK' if (dir1h=='LONG') else '–' } (для LONG); " \
                 f"{'OK' if (dir15=='SHORT') else '–'}/{ 'OK' if (dir1h=='SHORT') else '–' } (для SHORT)"
 
-    info = (f"Цена: {round(close5,6)} • 5m: {dir5}\n"
+    info = (f"Цена: {round(close5,6)} • {BASE_TF}: {dir5}\n"
             f"{trend_str}\n"
             f"Сила={round(strength*100,2)}% (≥ {STRENGTH_MIN*100:.2f}%) • "
             f"RSI(14)={round(rsi5[-1],1)} • ATR={round(atrp*100,2)}% в коридоре • "
@@ -188,17 +211,22 @@ def check_once():
     for s in SYMBOLS:
         try:
             lines.append(analyze_symbol(s))
+        except requests.HTTPError as he:
+            lines.append(f"{s}_UMCBL: HTTP ошибка — {he}")
         except Exception as e:
             lines.append(f"{s}_UMCBL: ошибка данных — {e}")
     dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    tg("📊 Фильтры (5m) — " + dt + "\n" + "\n\n".join(lines))
+    tg("📊 Фильтры (" + BASE_TF + ") — " + dt + "\n" + "\n\n".join(lines))
 
 def loop():
-    if SEND_STARTUP_MESSAGE:
-        tg("🤖 Бот запущен (фильтры LONG/SHORT: EMA50/200 + RSI + ATR).")
+    if SEND_STARTUP:
+        tg("🤖 Бот запущен (LONG/SHORT: EMA50/200 + RSI + ATR; исправлена гранулярность Bitget).")
     while True:
-        check_once()
-        time.sleep(CHECK_INTERVAL_SEC)
+        try:
+            check_once()
+        except Exception as e:
+            tg(f"⚠️ Главный цикл: ошибка — {e}")
+        time.sleep(CHECK_INTERVAL_S)
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
