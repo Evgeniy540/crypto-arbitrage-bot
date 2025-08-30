@@ -1,447 +1,200 @@
 # -*- coding: utf-8 -*-
-"""
-Bitget UMCBL Signal Bot — фильтры + EMA + Flask
-— Фильтры: тренды (5m/15m/1h), сила (|EMA9-EMA21|/price), RSI(14), ATR%(14), EMA50/EMA200
-— Сообщения "фильтры ЗЕЛЁНЫЕ/КРАСНЫЕ", "Возможен вход LONG/SHORT (ждём кросса EMA)"
-— Сигналы EMA (strong/weak/near) + PNG-график с TP/SL
-— Антидубли strong, "нет сигнала" пульс раз в 10 минут
-— Flask: /, /check_now, /status, /config, /debug_once
-"""
-
-import os, io, time, threading, math
+import os
+import time
+import threading
 from datetime import datetime, timezone
 from collections import defaultdict
+
 import requests
 from flask import Flask, jsonify, request
 
-# ==== Matplotlib (headless)
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# ========= ТВОИ ДАННЫЕ =========
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ТОКЕН_ТУТ")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "ЧАТ_ID_ТУТ")
 
-# ==== Данные Telegram (ENV с fallback)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "5723086631")
+# ========= НАСТРОЙКИ =========
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 
-# ==== Настройки
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]
-FUT_SUFFIX = "_UMCBL"
+BASE_TF     = "300"           # 5 минут
+CONFIRM_TFS = ["900", "3600"] # 15 минут, 1 час
 
-# ТФ для логики (человеческие ярлыки)
-BASE_TF     = "5min"                 # основной ТФ
-CONFIRM_TFS = ["15min", "1hour"]     # подтверждения тренда
+CHECK_INTERVAL = 30           # каждые 30 сек проверка
+NO_SIGNAL_INTERVAL = 600      # "нет сигнала" раз в 10 мин
 
-# Маппинг в правильный Bitget granularity (секунды)
-TFMAP = {
-    "1min": "60",
-    "3min": "180",
-    "5min": "300",
-    "15min": "900",
-    "30min": "1800",
-    "1hour": "3600",
-    "4hour": "14400",
-    "1day": "86400"
-}
-def tf2gran(tf: str) -> str:
-    return TFMAP.get(tf, tf)  # если уже число — вернём как есть
+EMA_FAST = 50
+EMA_SLOW = 200
+RSI_PERIOD = 14
 
-EMA_FAST, EMA_SLOW = 9, 21
-EMA_MID,  EMA_BIG  = 50, 200       # для фильтра "EMA50/EMA200 OK"
+# ========= ФИЛЬТРЫ =========
+MIN_STRENGTH = 0.001   # 0.1% (раньше было 0.2%)
+MAX_ATR      = 0.02    # 2% (ослабил фильтр)
+MIN_ATR      = 0.001   # 0.1%
 
-# Пороги фильтров
-STRENGTH_MIN_PCT   = 0.002   # ≥ 0.20%
-RSI_MIN_LONG       = 50.0
-RSI_MAX_SHORT      = 50.0
-ATR_MIN_PCT        = 0.002   # ≥ 0.20%
-ATR_MAX_PCT        = 0.008   # ≤ 0.80%
+# ========= ГЛОБАЛ =========
+last_signal_time = defaultdict(lambda: 0)
+last_none_time = defaultdict(lambda: 0)
 
-# TP/SL от цены сигнальной (закрытой) свечи
-TP_PCT = 0.015
-SL_PCT = 0.01
+# ========= УТИЛИТЫ =========
+def send_telegram_message(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
 
-CANDLES_LIMIT = 300
-CHECK_INTERVAL_SEC     = 60
-NO_SIGNAL_COOLDOWN_SEC = 60 * 10
-SEND_WEAK_SIGNALS      = True
-SEND_NEAR_SIGNALS      = True
-NEAR_EPS_PCT           = 0.001
-CHART_TAIL             = 180
-
-BITGET_MIX_HOST = "https://api.bitget.com"
-
-# ==== Состояния
-last_no_signal_ts  = defaultdict(lambda: 0)
-last_cross_dir     = defaultdict(lambda: None)     # last strong dir
-last_cross_ts      = defaultdict(lambda: 0)
-last_filters_green = defaultdict(lambda: None)     # None/True/False
-
-# ==== Telegram
-def send_telegram_text(text: str):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
-    except Exception as e:
-        print("TG text err:", e)
-
-def send_telegram_photo(png_bytes: bytes, caption: str = ""):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        files = {"photo": ("chart.png", png_bytes, "image/png")}
-        data  = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-        requests.post(url, data=data, files=files, timeout=30)
-    except Exception as e:
-        print("TG photo err:", e)
-
-# ==== API Bitget
-def fetch_history_candles(symbol: str, tf_label: str, limit: int = 300):
-    gran = tf2gran(tf_label)
-    url = f"{BITGET_MIX_HOST}/api/mix/v1/market/history-candles"
-    params = {
-        "symbol": f"{symbol}{FUT_SUFFIX}",
-        "granularity": gran,
-        "limit": str(min(max(limit, 50), 1000))
-    }
-    headers = {"User-Agent": "Mozilla/5.0 (SignalBot/filters+ema)"}
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        # Возможны 2 формата: {"data":[...]} или просто список
-        if isinstance(data, dict):
-            data = data.get("data", [])
-        if isinstance(data, list) and data and isinstance(data[0], list):
-            return data
+def fetch_history_candles(symbol, granularity, limit=300):
+    url = f"https://api.bitget.com/api/v2/market/history-candles"
+    params = {"symbol": symbol, "granularity": granularity, "limit": str(limit)}
+    r = requests.get(url, params=params, timeout=10)
+    if r.status_code != 200:
         return []
-    except Exception as e:
-        print(f"[{symbol}] candles err:", e)
-        return []
+    data = r.json().get("data", [])
+    candles = [
+        {
+            "time": int(c[0]) // 1000,
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "volume": float(c[5]),
+        }
+        for c in data
+    ]
+    return candles[::-1]
 
-# ==== TA helpers
-def ema(series, span):
-    k = 2 / (span + 1.0)
-    out = []
-    for i, v in enumerate(series):
-        out.append(v if i == 0 else v * k + out[-1] * (1 - k))
-    return out
+def ema(values, period):
+    k = 2 / (period + 1)
+    ema_val = values[0]
+    res = []
+    for v in values:
+        ema_val = v * k + ema_val * (1 - k)
+        res.append(ema_val)
+    return res
 
-def rsi14(closes, period=14):
-    if len(closes) < period + 2:
-        return None
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        ch = closes[i] - closes[i - 1]
-        gains.append(max(ch, 0.0)); losses.append(max(-ch, 0.0))
-    avg_g, avg_l = sum(gains) / period, sum(losses) / period
-    rs = (avg_g / avg_l) if avg_l != 0 else 1e9
-    rsi_vals = [100 - 100 / (1 + rs)]
-    for i in range(period + 1, len(closes)):
-        ch = closes[i] - closes[i - 1]
-        g = max(ch, 0.0); l = max(-ch, 0.0)
-        avg_g = (avg_g * (period - 1) + g) / period
-        avg_l = (avg_l * (period - 1) + l) / period
-        rs = (avg_g / avg_l) if avg_l != 0 else 1e9
-        rsi_vals.append(100 - 100 / (1 + rs))
-    return [None] * (len(closes) - len(rsi_vals)) + rsi_vals
+def rsi(values, period=14):
+    if len(values) < period + 1:
+        return [50] * len(values)
+    deltas = [values[i+1] - values[i] for i in range(len(values)-1)]
+    seed = deltas[:period]
+    up = sum(x for x in seed if x > 0) / period
+    down = -sum(x for x in seed if x < 0) / period
+    rs = up / down if down != 0 else 0
+    r = [100 - 100 / (1 + rs)]
+    upval, downval = up, down
+    for delta in deltas[period:]:
+        upval = (upval * (period - 1) + (delta if delta > 0 else 0)) / period
+        downval = (downval * (period - 1) + (-delta if delta < 0 else 0)) / period
+        rs = upval / downval if downval != 0 else 0
+        r.append(100 - 100 / (1 + rs))
+    return [50] * (period) + r
 
-def atr_pct14(highs, lows, closes, period=14):
-    if len(closes) < period + 2:
-        return None
+def atr(candles, period=14):
     trs = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i] - lows[i],
-                 abs(highs[i] - closes[i - 1]),
-                 abs(lows[i]  - closes[i - 1]))
+    for i in range(1, len(candles)):
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        prev_close = candles[i-1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
-    atr = sum(trs[:period]) / period
-    atrs = [atr]
-    for i in range(period, len(trs)):
-        atr = (atrs[-1] * (period - 1) + trs[i]) / period
-        atrs.append(atr)
-    atrs = [None] * (len(closes) - len(atrs)) + atrs
-    out = []
-    for i, a in enumerate(atrs):
-        out.append((a / closes[i]) if (a and closes[i]) else None)
-    return out
+    if not trs:
+        return 0
+    atr_vals = []
+    avg = sum(trs[:period]) / period
+    atr_vals.append(avg)
+    for tr in trs[period:]:
+        avg = (avg * (period - 1) + tr) / period
+        atr_vals.append(avg)
+    return atr_vals[-1] / candles[-1]["close"]
 
-def prepare_ohlc(raw):
-    if not raw:
-        return None
-    # Bitget присылает с newest→oldest. Отсортируем в возрастающем порядке.
-    candles = sorted(raw, key=lambda x: int(x[0]))
-    ts     = [int(c[0])   for c in candles]
-    opens  = [float(c[1]) for c in candles]
-    highs  = [float(c[2]) for c in candles]
-    lows   = [float(c[3]) for c in candles]
-    closes = [float(c[4]) for c in candles]
-    return ts, opens, highs, lows, closes
+# ========= СТРАТЕГИЯ =========
+def analyze(candles):
+    closes = [c["close"] for c in candles]
+    ema_fast = ema(closes, EMA_FAST)
+    ema_slow = ema(closes, EMA_SLOW)
+    rsi_vals = rsi(closes, RSI_PERIOD)
+    atr_val = atr(candles)
 
-def ema_block(closes, f=EMA_FAST, s=EMA_SLOW):
-    ef, es = ema(closes, f), ema(closes, s)
-    # Используем закрытую свечу (-2)
-    ef_now, es_now = ef[-2], es[-2]
-    ef_prev, es_prev = ef[-3], es[-3]
-    price = closes[-2]
-    cross_up   = (ef_now > es_now) and (ef_prev <= es_prev)
-    cross_down = (ef_now < es_now) and (ef_prev >= es_prev)
-    above_both = (price > ef_now) and (price > es_now)
-    below_both = (price < ef_now) and (price < es_now)
-    sig = "none"
-    if cross_up:
-        sig = "weak_long";  sig = "long"  if above_both else sig
-    elif cross_down:
-        sig = "weak_short"; sig = "short" if below_both else sig
-    # near
-    near = None
-    if sig == "none" and price:
-        diff = abs(ef_now - es_now) / price
-        if diff <= NEAR_EPS_PCT:
-            near = "near_long" if ef_now >= es_now else "near_short"
-    return dict(sig=sig, near=near, price=price, ef=ef_now, es=es_now,
-                ef_series=ef, es_series=es)
+    last = closes[-1]
+    strength = (last - ema_slow[-1]) / last
 
-def ema_dir(closes):  # для фильтра тренда
-    ef = ema(closes, EMA_FAST); es = ema(closes, EMA_SLOW)
-    return "long" if ef[-2] >= es[-2] else "short"
+    signal = "none"
+    reason = []
+    if abs(strength) >= MIN_STRENGTH and MIN_ATR <= atr_val <= MAX_ATR:
+        if ema_fast[-1] > ema_slow[-1] and rsi_vals[-1] > 50:
+            signal = "long"
+            reason.append("EMA↑, RSI>50")
+        elif ema_fast[-1] < ema_slow[-1] and rsi_vals[-1] < 50:
+            signal = "short"
+            reason.append("EMA↓, RSI<50")
+    return signal, strength, atr_val, rsi_vals[-1], reason
 
-def ema_dir_on_tf(symbol, tf_label):
-    raw = fetch_history_candles(symbol, tf_label, CANDLES_LIMIT)
-    p = prepare_ohlc(raw)
-    if not p: return None
-    _,_,_,_,cl = p
-    if len(cl) < EMA_SLOW + 3: return None
-    return ema_dir(cl)
-
-def ema50_200_ok(closes):
-    e50 = ema(closes, EMA_MID); e200 = ema(closes, EMA_BIG)
-    return e50[-2] >= e200[-2]
-
-# ==== Визуал
-def chart_png(symbol, tf_label, closes, ef_series, es_series, signal, price, tp, sl, tail=CHART_TAIL):
-    closes     = closes[-tail:]
-    ef_series  = ef_series[-tail:]
-    es_series  = es_series[-tail:]
-    sig_idx = len(closes) - 1
-    fig = plt.figure(figsize=(7.5, 3.3), dpi=150); ax = plt.gca()
-    ax.plot(closes, label="Close")
-    ax.plot(ef_series, label=f"EMA{EMA_FAST}")
-    ax.plot(es_series, label=f"EMA{EMA_SLOW}")
-    if signal in ("long", "short"):
-        ax.axhline(tp, linestyle="--", linewidth=1.2, label="TP")
-        ax.axhline(sl, linestyle="--", linewidth=1.2, label="SL")
-    ax.scatter([sig_idx], [price], s=35)
-    name = {"long":"LONG","short":"SHORT","weak_long":"weak LONG","weak_short":"weak SHORT",
-            "near_long":"near LONG","near_short":"near SHORT"}.get(signal, signal)
-    ax.set_title(f"{symbol} {tf_label} | {name}")
-    ax.set_xlabel("bars (old → new)"); ax.set_ylabel("price")
-    ax.legend(loc="best"); ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.45)
-    buf = io.BytesIO(); fig.tight_layout(); fig.savefig(buf, format="png"); plt.close(fig); buf.seek(0)
-    return buf.read()
-
-# ==== Форматирования
-def fmt_pct(x): return f"{x*100:.2f}%"
-
-def filters_message(symbol, tf, side, price, strength_pct, rsi, atr_pct, ok15, ok1h, ema50_200_ok_flag):
-    dot = "🟢" if side == "long" else "🔴"
-    lines = [
-        f"{dot} <b>{symbol}_{FUT_SUFFIX[1:]}:</b> фильтры {'ЗЕЛЁНЫЕ' if side=='long' else 'КРАСНЫЕ'}",
-        f"{tf}: <b>{side.upper()}</b> • тренды 15m/1h {'OK' if (ok15 and ok1h) else '—'} • сила ≥ {fmt_pct(STRENGTH_MIN_PCT)}",
-        f"Цена: {price:.6f} • RSI(14) {('≥' if side=='long' else '≤')}50 • ATR {fmt_pct(ATR_MIN_PCT)}–{fmt_pct(ATR_MAX_PCT)} • EMA50/EMA200 {'OK' if ema50_200_ok_flag else '—'}",
-        f"Текущее: сила={fmt_pct(strength_pct)} • RSI={rsi:.1f} • ATR={fmt_pct(atr_pct)}"
-    ]
-    return "\n".join(lines)
-
-def possible_entry_message(symbol, tf, side, price, strength_pct, rsi, atr_pct, ok15, ok1h, ema50_200_ok_flag):
-    lines = [
-        f"⚡ <b>Возможен вход {side.upper()}</b> по <b>{symbol}</b>",
-        f"Цена: {price:.6f} • {tf}: <b>{side.upper()}</b>",
-        f"Тренды 15m/1h: {'OK' if (ok15 and ok1h) else '—'} • Сила={fmt_pct(strength_pct)} (≥ {fmt_pct(STRENGTH_MIN_PCT)})",
-        f"RSI(14)={'≥' if side=='long' else '≤'}50 → {rsi:.1f} • ATR={fmt_pct(atr_pct)} в коридоре • EMA50/EMA200 {'OK' if ema50_200_ok_flag else '—'}",
-        "⏳ ждём подтверждения кросса EMA " + ("↑" if side=="long" else "↓"),
-    ]
-    return "\n".join(lines)
-
-# ==== Основная логика
-def process_symbol(symbol: str):
-    raw = fetch_history_candles(symbol, BASE_TF, CANDLES_LIMIT)
-    pack = prepare_ohlc(raw)
-    if not pack:
-        print(f"[{symbol}] no data")
-        return
-    ts, op, hi, lo, cl = pack
-    if len(cl) < max(EMA_SLOW, EMA_BIG) + 5:
-        print(f"[{symbol}] not enough len: {len(cl)}")
+# ========= ЛОГИКА =========
+def process_symbol(symbol):
+    candles = fetch_history_candles(symbol, BASE_TF)
+    if len(candles) < 210:
         return
 
-    # EMA-сигнал
-    em = ema_block(cl)
-    sig, near, price = em["sig"], em["near"], em["price"]
-    ef, es = em["ef"], em["es"]
+    base_sig, strength, atr_val, rsi_val, reason = analyze(candles)
 
-    # Фильтры
-    strength_pct = abs(ef - es) / price if price else 0.0
-    rsi_series   = rsi14(cl)
-    atr_series   = atr_pct14(hi, lo, cl)
-    rsi_val = rsi_series[-2] if rsi_series else None
-    atr_val = atr_series[-2] if atr_series else None
-    base_dir = "long" if ef >= es else "short"
-    ok15 = (ema_dir_on_tf(symbol, "15min") == base_dir)
-    ok1h = (ema_dir_on_tf(symbol, "1hour") == base_dir)
-    midbig_ok = ema50_200_ok(cl)
-
-    # Итог зелёных/красных фильтров
-    if base_dir == "long":
-        filters_green = (
-            ok15 and ok1h and
-            strength_pct >= STRENGTH_MIN_PCT and
-            (rsi_val is not None and rsi_val >= RSI_MIN_LONG) and
-            (atr_val is not None and ATR_MIN_PCT <= atr_val <= ATR_MAX_PCT) and
-            midbig_ok
-        )
-    else:
-        filters_green = (
-            ok15 and ok1h and
-            strength_pct >= STRENGTH_MIN_PCT and
-            (rsi_val is not None and rsi_val <= RSI_MAX_SHORT) and
-            (atr_val is not None and ATR_MIN_PCT <= atr_val <= ATR_MAX_PCT) and
-            midbig_ok
-        )
-
-    # Сообщение о смене фильтров
-    if last_filters_green[symbol] is not filters_green:
-        last_filters_green[symbol] = filters_green
-        side = base_dir
-        text = filters_message(symbol, BASE_TF, side, price, strength_pct, rsi_val, atr_val, ok15, ok1h, midbig_ok)
-        send_telegram_text(text)
-
-    # «Возможен вход…» когда фильтры ок, а кросса ещё нет (или weak/near)
-    if filters_green and (sig in ("none", "weak_long", "weak_short") or (sig == "none" and near)):
-        side = base_dir
-        text = possible_entry_message(symbol, BASE_TF, side, price, strength_pct, rsi_val, atr_val, ok15, ok1h, midbig_ok)
-        send_telegram_text(text)
-
-    # Нет сигнала — пульс раз в 10 минут
-    if sig == "none" and not near:
-        now = int(time.time())
-        if now - last_no_signal_ts[symbol] >= NO_SIGNAL_COOLDOWN_SEC:
-            last_no_signal_ts[symbol] = now
-            send_telegram_text(f"⚪️ Нет сигнала ({symbol} {BASE_TF})")
+    if base_sig == "none":
+        now = time.time()
+        if now - last_none_time[symbol] > NO_SIGNAL_INTERVAL:
+            send_telegram_message(f"⚪️ [{symbol}] нет сигнала (RSI={rsi_val:.1f}, ATR={atr_val:.3f})")
+            last_none_time[symbol] = now
         return
 
-    # Антидубли только для strong
-    if sig in ("long", "short") and last_cross_dir[symbol] == sig:
-        return
+    confirm_ok = True
+    for tf in CONFIRM_TFS:
+        conf_candles = fetch_history_candles(symbol, tf)
+        if len(conf_candles) < 210:
+            continue
+        sig, *_ = analyze(conf_candles)
+        if sig != base_sig:
+            confirm_ok = False
+            break
 
-    # Strong -> график с TP/SL; weak/near -> график без TP/SL
-    tp = price * (1 + TP_PCT) if sig == "long" else price * (1 - TP_PCT)
-    sl = price * (1 - SL_PCT) if sig == "long" else price * (1 + SL_PCT)
-    cap = []
-    if sig == "long":
-        cap = [f"🟢 LONG <b>{symbol}</b> ({BASE_TF})",
-               f"Цена: <b>{price:.6f}</b> • EMA{EMA_FAST}={ef:.6f} | EMA{EMA_SLOW}={es:.6f}",
-               f"🎯 TP: <b>{tp:.6f}</b> • 🛑 SL: <b>{sl:.6f}</b>"]
-    elif sig == "short":
-        cap = [f"🔴 SHORT <b>{symbol}</b> ({BASE_TF})",
-               f"Цена: <b>{price:.6f}</b> • EMA{EMA_FAST}={ef:.6f} | EMA{EMA_SLOW}={es:.6f}",
-               f"🎯 TP: <b>{tp:.6f}</b> • 🛑 SL: <b>{sl:.6f}</b>"]
-    elif sig in ("weak_long", "weak_short") or near:
-        tag = "🟡 Слабый LONG" if (sig=="weak_long" or near=="near_long") else "🟠 Слабый SHORT"
-        cap = [f"{tag} <b>{symbol}</b> ({BASE_TF})",
-               f"Цена: <b>{price:.6f}</b> • EMA{EMA_FAST}={ef:.6f} | EMA{EMA_SLOW}={es:.6f}"]
-    caption = "\n".join(cap)
+    if confirm_ok:
+        now = time.time()
+        if now - last_signal_time[symbol] > 60:  # не чаще раза в минуту
+            emoji = "📈" if base_sig == "long" else "📉"
+            msg = (
+                f"{emoji} [{symbol}] {base_sig.upper()} сигнал\n"
+                f"RSI={rsi_val:.1f}, ATR={atr_val:.3f}, strength={strength:.3%}\n"
+                f"Причины: {', '.join(reason)}"
+            )
+            send_telegram_message(msg)
+            last_signal_time[symbol] = now
 
-    picture = chart_png(symbol, BASE_TF, cl, em["ef_series"], em["es_series"],
-                        sig if sig!="none" else near, price, tp, sl, tail=CHART_TAIL)
-    send_telegram_photo(picture, caption)
-
-    if sig in ("long","short"):
-        last_cross_dir[symbol] = sig
-        last_cross_ts[symbol]  = int(time.time())
-
-# ==== циклы / Flask
-def loop():
-    send_telegram_text("🤖 Бот запущен на Render! (фильтры + EMA)")
+def worker():
+    send_telegram_message("🤖 Бот запущен (EMA+RSI+ATR)")
     while True:
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"[{stamp}] tick")
         for s in SYMBOLS:
             try:
                 process_symbol(s)
-                time.sleep(0.5)
             except Exception as e:
-                print(f"[{s}] ex:", e)
-        time.sleep(CHECK_INTERVAL_SEC)
+                send_telegram_message(f"⚠️ Ошибка {s}: {e}")
+        time.sleep(CHECK_INTERVAL)
 
+# ========= FLASK =========
 app = Flask(__name__)
 
 @app.route("/")
-def health():
-    return jsonify({"ok": True, "service":"filters+ema", "symbols":SYMBOLS,
-                    "base_tf":BASE_TF, "confirm_tfs":CONFIRM_TFS})
-
-@app.route("/check_now", methods=["POST", "GET"])
-def check_now():
-    try:
-        payload = request.json or {}
-    except Exception:
-        payload = {}
-    sym = (payload.get("symbol") if isinstance(payload, dict) else None) or request.args.get("symbol")
-    if sym:
-        process_symbol(sym)
-        return jsonify({"ok": True, "forced": sym})
-    for s in SYMBOLS:
-        process_symbol(s)
-    return jsonify({"ok": True, "forced":"all"})
-
-@app.route("/status")
-def status():
-    now = int(time.time())
-    info = {s:{
-        "last_no_signal_min": round((now-last_no_signal_ts[s])/60,1) if last_no_signal_ts[s] else None,
-        "last_cross": last_cross_dir[s],
-        "last_cross_ago_min": round((now-last_cross_ts[s])/60,1) if last_cross_ts[s] else None,
-        "filters_green": last_filters_green[s]
-    } for s in SYMBOLS}
-    return jsonify({"ok": True, "info": info})
-
-@app.route("/config")
-def config():
-    return jsonify({
-        "EMA": [EMA_FAST, EMA_SLOW, EMA_MID, EMA_BIG],
-        "strength_min_pct": STRENGTH_MIN_PCT,
-        "rsi_long_min": RSI_MIN_LONG, "rsi_short_max": RSI_MAX_SHORT,
-        "atr_pct_bounds": [ATR_MIN_PCT, ATR_MAX_PCT],
-        "weak": SEND_WEAK_SIGNALS, "near": SEND_NEAR_SIGNALS,
-        "tfmap": TFMAP, "base_tf": BASE_TF, "confirm_tfs": CONFIRM_TFS
-    })
+def index():
+    return jsonify({"status": "ok", "time": datetime.now().isoformat()})
 
 @app.route("/debug_once")
 def debug_once():
-    lines = []
+    out = {}
     for s in SYMBOLS:
-        raw = fetch_history_candles(s, BASE_TF, CANDLES_LIMIT)
-        p = prepare_ohlc(raw)
-        if not p:
-            lines.append(f"{s}: no data")
+        candles = fetch_history_candles(s, BASE_TF)
+        if len(candles) < 210:
+            out[s] = "no data"
             continue
-        ts,op,hi,lo,cl = p
-        em = ema_block(cl); rsi_s = rsi14(cl); atr_s = atr_pct14(hi,lo,cl)
-        rsi_val = rsi_s[-2] if rsi_s else None
-        atr_val = atr_s[-2] if atr_s else None
-        strength = abs(em['ef']-em['es'])/em['price'] if em['price'] else 0
-        lines.append(
-            f"{s}: close={em['price']:.6f} ef={em['ef']:.6f} es={em['es']:.6f} "
-            f"sig={em['sig']} near={em['near']} strength={strength:.4%} "
-            f"RSI={None if rsi_val is None else round(rsi_val,1)} "
-            f"ATR%={None if atr_val is None else round(atr_val*100,2)}"
-        )
-    send_telegram_text("🔎 DEBUG\n" + "\n".join(lines))
-    return jsonify({"ok": True, "lines": lines})
+        sig, strength, atr_val, rsi_val, reason = analyze(candles)
+        out[s] = {"signal": sig, "strength": strength, "ATR": atr_val, "RSI": rsi_val, "reason": reason}
+    return jsonify(out)
 
-def run_flask():
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+def start_worker():
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
 
 if __name__ == "__main__":
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
-    run_flask()
+    start_worker()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
