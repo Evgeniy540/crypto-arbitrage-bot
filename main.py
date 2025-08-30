@@ -1,179 +1,201 @@
 # -*- coding: utf-8 -*-
-import os
-import time
-import math
-import threading
+import os, time, math, threading, requests
 from datetime import datetime, timezone
-import requests
 from flask import Flask
 
-# ========= ТВОИ ДАННЫЕ (как просил) =========
+# ==== ТВОИ ДАННЫЕ ====
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
-# ============================================
+# =====================
 
-# ====== НАСТРОЙКИ БОТА ======
-FUT_SUFFIX = "_UMCBL"        # Фьючерсы USDT-M на Bitget
-# Добавил много монет. Можно убирать/добавлять.
+FUT_SUFFIX = "_UMCBL"
 SYMBOLS = [
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT",
-    "BNBUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT",
-    "LTCUSDT","APTUSDT","ARBUSDT","OPUSDT","LINKUSDT",
-    "ATOMUSDT","NEARUSDT","FILUSDT","SUIUSDT","PEPEUSDT",
-    "SHIBUSDT","ETCUSDT","ICPUSDT","INJUSDT"
+    "LINKUSDT","NEARUSDT","ATOMUSDT","INJUSDT","SUIUSDT",
+    "DOTUSDT","OPUSDT","ARBUSDT","APTUSDT","LTCUSDT","PEPEUSDT"
 ]
-TF = "5min"                  # 1min / 5min / 15min / 30min / 1h
-RSI_PERIOD = 14
-EMA_FAST = 50
-EMA_SLOW = 200              # Требуется >=200 свечей
-CHECK_INTERVAL_SEC = 60     # Частота проверок
+CHECK_INTERVAL_SEC = 60
 SEND_STARTUP_MESSAGE = True
 
-# ====== ВЕБ-СЕРВЕР ДЛЯ KEEP-ALIVE ======
-app = Flask(__name__)
+# Пороги
+RSI_MIN_LONG  = 50          # LONG: RSI >= 50
+RSI_MAX_SHORT = 50          # SHORT: RSI <= 50
+STRENGTH_MIN  = 0.0020      # 0.20% расстояние EMA50..EMA200 от цены
+ATR_MIN_PCT   = 0.0030      # 0.30%  нижняя граница волатильности
+ATR_MAX_PCT   = 0.0150      # 1.50%  верхняя граница
 
+# ---------- infra ----------
+app = Flask(__name__)
 @app.route("/")
-def root():
-    return "OK: crypto alert bot is running"
+def root(): return "OK"
 
 def run_flask():
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(os.environ.get("PORT","8000"))
     app.run(host="0.0.0.0", port=port)
 
-# ====== УТИЛИТЫ ======
-def tg_send(text: str):
+def tg(text):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-        requests.post(url, json=data, timeout=10)
-    except Exception:
-        pass
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10
+        )
+    except: pass
 
-def ema(series, period):
-    if len(series) < period:
-        return [math.nan]*len(series)
-    k = 2/(period+1)
-    out = [math.nan]*(period-1)
-    # SMA на первых period значениях
-    sma = sum(series[:period])/period
-    out.append(sma)
-    prev = sma
-    for x in series[period:]:
-        val = x*k + prev*(1-k)
-        out.append(val)
-        prev = val
+# ---------- индикаторы ----------
+def ema(vals, n):
+    if len(vals)<n: return [math.nan]*len(vals)
+    k = 2/(n+1)
+    out = [math.nan]*(n-1)
+    s  = sum(vals[:n])/n
+    out.append(s)
+    p = s
+    for x in vals[n:]:
+        p = x*k + p*(1-k)
+        out.append(p)
     return out
 
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return [math.nan]*len(values)
-    gains = [0.0]
-    losses = [0.0]
-    for i in range(1, len(values)):
-        ch = values[i] - values[i-1]
-        gains.append(max(ch, 0.0))
-        losses.append(max(-ch, 0.0))
-    # средние первые
-    avg_gain = sum(gains[1:period+1]) / period
-    avg_loss = sum(losses[1:period+1]) / period
-    rsis = [math.nan]*(period)
-    def rsi_from(gl, ll):
-        if ll == 0:
-            return 100.0
-        rs = gl/ll
-        return 100 - (100/(1+rs))
-    rsis.append(rsi_from(avg_gain, avg_loss))
-    for i in range(period+1, len(values)):
-        avg_gain = (avg_gain*(period-1) + gains[i]) / period
-        avg_loss = (avg_loss*(period-1) + losses[i]) / period
-        rsis.append(rsi_from(avg_gain, avg_loss))
+def rsi(vals, n=14):
+    if len(vals) < n+1: return [math.nan]*len(vals)
+    gains=[0.0]; losses=[0.0]
+    for i in range(1,len(vals)):
+        d = vals[i]-vals[i-1]
+        gains.append(max(d,0)); losses.append(max(-d,0))
+    ag = sum(gains[1:n+1])/n; al = sum(losses[1:n+1])/n
+    rsis=[math.nan]*n
+    def rsi_from(g,l): return 100.0 if l==0 else 100 - 100/(1+g/l)
+    rsis.append(rsi_from(ag,al))
+    for i in range(n+1,len(vals)):
+        ag=(ag*(n-1)+gains[i])/n; al=(al*(n-1)+losses[i])/n
+        rsis.append(rsi_from(ag,al))
     return rsis
 
-def bitget_granularity(tf: str) -> str:
-    # Bitget history-candles принимает: 1min, 3min, 5min, 15min, 30min, 1h, 4h, 1day
-    return tf
+def true_range(h,l,c_prev): return max(h-l, abs(h-c_prev), abs(l-c_prev))
 
-def fetch_candles(symbol: str, tf: str, limit: int = 300):
-    """
-    Возвращает список свечей (open_time, open, high, low, close, volume)
-    в порядке от старых к новым. Использует фьючерсный endpoint.
-    """
-    url = "https://api.bitget.com/api/mix/v1/market/history-candles"
-    params = {
-        "symbol": symbol + FUT_SUFFIX,
-        "granularity": bitget_granularity(tf),
-        "limit": str(limit)
-    }
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, params=params, headers=headers, timeout=15)
+def atr_pct(candles, n=14):
+    if len(candles) < n+1: return math.nan
+    trs=[]
+    for i in range(1,len(candles)):
+        _,o,h,l,c,_ = candles[i]
+        _,o0,h0,l0,c0,_ = candles[i-1]
+        trs.append(true_range(h,l,c0))
+    atr = sum(trs[-n:])/n
+    close = candles[-1][4]
+    return atr/close
+
+# ---------- данные ----------
+def bitget_candles(symbol, tf="5min", limit=320, futures=True):
+    base = "https://api.bitget.com/api/mix/v1/market/history-candles" if futures \
+           else "https://api.bitget.com/api/spot/v1/market/history-candles"
+    params = {"symbol": symbol+(FUT_SUFFIX if futures else ""), "granularity": tf, "limit": str(limit)}
+    r = requests.get(base, params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
     r.raise_for_status()
-    data = r.json()
-    if data.get("code") != "00000" or "data" not in data:
-        return []
-    rows = data["data"]            # Bitget отдаёт от новых к старым
-    rows.reverse()
-    # формат: ["1709292000000","open","high","low","close","volume","turnover"]
-    out = []
-    for row in rows:
+    js = r.json()
+    if js.get("code") != "00000" or "data" not in js: return []
+    rows = js["data"]; rows.reverse()
+    out=[]
+    for R in rows:
         try:
-            ts = int(row[0])//1000
-            o,h,l,c,v = map(float, row[1:6])
+            ts=int(R[0])//1000
+            o,h,l,c,v = map(float, R[1:6])
             out.append((ts,o,h,l,c,v))
-        except:
-            continue
+        except: continue
     return out
 
-def make_status_line(sym: str, closes, ema50, ema200, rsi14):
-    last_close = closes[-1]
-    e50_prev, e200_prev = ema50[-2], ema200[-2]
-    e50, e200 = ema50[-1], ema200[-1]
-    r = rsi14[-1]
+def get_close_series(symbol, tf, need=210):
+    c = bitget_candles(symbol, tf=tf, limit=max(need+10, 260))
+    if len(c) < need: return [], []
+    closes=[x[4] for x in c]
+    return c, closes
 
-    # Логика сигналов: кросс EMA50/200 + простой фильтр RSI
-    signal = "Сигнала нет"
-    if not math.isnan(e50_prev) and not math.isnan(e200_prev):
-        # кросс вверх
-        if e50 > e200 and e50_prev <= e200_prev and r >= 50:
-            signal = "🚀 LONG сигнал"
-        # кросс вниз
-        elif e50 < e200 and e50_prev >= e200_prev and r <= 50:
-            signal = "🔻 SHORT сигнал"
+# ---------- логика ----------
+def trend_dir(closes):
+    e50=ema(closes,50); e200=ema(closes,200)
+    if math.isnan(e50[-1]) or math.isnan(e200[-1]): return None, e50, e200
+    if e50[-1] > e200[-1]:  return "LONG",  e50, e200
+    if e50[-1] < e200[-1]:  return "SHORT", e50, e200
+    return None, e50, e200
 
-    return (f"{sym}: close={round(last_close,6)} | "
-            f"EMA50={round(e50,6)} | EMA200={round(e200,6)} | "
-            f"RSI={round(r,2)} | {signal}")
+def strength_pct(e_fast, e_slow, close):
+    return abs(e_fast - e_slow)/close
+
+def analyze_symbol(sym):
+    # 5m базовый ТФ
+    c5, cls5 = get_close_series(sym, "5min", need=210)
+    if not cls5: return f"{sym}_UMCBL: недостаточно данных на 5m"
+
+    e50_5 = ema(cls5, 50); e200_5 = ema(cls5, 200)
+    rsi5  = rsi(cls5, 14)
+    if math.isnan(e200_5[-1]) or math.isnan(rsi5[-1]):
+        return f"{sym}_UMCBL: недостаточно данных для индикаторов (5m)"
+
+    close5 = cls5[-1]
+    dir5   = "LONG" if e50_5[-1] > e200_5[-1] else "SHORT"
+    strength = strength_pct(e50_5[-1], e200_5[-1], close5)
+    atrp = atr_pct(c5,14)
+
+    # тренды на 15m/1h для согласования
+    _, cls15 = get_close_series(sym, "15min", need=210)
+    _, cls1h = get_close_series(sym, "1h",    need=210)
+    dir15, _, _ = trend_dir(cls15) if cls15 else (None, [], [])
+    dir1h, _, _ = trend_dir(cls1h) if cls1h else (None, [], [])
+
+    t15_ok_long  = (dir15 == "LONG")
+    t1h_ok_long  = (dir1h == "LONG")
+    t15_ok_short = (dir15 == "SHORT")
+    t1h_ok_short = (dir1h == "SHORT")
+
+    # готовые фильтры
+    filters_green_long = (
+        dir5 == "LONG" and t15_ok_long and t1h_ok_long and
+        strength >= STRENGTH_MIN and rsi5[-1] >= RSI_MIN_LONG and
+        (not math.isnan(atrp) and ATR_MIN_PCT <= atrp <= ATR_MAX_PCT)
+    )
+    filters_green_short = (
+        dir5 == "SHORT" and t15_ok_short and t1h_ok_short and
+        strength >= STRENGTH_MIN and rsi5[-1] <= RSI_MAX_SHORT and
+        (not math.isnan(atrp) and ATR_MIN_PCT <= atrp <= ATR_MAX_PCT)
+    )
+
+    # возможные (ждём усиления)
+    possible_long  = (dir5 == "LONG"  and strength < STRENGTH_MIN and rsi5[-1] >= RSI_MIN_LONG)
+    possible_short = (dir5 == "SHORT" and strength < STRENGTH_MIN and rsi5[-1] <= RSI_MAX_SHORT)
+
+    trend_str = f"Тренды 15m/1h: " \
+                f"{'OK' if (dir15=='LONG') else '–'}/{ 'OK' if (dir1h=='LONG') else '–' } (для LONG); " \
+                f"{'OK' if (dir15=='SHORT') else '–'}/{ 'OK' if (dir1h=='SHORT') else '–' } (для SHORT)"
+
+    info = (f"Цена: {round(close5,6)} • 5m: {dir5}\n"
+            f"{trend_str}\n"
+            f"Сила={round(strength*100,2)}% (≥ {STRENGTH_MIN*100:.2f}%) • "
+            f"RSI(14)={round(rsi5[-1],1)} • ATR={round(atrp*100,2)}% в коридоре • "
+            f"EMA50/EMA200 OK")
+
+    msgs=[]
+    if filters_green_long:
+        msgs.append(f"🟢 {sym}_UMCBL: фильтры ЗЕЛЁНЫЕ (LONG)\n{info}")
+    if filters_green_short:
+        msgs.append(f"🟣 {sym}_UMCBL: фильтры ЗЕЛЁНЫЕ (SHORT)\n{info}")
+    if not msgs and possible_long:
+        msgs.append(f"⚡ Возможно вход LONG по {sym}_UMCBL\n{info}\n⌛ ждём подтверждения кросса EMA ↑")
+    if not msgs and possible_short:
+        msgs.append(f"⚡ Возможно вход SHORT по {sym}_UMCBL\n{info}\n⌛ ждём подтверждения кросса EMA ↓")
+    if not msgs:
+        msgs.append(f"⚪ {sym}_UMCBL: фильтры НЕ собраны\n{info}")
+    return "\n".join(msgs)
 
 def check_once():
-    lines = []
-    for sym in SYMBOLS:
+    lines=[]
+    for s in SYMBOLS:
         try:
-            candles = fetch_candles(sym, TF, limit=max(EMA_SLOW+10, 250))
-            if len(candles) < EMA_SLOW:
-                lines.append(f"{sym}: Недостаточно данных ({len(candles)}/{EMA_SLOW})")
-                continue
-
-            closes = [c[4] for c in candles]
-            ema50 = ema(closes, EMA_FAST)
-            ema200 = ema(closes, EMA_SLOW)
-            rsi14 = rsi(closes, RSI_PERIOD)
-
-            if math.isnan(ema200[-1]) or math.isnan(rsi14[-1]):
-                lines.append(f"{sym}: Недостаточно данных для индикаторов")
-                continue
-
-            lines.append(make_status_line(sym, closes, ema50, ema200, rsi14))
-
+            lines.append(analyze_symbol(s))
         except Exception as e:
-            lines.append(f"{sym}: ошибка получения данных: {e}")
-
-    # Отправляем одним сообщением, чтобы не спамить
+            lines.append(f"{s}_UMCBL: ошибка данных — {e}")
     dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    msg = f"🧾 Статус ({TF}) — {dt}\n" + "\n".join(lines)
-    tg_send(msg)
+    tg("📊 Фильтры (5m) — " + dt + "\n" + "\n\n".join(lines))
 
 def loop():
     if SEND_STARTUP_MESSAGE:
-        tg_send("🤖 Бот запущен (логирование включено: EMA50/200 + RSI).")
+        tg("🤖 Бот запущен (фильтры LONG/SHORT: EMA50/200 + RSI + ATR).")
     while True:
         check_once()
         time.sleep(CHECK_INTERVAL_SEC)
