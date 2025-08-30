@@ -14,6 +14,7 @@ SYMBOLS = [
     "LINKUSDT","NEARUSDT","ATOMUSDT","INJUSDT","SUIUSDT",
     "DOTUSDT","OPUSDT","ARBUSDT","APTUSDT","LTCUSDT","PEPEUSDT"
 ]
+
 BASE_TF          = "5m"   # 1m / 3m / 5m / 15m / 30m / 1h / 4h / 1d
 CHECK_INTERVAL_S = 60
 SEND_STARTUP     = True
@@ -101,12 +102,15 @@ def _granularity(tf: str) -> str:
     }
     return mapping.get(tf, "300")  # по умолчанию 5m
 
-def bitget_candles(symbol, tf="5m", limit=320, futures=True):
+def bitget_candles(symbol, tf="5m", futures=True):
+    """
+    Возвращает свечи (ts, o, h, l, c, v) от старых к новым.
+    ВНИМАНИЕ: history-candles НЕ принимает limit — убрано.
+    """
     base = "https://api.bitget.com/api/mix/v1/market/history-candles" if futures \
            else "https://api.bitget.com/api/spot/v1/market/history-candles"
     params = {"symbol": symbol + (FUT_SUFFIX if futures else ""),
-              "granularity": _granularity(tf),
-              "limit": str(limit)}
+              "granularity": _granularity(tf)}
     r = requests.get(base, params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
     r.raise_for_status()
     js = r.json()
@@ -125,7 +129,13 @@ def bitget_candles(symbol, tf="5m", limit=320, futures=True):
     return out
 
 def get_close_series(symbol, tf, need=210):
-    c = bitget_candles(symbol, tf=tf, limit=max(need+10, 260))
+    """
+    Забираем все свечи и берём хвост нужной длины (history-candles не поддерживает limit).
+    """
+    c = bitget_candles(symbol, tf=tf, futures=True)
+    if not c: return [], []
+    if len(c) > need + 10:
+        c = c[-(need+10):]  # небольшой запас для EMA
     if len(c) < need: return [], []
     closes=[x[4] for x in c]
     return c, closes
@@ -220,7 +230,7 @@ def check_once():
 
 def loop():
     if SEND_STARTUP:
-        tg("🤖 Бот запущен (LONG/SHORT: EMA50/200 + RSI + ATR; исправлена гранулярность Bitget).")
+        tg("🤖 Бот запущен (LONG/SHORT: EMA50/200 + RSI + ATR; исправлен history-candles без limit).")
     while True:
         try:
             check_once()
