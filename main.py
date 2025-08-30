@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Bitget UMCBL Signal Bot (EMA 9/21) — SUPER версия
-- Корректная сортировка history-candles (новейшая свеча в ответе первая — мы сортируем по ts↑)
-- Сигналы только по закрытым свечам (-2/-3)
-- TP/SL от цены закрытия сигнальной свечи
-- PNG-график: Close, EMA9, EMA21, линии TP/SL, маркер сигнала
-- Анти-дублирование сигналов
-- Опциональное подтверждение трендом на другом ТФ (по умолчанию 5min)
-- Flask keep-alive + /, /check_now, /status, /config
+Bitget UMCBL Signal Bot (EMA 9/21) — расширенная версия
+— Правильная сортировка history-candles (новейшая свеча приходит первой -> сортируем по ts ↑)
+— Сигналы по закрытым свечам (-2/-3)
+— Strong (long/short), Weak (weak_long/weak_short) и Near (near_long/near_short)
+— TP/SL от цены закрытия сигнальной свечи
+— PNG-график: Close, EMA9, EMA21, TP/SL, маркер сигнальной свечи
+— Антидубли для strong-сигналов
+— Подтверждающий ТФ (по умолчанию 5min), можно выключить
+— Flask: /, /check_now, /status, /config, /debug_once
 """
 
 import os
@@ -20,22 +21,22 @@ from collections import defaultdict
 import requests
 from flask import Flask, jsonify, request
 
-# ======== Matplotlib без дисплея ========
+# === Matplotlib без дисплея ===
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ============ ТВОИ ДАННЫЕ (ВПИСАНО) ============
+# ============ ТВОИ ДАННЫЕ ============
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
-# ==============================================
+# =====================================
 
 # ============ НАСТРОЙКИ ============
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]  # можно расширить
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "TRXUSDT"]  # добавляй по желанию
 FUT_SUFFIX = "_UMCBL"
 
-BASE_TF    = "1min"   # основной ТФ сигналов
-CONFIRM_TF = "5min"   # подтверждающий ТФ тренда ("" чтобы отключить)
+BASE_TF    = "1min"     # основной ТФ
+CONFIRM_TF = "5min"     # подтверждение трендом; "" чтобы выключить
 
 CANDLES_LIMIT = 300
 EMA_FAST, EMA_SLOW = 9, 21
@@ -44,12 +45,18 @@ TP_PCT = 0.015  # +1.5%
 SL_PCT = 0.01   # -1.0%
 
 CHECK_INTERVAL_SEC      = 60
-NO_SIGNAL_COOLDOWN_SEC  = 60 * 60
-CHART_TAIL              = 180
+NO_SIGNAL_COOLDOWN_SEC  = 60 * 10   # чаще видеть пульс (каждые 10 минут)
 
-# ============ ГЛОБ СОСТОЯНИЯ ============
+# Дополнительные сигналы
+SEND_WEAK_SIGNALS = True
+SEND_NEAR_SIGNALS = True
+NEAR_EPS_PCT      = 0.001  # 0.10% близости EMA
+
+CHART_TAIL = 180
+
+# ============ ГЛОБ. СОСТОЯНИЕ ============
 last_no_signal_ts = defaultdict(lambda: 0)     # антиспам "нет сигнала"
-last_cross_dir    = defaultdict(lambda: None)  # последний отправленный "long"/"short"
+last_cross_dir    = defaultdict(lambda: None)  # последний strong ("long"/"short")
 last_cross_ts     = defaultdict(lambda: 0)
 
 # ============ ВСПОМОГАТЕЛЬНОЕ ============
@@ -77,12 +84,12 @@ def send_telegram_photo(png_bytes: bytes, caption: str = ""):
 def fetch_history_candles(symbol: str, granularity: str, limit: int = 300):
     """
     GET /api/mix/v1/market/history-candles?symbol=BTCUSDT_UMCBL&granularity=1min&limit=300
-    Ответ: новейшая свеча ПЕРВОЙ. Мы сортируем по ts (возрастающе).
-    Формат свечи: [ts, open, high, low, close, volume, turnover]
+    Ответ Bitget: новейшая свеча ПЕРВОЙ -> мы сортируем по ts (возрастающе).
+    Формат: [ts, open, high, low, close, volume, turnover]
     """
     url = f"{BITGET_MIX_HOST}/api/mix/v1/market/history-candles"
     params = {"symbol": f"{symbol}{FUT_SUFFIX}", "granularity": granularity, "limit": str(min(max(limit, 50), 1000))}
-    headers = {"User-Agent": "Mozilla/5.0 (SignalBot/2.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (SignalBot/2.1)"}
     try:
         r = requests.get(url, params=params, headers=headers, timeout=15)
         r.raise_for_status()
@@ -106,7 +113,7 @@ def ema(series, span):
 def prepare_series(raw_candles):
     if not raw_candles:
         return None, None
-    candles = sorted(raw_candles, key=lambda x: int(x[0]))  # old->new
+    candles = sorted(raw_candles, key=lambda x: int(x[0]))  # old -> new
     closes  = [float(c[4]) for c in candles]
     times   = [int(c[0])   for c in candles]
     return times, closes
@@ -117,29 +124,39 @@ def last_closed_ok(closes, need=EMA_SLOW + 3) -> bool:
 def ema_signal_series(closes):
     ema_f = ema(closes, EMA_FAST)
     ema_s = ema(closes, EMA_SLOW)
-    # -1 текущая (формируется), -2/-3 закрытые
+
+    # -1 текущая (формируется), -2/-3 — закрытые
     ef_now, es_now   = ema_f[-2], ema_s[-2]
     ef_prev, es_prev = ema_f[-3], ema_s[-3]
     price_closed     = closes[-2]
 
     cross_up   = (ef_now > es_now) and (ef_prev <= es_prev)
     cross_down = (ef_now < es_now) and (ef_prev >= es_prev)
+
+    # фильтр для strong
     above_both = (price_closed > ef_now) and (price_closed > es_now)
     below_both = (price_closed < ef_now) and (price_closed < es_now)
 
-    if cross_up and above_both:
-        sig = "long"
-    elif cross_down and below_both:
-        sig = "short"
-    elif cross_up:
+    # базовый сигнал
+    sig = "none"
+    if cross_up:
         sig = "weak_long"
+        if above_both:
+            sig = "long"
     elif cross_down:
         sig = "weak_short"
-    else:
-        sig = "none"
+        if below_both:
+            sig = "short"
+
+    # near-cross (почти пересеклись) — подсказка
+    near = None
+    diff_pct = abs(ef_now - es_now) / price_closed if price_closed else 1.0
+    if sig == "none" and diff_pct <= NEAR_EPS_PCT:
+        near = "near_long" if ef_now >= es_now else "near_short"
 
     return {
-        "signal": sig,
+        "signal": sig,                  # long/short/weak_long/weak_short/none
+        "near": near,                   # near_long/near_short/None
         "price": price_closed,
         "ema_fast": ef_now,
         "ema_slow": es_now,
@@ -174,12 +191,15 @@ def make_chart_png(symbol: str, tf: str, times, closes, ema_f_series, ema_s_seri
     ax.plot(ema_f_series, label=f"EMA{EMA_FAST}")
     ax.plot(ema_s_series, label=f"EMA{EMA_SLOW}")
 
-    ax.axhline(tp, linestyle="--", linewidth=1.2, label="TP")
-    ax.axhline(sl, linestyle="--", linewidth=1.2, label="SL")
+    if signal in ("long", "short"):
+        ax.axhline(tp, linestyle="--", linewidth=1.2, label="TP")
+        ax.axhline(sl, linestyle="--", linewidth=1.2, label="SL")
     ax.scatter([sig_idx], [price], s=35)
 
     direction = {"long": "LONG", "short": "SHORT",
-                 "weak_long": "weak LONG", "weak_short": "weak SHORT"}.get(signal, signal)
+                 "weak_long": "weak LONG", "weak_short": "weak SHORT",
+                 "near_long": "near LONG", "near_short": "near SHORT"}.get(signal, signal)
+
     ax.set_title(f"{symbol} {tf} | {direction}")
     ax.set_xlabel("bars (old → new)")
     ax.set_ylabel("price")
@@ -226,45 +246,59 @@ def build_caption(symbol: str, tf: str, comp: dict, confirmed: bool):
 
     return "\n".join(lines), tp, sl
 
+# ============ ОСНОВНОЙ ЦИКЛ ============
 def process_symbol(symbol: str):
-    # 1) свечи основного ТФ
+    # 1) свечи
     raw = fetch_history_candles(symbol, BASE_TF, CANDLES_LIMIT)
     times, closes = prepare_series(raw)
     if not last_closed_ok(closes):
-        # не спамим — только полезные сообщения; в лог консолью
         print(f"[{symbol}] Недостаточно данных")
         return
 
     # 2) сигнал
     comp = ema_signal_series(closes)
-    sig = comp["signal"]
+    sig  = comp["signal"]
+    near = comp.get("near")
 
-    if sig == "none":
+    # 3) если вообще нечего — шлём "нет сигнала" по расписанию
+    if sig == "none" and not (SEND_NEAR_SIGNALS and near):
         now = ts_now()
         if now - last_no_signal_ts[symbol] >= NO_SIGNAL_COOLDOWN_SEC:
             last_no_signal_ts[symbol] = now
             send_telegram_text(f"⚪️ Нет сигнала ({symbol} {BASE_TF})")
         return
 
-    # 3) анти-дублирование на сильных сигналах
+    # 4) антидубль только на strong
     if sig in ("long", "short") and last_cross_dir[symbol] == sig:
         return
 
-    # 4) подтверждение трендом (если включено)
+    # 5) подтверждение трендом для strong
     confirmed = True
     if sig in ("long", "short") and CONFIRM_TF:
         confirmed = confirm_direction_on_tf(symbol, sig, CONFIRM_TF)
 
-    # 5) отправка картинки
+    # 6) фильтрация weak/near по настройкам
+    if sig in ("weak_long", "weak_short") and not SEND_WEAK_SIGNALS:
+        return
+    if sig == "none" and near and not SEND_NEAR_SIGNALS:
+        return
+
+    # 7) подпись и график
+    # для near используем формат weak (без TP/SL)
     caption, tp, sl = build_caption(symbol, BASE_TF, comp, confirmed)
+    sig_for_plot = sig if sig != "none" else near
+    if sig == "none" and near:
+        note = "🔷 near LONG" if near == "near_long" else "♦️ near SHORT"
+        caption = f"{caption}\n{note}"
+
     png = make_chart_png(
         symbol, BASE_TF, times, closes,
         comp["ema_f_series"], comp["ema_s_series"],
-        sig, comp["price"], tp, sl, tail=CHART_TAIL
+        sig_for_plot, comp["price"], tp, sl, tail=CHART_TAIL
     )
     send_telegram_photo(png, caption)
 
-    # 6) метки для анти-дубля
+    # 8) отметим последний strong
     if sig in ("long", "short"):
         last_cross_dir[symbol] = sig
         last_cross_ts[symbol]  = ts_now()
@@ -295,7 +329,9 @@ def health():
         "confirm_tf": CONFIRM_TF,
         "ema": [EMA_FAST, EMA_SLOW],
         "tp_pct": TP_PCT,
-        "sl_pct": SL_PCT
+        "sl_pct": SL_PCT,
+        "weak": SEND_WEAK_SIGNALS,
+        "near": SEND_NEAR_SIGNALS
     })
 
 @app.route("/check_now", methods=["POST"])
@@ -321,6 +357,43 @@ def status():
         for s in SYMBOLS
     }
     return jsonify({"ok": True, "base_tf": BASE_TF, "confirm_tf": CONFIRM_TF, "symbols": SYMBOLS, "info": info})
+
+@app.route("/config")
+def config_view():
+    return jsonify({
+        "symbols": SYMBOLS,
+        "base_tf": BASE_TF,
+        "confirm_tf": CONFIRM_TF,
+        "tp_pct": TP_PCT,
+        "sl_pct": SL_PCT,
+        "near_eps_pct": NEAR_EPS_PCT,
+        "check_interval_sec": CHECK_INTERVAL_SEC,
+        "chart_tail": CHART_TAIL,
+        "weak": SEND_WEAK_SIGNALS,
+        "near": SEND_NEAR_SIGNALS
+    })
+
+@app.route("/debug_once")
+def debug_once():
+    lines = []
+    for s in SYMBOLS:
+        try:
+            raw = fetch_history_candles(s, BASE_TF, CANDLES_LIMIT)
+            times, closes = prepare_series(raw)
+            if not last_closed_ok(closes):
+                lines.append(f"{s}: нет данных")
+                continue
+            comp = ema_signal_series(closes)
+            sig  = comp["signal"]
+            near = comp.get("near")
+            p    = comp["price"]
+            ef   = comp["ema_fast"]
+            es   = comp["ema_slow"]
+            lines.append(f"{s}: close={p:.6f} EMA{EMA_FAST}={ef:.6f} EMA{EMA_SLOW}={es:.6f} sig={sig} near={near}")
+        except Exception as e:
+            lines.append(f"{s}: error {e}")
+    send_telegram_text("🔎 DEBUG\n" + "\n".join(lines))
+    return jsonify({"ok": True, "sent_lines": len(lines), "lines": lines})
 
 def run_flask():
     port = int(os.environ.get("PORT", "5000"))
