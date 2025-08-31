@@ -16,20 +16,20 @@ SYMBOLS = [
 ]
 
 BASE_TF              = "5m"   # 1m/3m/5m/15m/30m/1h/4h/1d
-CHECK_INTERVAL_S     = 300    # 🔕 проверяем раз в 5 минут
+CHECK_INTERVAL_S     = 300    # проверяем раз в 5 минут
 SEND_STARTUP         = True
 
 # Пороги фильтров
 RSI_MIN_LONG  = 50
 RSI_MAX_SHORT = 50
 STRENGTH_MIN  = 0.0020   # 0.20%
-ATR_MIN_PCT   = 0.0010   # 🔽 0.10%
+ATR_MIN_PCT   = 0.0010   # 0.10%
 ATR_MAX_PCT   = 0.0150   # 1.50%
 
 # История/окна (умный режим)
-NEED_IDEAL     = 210       # цель для 5m
-NEED_MIN       = 120       # минимум для 5m
-NEED_MIN_HTF   = 60        # 🔽 минимум для 15m/1h
+NEED_IDEAL     = 210       # цель для 5m (EMA200 «гладко»)
+NEED_MIN       = 120       # минимум для 5m (работаем, если >= 120)
+NEED_MIN_HTF   = 60        # минимум для 15m/1h
 FETCH_BUFFER   = 60
 STEP_BARS      = 100
 MAX_WINDOWS    = 30
@@ -37,8 +37,8 @@ MAX_TOTAL_BARS = 1000
 REQUEST_PAUSE  = 0.25
 
 # Анти-спам
-PING_COOLDOWN_MIN   = 60    # не пинговать «без изменений» чаще раза в час
-STATE_COOLDOWN_MIN  = 5     # не повторять одинаковый статус чаще, чем раз в 5 мин
+PING_COOLDOWN_MIN   = 60    # «без изменений»/слабые статусы не чаще 1/час
+STATE_COOLDOWN_MIN  = 5     # одинаковый статус по тикеру — не чаще, чем раз в 5 мин
 
 # ---------- infra ----------
 app = Flask(__name__)
@@ -103,12 +103,9 @@ def atr_pct(candles, n=14):
 def _granularity(tf: str) -> str:
     tf = tf.lower().strip()
     mapping = {
-        "1m":"60","1min":"60",
-        "3m":"180","3min":"180",
-        "5m":"300","5min":"300",
-        "15m":"900","15min":"900",
-        "30m":"1800","30min":"1800",
-        "1h":"3600","4h":"14400","1d":"86400","1day":"86400"
+        "1m":"60","3m":"180","5m":"300",
+        "15m":"900","30m":"1800","1h":"3600",
+        "4h":"14400","1d":"86400"
     }
     return mapping.get(tf, "300")
 
@@ -117,7 +114,7 @@ def _granularity_sec(tf: str) -> int:
 
 def _parse_rows(rows):
     rows = list(rows)
-    rows.reverse()  # от новых к старым -> в хронологию
+    rows.reverse()  # API отдаёт от новых к старым -> в хронологию
     out=[]
     for R in rows:
         try:
@@ -141,19 +138,23 @@ def _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=True):
     r = requests.get(base, params=params, headers=headers, timeout=15)
     r.raise_for_status()
     js = r.json()
-    if isinstance(js, list):
+    if isinstance(js, list):  # некоторые регионы/прокси отдают сразу массив
         return _parse_rows(js)
     if isinstance(js, dict) and js.get("code") == "00000" and "data" in js:
         return _parse_rows(js["data"])
     return []
 
 def bitget_candles(symbol, tf="5m", futures=True, need=NEED_IDEAL+FETCH_BUFFER):
+    """
+    Сбор длинной истории окнами через /history-candles (узкие окна, много шагов).
+    Если мало — то, что собрали; фолбэк на /candles уже почти не нужен.
+    Возвращает [(ts,o,h,l,c,v)] от старых к новым.
+    """
     full_symbol = symbol + (FUT_SUFFIX if futures else "")
-    gran_s   = _granularity_sec(tf)
+    gran_s = _granularity_sec(tf)
 
     end_ms = int(time.time() * 1000)
     all_rows = {}
-    total_target = min(MAX_TOTAL_BARS, max(need, NEED_IDEAL+FETCH_BUFFER))
     step_ms = STEP_BARS * gran_s * 1000
 
     for _ in range(MAX_WINDOWS):
@@ -161,45 +162,20 @@ def bitget_candles(symbol, tf="5m", futures=True, need=NEED_IDEAL+FETCH_BUFFER):
         try:
             part = _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=futures)
             for ts,o,h,l,c,v in part:
-                all_rows[ts] = (ts,o,h,l,c,v)
+                all_rows[ts] = (ts,o,h,l,c,v)  # де-дупликация
         except Exception:
             break
-
-        if len(all_rows) >= total_target:
-            break
-
         end_ms = start_ms - 1
         time.sleep(REQUEST_PAUSE)
 
     rows = sorted(all_rows.values(), key=lambda x: x[0])
-    if len(rows) >= NEED_MIN:
-        return rows[-total_target:] if len(rows) > total_target else rows
-
-    # Фолбэк: /candles (limit)
-    base_cand = "https://api.bitget.com/api/mix/v1/market/candles" if futures \
-                else "https://api.bitget.com/api/spot/v1/market/candles"
-    headers = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
-    params = {
-        "symbol": full_symbol,
-        "granularity": str(gran_s),
-        "limit": str(min(total_target, 600))
-    }
-    r2 = requests.get(base_cand, params=params, headers=headers, timeout=15)
-    r2.raise_for_status()
-    js2 = r2.json()
-    if isinstance(js2, list):
-        rows2 = _parse_rows(js2)
-    elif isinstance(js2, dict) and "data" in js2:
-        rows2 = _parse_rows(js2["data"])
-    else:
-        rows2 = []
-    merged = sorted({x[0]:x for x in rows + rows2}.values(), key=lambda x: x[0])
-    return merged[-total_target:] if len(merged) >= NEED_MIN else merged
+    return rows  # «умный» сбор: дальше режем в get_close_series
 
 def get_close_series(symbol, tf, need=NEED_IDEAL, min_need=NEED_MIN):
     c = bitget_candles(symbol, tf=tf, futures=True, need=need+FETCH_BUFFER)
     if not c or len(c) < min_need:
         return [], []
+    # режем лишнее по потолку
     if len(c) > min(MAX_TOTAL_BARS, need + FETCH_BUFFER):
         c = c[-(need+FETCH_BUFFER):]
     closes=[x[4] for x in c]
@@ -219,19 +195,19 @@ def strength_pct(e_fast, e_slow, close):
 def analyze_symbol(sym):
     # базовый ТФ
     c5, cls5 = get_close_series(sym, BASE_TF, need=NEED_IDEAL, min_need=NEED_MIN)
-    if not cls5: return ("NO_DATA", f"{sym}_UMCBL: недостаточно данных на {BASE_TF}")
+    if not cls5: return ("NO_DATA", f"{sym}_UMCBL: недостаточно данных")
 
     e50_5 = ema(cls5, 50); e200_5 = ema(cls5, 200)
     rsi5  = rsi(cls5, 14)
     if math.isnan(e200_5[-1]) or math.isnan(rsi5[-1]):
-        return ("NO_DATA", f"{sym}_UMCBL: недостаточно данных для индикаторов ({BASE_TF})")
+        return ("NO_DATA", f"{sym}_UMCBL: недостаточно индикаторов")
 
     close5   = cls5[-1]
     dir5     = "LONG" if e50_5[-1] > e200_5[-1] else "SHORT"
     strength = strength_pct(e50_5[-1], e200_5[-1], close5)
     atrp     = atr_pct(c5,14)
 
-    # тренды на 15m/1h — с меньшим минимумом
+    # старшие ТФ с меньшим минимумом
     _, cls15 = get_close_series(sym, "15m", need=NEED_MIN, min_need=NEED_MIN_HTF)
     _, cls1h = get_close_series(sym, "1h",  need=NEED_MIN, min_need=NEED_MIN_HTF)
     dir15, _, _ = trend_dir(cls15) if cls15 else (None, [], [])
@@ -242,49 +218,39 @@ def analyze_symbol(sym):
     t15_ok_short = (dir15 == "SHORT")
     t1h_ok_short = (dir1h == "SHORT")
 
-    filters_green_long = (
+    filters_long = (
         dir5 == "LONG" and t15_ok_long and t1h_ok_long and
         strength >= STRENGTH_MIN and rsi5[-1] >= RSI_MIN_LONG and
         (not math.isnan(atrp) and ATR_MIN_PCT <= atrp <= ATR_MAX_PCT)
     )
-    filters_green_short = (
+    filters_short = (
         dir5 == "SHORT" and t15_ok_short and t1h_ok_short and
         strength >= STRENGTH_MIN and rsi5[-1] <= RSI_MAX_SHORT and
         (not math.isnan(atrp) and ATR_MIN_PCT <= atrp <= ATR_MAX_PCT)
     )
 
-    possible_long  = (dir5 == "LONG"  and strength < STRENGTH_MIN and rsi5[-1] >= RSI_MIN_LONG)
-    possible_short = (dir5 == "SHORT" and strength < STRENGTH_MIN and rsi5[-1] <= RSI_MAX_SHORT)
-
-    trend_str = f"Тренды 15m/1h: " \
-                f"{'OK' if t15_ok_long else '–'}/{ 'OK' if t1h_ok_long else '–' } (для LONG); " \
-                f"{'OK' if t15_ok_short else '–'}/{ 'OK' if t1h_ok_short else '–' } (для SHORT)"
-
     info = (f"Цена: {round(close5,6)} • {BASE_TF}: {dir5}\n"
-            f"{trend_str}\n"
-            f"Сила={round(strength*100,2)}% (≥ {STRENGTH_MIN*100:.2f}%) • "
-            f"RSI(14)={round(rsi5[-1],1)} • ATR={round(atrp*100,2)}% • EMA50/EMA200 OK")
+            f"RSI={round(rsi5[-1],1)} • ATR={round(atrp*100,2)}% • "
+            f"Сила={round(strength*100,2)}% • EMA50/200 OK")
 
-    # Статус для анти-спама
-    if filters_green_long:
-        return ("STRONG_LONG", f"🟩 СИЛЬНЫЙ LONG по {sym}_UMCBL\n{info}")
-    if filters_green_short:
-        return ("STRONG_SHORT", f"🟪 СИЛЬНЫЙ SHORT по {sym}_UMCBL\n{info}")
-    if possible_long:
-        return ("POSSIBLE_LONG", f"⚡ Возможно вход LONG по {sym}_UMCBL\n{info}\n⌛ ждём подтверждения EMA ↑")
-    if possible_short:
-        return ("POSSIBLE_SHORT", f"⚡ Возможно вход SHORT по {sym}_UMCBL\n{info}\n⌛ ждём подтверждения EMA ↓")
-    return ("NEUTRAL", f"⚪ {sym}_UMCBL: фильтры НЕ собраны\n{info}")
+    # таймштамп UTC в заголовок сильного сигнала
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-# ---------- анти-спам отправка ----------
+    if filters_long:
+        return ("STRONG_LONG", f"🟩 СИЛЬНЫЙ LONG {sym}_UMCBL ({now_str})\n{info}")
+    if filters_short:
+        return ("STRONG_SHORT", f"🟪 СИЛЬНЫЙ SHORT {sym}_UMCBL ({now_str})\n{info}")
+    return ("WEAK", f"⚪ {sym}_UMCBL: фильтры НЕ собраны\n{info}")
+
+# ---------- анти-спам ----------
 _last_state = {}       # symbol -> (state, ts_sent)
 _last_ping_ts = 0
 
-def send_changes(batch_msgs):
-    if not batch_msgs: 
-        return False
+def send_changes(msgs):
+    if not msgs: return False
     dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    tg("📊 Обновления (" + BASE_TF + ") — " + dt + "\n" + "\n\n".join(batch_msgs))
+    msgs.append(f"⏳ Следующая проверка через {CHECK_INTERVAL_S//60} минут")
+    tg("📊 Обновления (" + BASE_TF + ") — " + dt + "\n" + "\n\n".join(msgs))
     return True
 
 def check_once():
@@ -295,30 +261,37 @@ def check_once():
     for s in SYMBOLS:
         try:
             state, text = analyze_symbol(s)
-        except requests.HTTPError as he:
-            state, text = ("ERROR", f"{s}_UMCBL: HTTP ошибка — {he}")
         except Exception as e:
-            state, text = ("ERROR", f"{s}_UMCBL: ошибка данных — {e}")
+            state, text = ("ERR", f"{s}_UMCBL: ошибка данных — {e}")
 
-        last = _last_state.get(s, (None, 0))
-        last_state, last_ts = last
+        last_state, last_ts = _last_state.get(s, (None, 0))
 
-        # отправляем, если сменился статус или прошло N минут
-        if (state != last_state) or (now - last_ts >= STATE_COOLDOWN_MIN*60) or (state in ("STRONG_LONG","STRONG_SHORT")):
-            changed_msgs.append(text)
-            _last_state[s] = (state, now)
+        if state in ("STRONG_LONG", "STRONG_SHORT"):
+            if state != last_state or (now - last_ts >= STATE_COOLDOWN_MIN*60):
+                changed_msgs.append(text)
+                _last_state[s] = (state, now)
+        elif state == "WEAK":
+            # слабые/нейтральные — максимум раз в час
+            if (state != last_state and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60)):
+                changed_msgs.append(text)
+                _last_state[s] = (state, now)
+                _last_ping_ts = now
+        else:
+            # NO_DATA / ERR — тоже не чаще 1/час
+            if (state != last_state and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60)):
+                changed_msgs.append(text)
+                _last_state[s] = (state, now)
+                _last_ping_ts = now
 
     sent = send_changes(changed_msgs)
-
-    # если изменений не было — пингуем не чаще раза в час
     if (not sent) and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60):
         dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        tg(f"ℹ️ Без изменений по фильтрам ({BASE_TF}) — {dt}")
+        tg(f"ℹ️ Без изменений по фильтрам ({BASE_TF}) — {dt}\n⏳ Следующая проверка через {CHECK_INTERVAL_S//60} минут")
         _last_ping_ts = now
 
 def loop():
     if SEND_STARTUP:
-        tg("🤖 Бот запущен: умный сбор истории (HTF от 60 баров), ATR≥0.1%, анти-спам включён.")
+        tg("🤖 Бот запущен: сильные сигналы сразу, нейтралка ≤ 1/ч, UTC-таймштамп в заголовке.")
     while True:
         try:
             check_once()
