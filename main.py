@@ -40,6 +40,15 @@ REQUEST_PAUSE  = 0.25
 PING_COOLDOWN_MIN   = 60    # «без изменений»/слабые статусы не чаще 1/час
 STATE_COOLDOWN_MIN  = 5     # одинаковый статус по тикеру — не чаще, чем раз в 5 мин
 
+# ===== Настройки алертов СМЕНЫ ТРЕНДА =====
+TREND_FAST = 50                 # быстрая EMA для тренда
+TREND_SLOW = 200                # медленная EMA для тренда
+TREND_CONFIRM_BARS = 2          # требуемое число подряд баров для подтверждения смены
+TREND_TFS = ["15m", "1h"]       # на каких ТФ следим за сменой тренда
+TREND_ALERT_COOLDOWN_MIN = 15   # минимальная пауза между алертами по одной паре/ТФ
+_last_trend = {}                # (symbol, tf) -> (last_trend, ts_last_alert)
+# ==========================================
+
 # ---------- infra ----------
 app = Flask(__name__)
 @app.route("/")
@@ -147,7 +156,6 @@ def _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=True):
 def bitget_candles(symbol, tf="5m", futures=True, need=NEED_IDEAL+FETCH_BUFFER):
     """
     Сбор длинной истории окнами через /history-candles (узкие окна, много шагов).
-    Если мало — то, что собрали; фолбэк на /candles уже почти не нужен.
     Возвращает [(ts,o,h,l,c,v)] от старых к новым.
     """
     full_symbol = symbol + (FUT_SUFFIX if futures else "")
@@ -181,13 +189,20 @@ def get_close_series(symbol, tf, need=NEED_IDEAL, min_need=NEED_MIN):
     closes=[x[4] for x in c]
     return c, closes
 
-# ---------- логика сигналов ----------
+# ---------- тренд и сигналы ----------
 def trend_dir(closes):
     e50=ema(closes,50); e200=ema(closes,200)
     if math.isnan(e50[-1]) or math.isnan(e200[-1]): return None, e50, e200
     if e50[-1] > e200[-1]:  return "LONG",  e50, e200
     if e50[-1] < e200[-1]:  return "SHORT", e50, e200
     return None, e50, e200
+
+def trend_dir_with_params(closes, fast=TREND_FAST, slow=TREND_SLOW):
+    ef=ema(closes, fast); es=ema(closes, slow)
+    if math.isnan(ef[-1]) or math.isnan(es[-1]): return None, ef, es
+    if ef[-1] > es[-1]:  return "LONG",  ef, es
+    if ef[-1] < es[-1]:  return "SHORT", ef, es
+    return None, ef, es
 
 def strength_pct(e_fast, e_slow, close):
     return abs(e_fast - e_slow)/close
@@ -242,7 +257,36 @@ def analyze_symbol(sym):
         return ("STRONG_SHORT", f"🟪 СИЛЬНЫЙ SHORT {sym}_UMCBL ({now_str})\n{info}")
     return ("WEAK", f"⚪ {sym}_UMCBL: фильтры НЕ собраны\n{info}")
 
-# ---------- анти-спам ----------
+# --- детектор смены тренда на HTF ---
+def detect_trend_change(sym, tf, need, min_need):
+    _, cls = get_close_series(sym, tf, need=need, min_need=min_need)
+    if not cls: return None
+    ef = ema(cls, TREND_FAST)
+    es = ema(cls, TREND_SLOW)
+
+    # подтверждение: последние N баров подряд один и тот же знак
+    states = []
+    for i in range(TREND_CONFIRM_BARS):
+        a = ef[-1 - i]; b = es[-1 - i]
+        if math.isnan(a) or math.isnan(b): return None
+        states.append("LONG" if a > b else "SHORT" if a < b else None)
+    if None in states or not all(s == states[0] for s in states):
+        return None
+    curr = states[0]
+
+    key = (sym, tf)
+    prev, ts_prev = _last_trend.get(key, (None, 0))
+    now = time.time()
+    if prev != curr and (now - ts_prev) >= TREND_ALERT_COOLDOWN_MIN*60:
+        _last_trend[key] = (curr, now)
+        when = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        return f"🔄 Смена тренда {sym}_UMCBL на {tf}: {curr} ({when})"
+    # При первом запуске — фиксируем состояние, но не шлём алерт
+    if prev is None:
+        _last_trend[key] = (curr, now)
+    return None
+
+# ---------- анти-спам и отправка ----------
 _last_state = {}       # symbol -> (state, ts_sent)
 _last_ping_ts = 0
 
@@ -259,6 +303,7 @@ def check_once():
     changed_msgs = []
 
     for s in SYMBOLS:
+        # 1) основной анализ
         try:
             state, text = analyze_symbol(s)
         except Exception as e:
@@ -283,6 +328,16 @@ def check_once():
                 _last_state[s] = (state, now)
                 _last_ping_ts = now
 
+        # 2) алерты смены тренда по выбранным ТФ
+        for tf in TREND_TFS:
+            msg = detect_trend_change(
+                s, tf,
+                need=NEED_MIN if tf in ("15m","1h") else NEED_IDEAL,
+                min_need=NEED_MIN_HTF if tf in ("15m","1h") else NEED_MIN
+            )
+            if msg:
+                changed_msgs.append(msg)
+
     sent = send_changes(changed_msgs)
     if (not sent) and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60):
         dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -291,7 +346,7 @@ def check_once():
 
 def loop():
     if SEND_STARTUP:
-        tg("🤖 Бот запущен: сильные сигналы сразу, нейтралка ≤ 1/ч, UTC-таймштамп в заголовке.")
+        tg("🤖 Бот запущен: сильные сигналы сразу, нейтралка ≤ 1/ч, UTC-таймштамп и алерты смены тренда (15m/1h).")
     while True:
         try:
             check_once()
