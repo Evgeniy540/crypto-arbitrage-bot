@@ -21,18 +21,28 @@ SEND_STARTUP     = True
 
 # ========= ПРЕСЕТЫ (/mode) =========
 PRESETS = {
+    # самый мягкий: максимум сигналов
+    "soft": {
+        "TREND_FAST": 20, "TREND_SLOW": 100, "TREND_CONFIRM_BARS": 1,
+        "TREND_TFS": ["5m","15m"], "TREND_ALERT_COOLDOWN_MIN": 5,
+        "STRENGTH_MIN": 0.0005, "ATR_MIN_PCT": 0.0003, "ATR_MAX_PCT": 0.0300,
+        "RSI_MIN_LONG": 45, "RSI_MAX_SHORT": 55
+    },
+    # агрессивный (чуть жестче soft)
     "aggressive": {
         "TREND_FAST": 20, "TREND_SLOW": 100, "TREND_CONFIRM_BARS": 1,
         "TREND_TFS": ["5m","15m","1h"], "TREND_ALERT_COOLDOWN_MIN": 5,
         "STRENGTH_MIN": 0.0010, "ATR_MIN_PCT": 0.0005, "ATR_MAX_PCT": 0.0300,
         "RSI_MIN_LONG": 48, "RSI_MAX_SHORT": 52
     },
+    # сбалансированный
     "balanced": {
         "TREND_FAST": 50, "TREND_SLOW": 200, "TREND_CONFIRM_BARS": 2,
         "TREND_TFS": ["15m","1h"], "TREND_ALERT_COOLDOWN_MIN": 15,
         "STRENGTH_MIN": 0.0020, "ATR_MIN_PCT": 0.0010, "ATR_MAX_PCT": 0.0150,
         "RSI_MIN_LONG": 50, "RSI_MAX_SHORT": 50
     },
+    # максимально безопасный: мало сигналов, жесткие фильтры
     "safe": {
         "TREND_FAST": 100, "TREND_SLOW": 200, "TREND_CONFIRM_BARS": 3,
         "TREND_TFS": ["1h","4h"], "TREND_ALERT_COOLDOWN_MIN": 30,
@@ -52,7 +62,8 @@ def load_mode() -> str:
         name = open(MODE_FILE, "r", encoding="utf-8").read().strip()
         if name in PRESETS: return name
     except Exception: pass
-    return "balanced"
+    # дефолт сразу мягкий
+    return "soft"
 
 def apply_mode(name: str):
     global TREND_FAST, TREND_SLOW, TREND_CONFIRM_BARS, TREND_TFS, TREND_ALERT_COOLDOWN_MIN
@@ -97,7 +108,7 @@ _last_trend = {}   # (symbol, tf) -> (state, ts)
 # ===== Индивидуальные пороги =====
 OV_FILE = "overrides.json"
 _symbol_overrides = {
-    "BTCUSDT": {"ATR_MIN_PCT": 0.0005}  # 0.05%
+    "BTCUSDT": {"ATR_MIN_PCT": 0.0005}  # 0.05% как пример
 }
 def load_overrides():
     global _symbol_overrides
@@ -390,7 +401,7 @@ def handle_command(chat_id: int, text: str):
         tg_send(chat_id,
             "Команды:\n"
             "/mode — показать режим и пресеты\n"
-            "/mode aggressive|balanced|safe — применить пресет\n"
+            "/mode soft|aggressive|balanced|safe — применить пресет\n"
             "/get <symbol> — показать overrides для монеты (пример: /get btcusdt)\n"
             "/set <symbol> <param> <value> — atr_min|atr_max|strength_min|rsi_min_long|rsi_max_short\n"
             "/overrides — показать все overrides\n"
@@ -399,12 +410,12 @@ def handle_command(chat_id: int, text: str):
 
     if t == "/mode":
         tg_send(chat_id, "Текущие настройки:\n" + format_mode_settings(_current_mode) +
-               "\n\nДоступно: aggressive / balanced / safe\nПример: /mode aggressive"); return
+               "\n\nДоступно: soft / aggressive / balanced / safe\nПример: /mode soft"); return
 
     if t.startswith("/mode "):
         name = t.split(" ",1)[1].strip()
         if name not in PRESETS:
-            tg_send(chat_id, "Неизвестный режим. Доступно: aggressive / balanced / safe"); return
+            tg_send(chat_id, "Неизвестный режим. Доступно: soft / aggressive / balanced / safe"); return
         apply_mode(name); save_mode(name); _current_mode=name
         tg_send(chat_id, "✅ Режим применён.\n" + format_mode_settings(name)); return
 
@@ -523,4 +534,6 @@ if __name__ == "__main__":
 
     threading.Thread(target=run_flask,   daemon=True).start()  # healthcheck
     threading.Thread(target=tg_poll_loop, daemon=True).start() # команды
+
+    # основной цикл
     loop()
