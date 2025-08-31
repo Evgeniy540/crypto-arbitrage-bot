@@ -5,7 +5,7 @@ from flask import Flask
 
 # ==== ТВОИ ДАННЫЕ ====
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
-TELEGRAM_CHAT_ID   = "5723086631"   # можно строкой; в коде сравнивается как int
+TELEGRAM_CHAT_ID   = "5723086631"   # можно строкой
 # =====================
 
 FUT_SUFFIX = "_UMCBL"
@@ -15,7 +15,7 @@ SYMBOLS = [
     "DOTUSDT","OPUSDT","ARBUSDT","APTUSDT","LTCUSDT","PEPEUSDT"
 ]
 
-BASE_TF              = "5m"   # 1m/3m/5m/15m/30m/1h/4h/1d
+BASE_TF              = "5m"
 CHECK_INTERVAL_S     = 300    # проверяем раз в 5 минут
 SEND_STARTUP         = True
 
@@ -77,12 +77,13 @@ def apply_mode(name: str):
 
 def format_mode_settings(name: str) -> str:
     c = PRESETS[name]
-    lines = [
-        f"Режим: {name}",
-        f"TREND: EMA{c['TREND_FAST']}/{c['TREND_SLOW']}, підтверждение={c['TREND_CONFIRM_BARS']} бар(ов), TFs={','.join(c['TREND_TFS'])}, cooldown={c['TREND_ALERT_COOLDOWN_MIN']} м.",
-        f"STRENGTH_MIN={c['STRENGTH_MIN']*100:.2f}% • ATR={c['ATR_MIN_PCT']*100:.2f}%..{c['ATR_MAX_PCT']*100:.2f}% • RSI long≥{c['RSI_MIN_LONG']} / short≤{c['RSI_MAX_SHORT']}"
-    ]
-    return "\n".join(lines)
+    return (
+        f"Режим: {name}\n"
+        f"TREND EMA{c['TREND_FAST']}/{c['TREND_SLOW']}, подтверждение={c['TREND_CONFIRM_BARS']}, "
+        f"TFs={','.join(c['TREND_TFS'])}, cooldown={c['TREND_ALERT_COOLDOWN_MIN']} м.\n"
+        f"Сила≥{c['STRENGTH_MIN']*100:.2f}% • ATR {c['ATR_MIN_PCT']*100:.2f}%..{c['ATR_MAX_PCT']*100:.2f}% • "
+        f"RSI long≥{c['RSI_MIN_LONG']} / short≤{c['RSI_MAX_SHORT']}"
+    )
 
 # ===== Значения по умолчанию (будут перезаписаны apply_mode(load_mode())) =====
 RSI_MIN_LONG  = 50
@@ -92,9 +93,9 @@ ATR_MIN_PCT   = 0.0010   # 0.10%
 ATR_MAX_PCT   = 0.0150   # 1.50%
 
 # История/окна (умный режим)
-NEED_IDEAL     = 210       # цель для 5m
-NEED_MIN       = 120       # минимум для 5m
-NEED_MIN_HTF   = 60        # минимум для 15m/1h
+NEED_IDEAL     = 210
+NEED_MIN       = 120
+NEED_MIN_HTF   = 60
 FETCH_BUFFER   = 60
 STEP_BARS      = 100
 MAX_WINDOWS    = 30
@@ -103,15 +104,47 @@ REQUEST_PAUSE  = 0.25
 
 # Анти-спам
 PING_COOLDOWN_MIN   = 60    # «без изменений»/слабые статусы не чаще 1/час
-STATE_COOLDOWN_MIN  = 5     # одинаковый статус по тикеру — не чаще, чем раз в 5 мин
+STATE_COOLDOWN_MIN  = 5     # одинаковый статус по тикеру — не чаще 5 мин
 
-# ===== Настройки алертов СМЕНЫ ТРЕНДА (будут перезаписаны пресетом) =====
+# ===== Настройки алертов СМЕНЫ ТРЕНДА (перезаписываются пресетом) =====
 TREND_FAST = 50
 TREND_SLOW = 200
 TREND_CONFIRM_BARS = 2
 TREND_TFS = ["15m","1h"]
 TREND_ALERT_COOLDOWN_MIN = 15
 _last_trend = {}  # (symbol, tf) -> (last_trend, ts_last_alert)
+
+# ===== Адресные пороги по тикерам =====
+OV_FILE = "overrides.json"
+DEFAULT_OVERRIDES = {
+    # BTC: снижаем нижний порог ATR до 0.05%
+    "BTCUSDT": {"ATR_MIN_PCT": 0.0005}
+}
+_symbol_overrides = {}
+
+def load_overrides():
+    global _symbol_overrides
+    _symbol_overrides = dict(DEFAULT_OVERRIDES)
+    try:
+        if os.path.exists(OV_FILE):
+            with open(OV_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if isinstance(v, dict):
+                            _symbol_overrides.setdefault(k, {}).update(v)
+    except Exception:
+        pass
+
+def save_overrides():
+    try:
+        with open(OV_FILE, "w", encoding="utf-8") as f:
+            json.dump(_symbol_overrides, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def param_for(sym: str, name: str, default_value):
+    return _symbol_overrides.get(sym, {}).get(name, default_value)
 
 # ---------- infra ----------
 app = Flask(__name__)
@@ -127,6 +160,15 @@ def tg(text: str):
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": int(TELEGRAM_CHAT_ID), "text": text}, timeout=10
+        )
+    except Exception:
+        pass
+
+def tg_send(chat_id: int, text: str):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": int(chat_id), "text": text}, timeout=10
         )
     except Exception:
         pass
@@ -211,7 +253,7 @@ def _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=True):
     r = requests.get(base, params=params, headers=headers, timeout=15)
     r.raise_for_status()
     js = r.json()
-    if isinstance(js, list):  # некоторые регионы/прокси отдают сразу массив
+    if isinstance(js, list):
         return _parse_rows(js)
     if isinstance(js, dict) and js.get("code") == "00000" and "data" in js:
         return _parse_rows(js["data"])
@@ -219,7 +261,7 @@ def _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=True):
 
 def bitget_candles(symbol, tf="5m", futures=True, need=NEED_IDEAL+FETCH_BUFFER):
     """
-    Сбор длинной истории окнами через /history-candles (узкие окна, много шагов).
+    Сбор длинной истории окнами через /history-candles.
     Возвращает [(ts,o,h,l,c,v)] от старых к новым.
     """
     full_symbol = symbol + (FUT_SUFFIX if futures else "")
@@ -234,20 +276,19 @@ def bitget_candles(symbol, tf="5m", futures=True, need=NEED_IDEAL+FETCH_BUFFER):
         try:
             part = _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=futures)
             for ts,o,h,l,c,v in part:
-                all_rows[ts] = (ts,o,h,l,c,v)  # де-дупликация
+                all_rows[ts] = (ts,o,h,l,c,v)
         except Exception:
             break
         end_ms = start_ms - 1
         time.sleep(REQUEST_PAUSE)
 
     rows = sorted(all_rows.values(), key=lambda x: x[0])
-    return rows  # «умный» сбор: дальше режем в get_close_series
+    return rows
 
 def get_close_series(symbol, tf, need=NEED_IDEAL, min_need=NEED_MIN):
     c = bitget_candles(symbol, tf=tf, futures=True, need=need+FETCH_BUFFER)
     if not c or len(c) < min_need:
         return [], []
-    # режем лишнее по потолку
     if len(c) > min(MAX_TOTAL_BARS, need + FETCH_BUFFER):
         c = c[-(need+FETCH_BUFFER):]
     closes=[x[4] for x in c]
@@ -260,13 +301,6 @@ def trend_dir(closes):
     if e50[-1] > e200[-1]:  return "LONG",  e50, e200
     if e50[-1] < e200[-1]:  return "SHORT", e50, e200
     return None, e50, e200
-
-def trend_dir_with_params(closes, fast, slow):
-    ef=ema(closes, fast); es=ema(closes, slow)
-    if math.isnan(ef[-1]) or math.isnan(es[-1]): return None, ef, es
-    if ef[-1] > es[-1]:  return "LONG",  ef, es
-    if ef[-1] < es[-1]:  return "SHORT", ef, es
-    return None, ef, es
 
 def strength_pct(e_fast, e_slow, close):
     return abs(e_fast - e_slow)/close
@@ -286,7 +320,7 @@ def analyze_symbol(sym):
     strength = strength_pct(e50_5[-1], e200_5[-1], close5)
     atrp     = atr_pct(c5,14)
 
-    # старшие ТФ с меньшим минимумом
+    # старшие ТФ
     _, cls15 = get_close_series(sym, "15m", need=NEED_MIN, min_need=NEED_MIN_HTF)
     _, cls1h = get_close_series(sym, "1h",  need=NEED_MIN, min_need=NEED_MIN_HTF)
     dir15, _, _ = trend_dir(cls15) if cls15 else (None, [], [])
@@ -297,24 +331,29 @@ def analyze_symbol(sym):
     t15_ok_short = (dir15 == "SHORT")
     t1h_ok_short = (dir1h == "SHORT")
 
+    # --- локальные пороги с учётом overrides
+    atr_min       = param_for(sym, "ATR_MIN_PCT", ATR_MIN_PCT)
+    atr_max       = param_for(sym, "ATR_MAX_PCT", ATR_MAX_PCT)
+    strength_min  = param_for(sym, "STRENGTH_MIN", STRENGTH_MIN)
+    rsi_min_long  = param_for(sym, "RSI_MIN_LONG", RSI_MIN_LONG)
+    rsi_max_short = param_for(sym, "RSI_MAX_SHORT", RSI_MAX_SHORT)
+
     filters_long = (
         dir5 == "LONG" and t15_ok_long and t1h_ok_long and
-        strength >= STRENGTH_MIN and rsi5[-1] >= RSI_MIN_LONG and
-        (not math.isnan(atrp) and ATR_MIN_PCT <= atrp <= ATR_MAX_PCT)
+        strength >= strength_min and rsi5[-1] >= rsi_min_long and
+        (not math.isnan(atrp) and atr_min <= atrp <= atr_max)
     )
     filters_short = (
         dir5 == "SHORT" and t15_ok_short and t1h_ok_short and
-        strength >= STRENGTH_MIN and rsi5[-1] <= RSI_MAX_SHORT and
-        (not math.isnan(atrp) and ATR_MIN_PCT <= atrp <= ATR_MAX_PCT)
+        strength >= strength_min and rsi5[-1] <= rsi_max_short and
+        (not math.isnan(atrp) and atr_min <= atrp <= atr_max)
     )
 
     info = (f"Цена: {round(close5,6)} • {BASE_TF}: {dir5}\n"
             f"RSI={round(rsi5[-1],1)} • ATR={round(atrp*100,2)}% • "
             f"Сила={round(strength*100,2)}% • EMA50/200 OK")
 
-    # таймштамп UTC в заголовок сильного сигнала
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
-
     if filters_long:
         return ("STRONG_LONG", f"🟩 СИЛЬНЫЙ LONG {sym}_UMCBL ({now_str})\n{info}")
     if filters_short:
@@ -328,14 +367,12 @@ def detect_trend_change(sym, tf, need, min_need):
     ef = ema(cls, TREND_FAST)
     es = ema(cls, TREND_SLOW)
 
-    # подтверждение: последние N баров подряд один и тот же знак
     states = []
     for i in range(TREND_CONFIRM_BARS):
         a = ef[-1 - i]; b = es[-1 - i]
         if math.isnan(a) or math.isnan(b): return None
         states.append("LONG" if a > b else "SHORT" if a < b else None)
-    if None in states or not all(s == states[0] for s in states):
-        return None
+    if None in states or not all(s == states[0] for s in states): return None
     curr = states[0]
 
     key = (sym, tf)
@@ -345,7 +382,6 @@ def detect_trend_change(sym, tf, need, min_need):
         _last_trend[key] = (curr, now)
         when = datetime.now(timezone.utc).strftime("%H:%M UTC")
         return f"🔄 Смена тренда {sym}_UMCBL на {tf}: {curr} ({when})"
-    # При первом запуске — фиксируем состояние, но не шлём алерт
     if prev is None:
         _last_trend[key] = (curr, now)
     return None
@@ -380,13 +416,11 @@ def check_once():
                 changed_msgs.append(text)
                 _last_state[s] = (state, now)
         elif state == "WEAK":
-            # слабые/нейтральные — максимум раз в час
             if (state != last_state and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60)):
                 changed_msgs.append(text)
                 _last_state[s] = (state, now)
                 _last_ping_ts = now
         else:
-            # NO_DATA / ERR — тоже не чаще 1/час
             if (state != last_state and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60)):
                 changed_msgs.append(text)
                 _last_state[s] = (state, now)
@@ -408,50 +442,74 @@ def check_once():
         tg(f"ℹ️ Без изменений по фильтрам ({BASE_TF}) — {dt}\n⏳ Следующая проверка через {CHECK_INTERVAL_S//60} минут")
         _last_ping_ts = now
 
-# ---------- Telegram команды (/mode, /help) ----------
-def tg_send(chat_id: int, text: str):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text}, timeout=10
-        )
-    except Exception:
-        pass
-
+# ---------- Telegram команды ----------
 def handle_command(chat_id: int, text: str):
     global _current_mode
-    if chat_id != int(TELEGRAM_CHAT_ID):
+    if int(chat_id) != int(TELEGRAM_CHAT_ID):
         tg_send(chat_id, "⛔ Нет доступа.")
         return
     t = (text or "").strip().lower()
-    if t == "/help" or t == "/start":
+
+    if t in ("/help", "/start"):
         tg_send(chat_id,
             "Команды:\n"
-            "/mode — показать режим и доступные пресеты\n"
-            "/mode aggressive — включить агрессивный режим\n"
-            "/mode balanced — включить сбалансированный режим\n"
-            "/mode safe — включить консервативный режим"
-        )
-        return
+            "/mode — показать режим и пресеты\n"
+            "/mode aggressive|balanced|safe — применить пресет\n"
+            "/get <symbol> — показать overrides для монеты (пример: /get btcusdt)\n"
+            "/set <symbol> <param> <value> — задать override, параметры: atr_min, atr_max, strength_min, rsi_min_long, rsi_max_short\n"
+            "/overrides — показать все overrides"
+        ); return
+
     if t == "/mode":
-        msg = "Текущие настройки:\n" + format_mode_settings(_current_mode) + \
-              "\n\nДоступно: aggressive / balanced / safe\nПример: /mode aggressive"
-        tg_send(chat_id, msg)
-        return
+        tg_send(chat_id, "Текущие настройки:\n" + format_mode_settings(_current_mode) +
+               "\n\nДоступно: aggressive / balanced / safe\nПример: /mode aggressive"); return
+
     if t.startswith("/mode "):
-        name = t.split(" ", 1)[1].strip()
+        name = t.split(" ",1)[1].strip()
         if name not in PRESETS:
-            tg_send(chat_id, "Неизвестный режим. Доступно: aggressive / balanced / safe")
-            return
-        apply_mode(name)
-        save_mode(name)
-        _current_mode = name
-        tg_send(chat_id, "✅ Режим применён.\n" + format_mode_settings(name))
+            tg_send(chat_id, "Неизвестный режим. Доступно: aggressive / balanced / safe"); return
+        apply_mode(name); save_mode(name); _current_mode = name
+        tg_send(chat_id, "✅ Режим применён.\n" + format_mode_settings(name)); return
+
+    if t.startswith("/get "):
+        sym = t.split(" ",1)[1].strip().upper()
+        data = _symbol_overrides.get(sym, {})
+        if not data: tg_send(chat_id, f"{sym}: overrides не заданы"); return
+        tg_send(chat_id, f"{sym} overrides:\n" + json.dumps(data, ensure_ascii=False, indent=2)); return
+
+    if t == "/overrides":
+        tg_send(chat_id, "Overrides:\n" + json.dumps(_symbol_overrides, ensure_ascii=False, indent=2)); return
+
+    if t.startswith("/set "):
+        # /set btcusdt atr_min 0.0005
+        try:
+            _, rest = text.split(" ", 1)
+            parts = rest.strip().split()
+            sym = parts[0].upper()
+            p = parts[1].lower()
+            val = float(parts[2])
+            mapping = {
+                "atr_min": "ATR_MIN_PCT",
+                "atr_max": "ATR_MAX_PCT",
+                "strength_min": "STRENGTH_MIN",
+                "rsi_min_long": "RSI_MIN_LONG",
+                "rsi_max_short": "RSI_MAX_SHORT",
+            }
+            if p not in mapping: raise ValueError("param")
+            key = mapping[p]
+            _symbol_overrides.setdefault(sym, {})[key] = val
+            save_overrides()
+            tg_send(chat_id, f"✅ Установлено: {sym}.{key} = {val}")
+        except Exception:
+            tg_send(chat_id, "Формат: /set <symbol> <param> <value>\n"
+                             "param: atr_min | atr_max | strength_min | rsi_min_long | rsi_max_short\n"
+                             "пример: /set btcusdt atr_min 0.0005")
         return
+
     tg_send(chat_id, "Неизвестная команда. Напиши /help")
 
 def tg_poll_loop():
-    """Лонг-поллинг Telegram для команд /mode (без вебхука)."""
+    """Лонг-поллинг Telegram для команд (без вебхука)."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     last_update_id = None
     while True:
@@ -468,8 +526,7 @@ def tg_poll_loop():
                 last_update_id = upd.get("update_id", last_update_id)
                 msg = upd.get("message") or upd.get("edited_message")
                 if not msg: continue
-                chat = msg.get("chat", {})
-                chat_id = chat.get("id")
+                chat_id = msg.get("chat", {}).get("id")
                 text = msg.get("text", "")
                 if text and chat_id:
                     handle_command(int(chat_id), text)
@@ -489,12 +546,14 @@ def loop():
 
 # ====== STARTUP ======
 if __name__ == "__main__":
-    # загрузить и применить режим
+    # загрузить overrides и режим
+    load_overrides()
     _current_mode = load_mode()
     apply_mode(_current_mode)
 
-    # стартуем Flask (healthcheck) + polling команд
+    # фоновые потоки: Flask healthcheck + Telegram команды
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=tg_poll_loop, daemon=True).start()
+
     # основной цикл
     loop()
