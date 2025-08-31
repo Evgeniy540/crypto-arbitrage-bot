@@ -26,12 +26,16 @@ STRENGTH_MIN  = 0.0020
 ATR_MIN_PCT   = 0.0030
 ATR_MAX_PCT   = 0.0150
 
-# История (сколько хотим баров на расчёт индикаторов)
-NEED_BARS = 210          # минимум для EMA200/RSI14
-FETCH_BUFFER = 70        # запас, чтобы EMA были «гладкими»
-MAX_TOTAL_BARS = 600     # жёсткий потолок истории
-STEP_BARS = 240          # шаг окна при сборе истории (≈ сколько баров берём за один запрос)
-REQUEST_PAUSE = 0.2      # сек, пауза между запросами (уважительно к API)
+# Требования по истории
+NEED_IDEAL = 210     # «идеально» для EMA200/RSI14
+NEED_MIN   = 120     # «умный минимум»: работаем, если >= 120
+FETCH_BUFFER = 60    # запас к need, чтобы EMA были гладкими
+
+# Параметры догрузки истории
+STEP_BARS       = 100     # сколько баров затягиваем за один шаг окна
+MAX_WINDOWS     = 30      # максимум шагов назад (≈ до 3000 баров запрошено)
+MAX_TOTAL_BARS  = 1000    # жёсткий потолок на массив истории
+REQUEST_PAUSE   = 0.25    # сек пауза между запросами /history-candles
 
 # ---------- infra ----------
 app = Flask(__name__)
@@ -123,7 +127,7 @@ def _parse_rows(rows):
     return out
 
 def _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=True):
-    """Один запрос к /history-candles. Возвращает список [(ts, o,h,l,c,v)] или []."""
+    """Один запрос к /history-candles. Возвращает [(ts,o,h,l,c,v)] или []."""
     base = "https://api.bitget.com/api/mix/v1/market/history-candles" if futures \
            else "https://api.bitget.com/api/spot/v1/market/history-candles"
     headers = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
@@ -142,68 +146,73 @@ def _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=True):
         return _parse_rows(js["data"])
     return []
 
-def bitget_candles(symbol, tf="5m", futures=True, need=NEED_BARS+FETCH_BUFFER):
+def bitget_candles(symbol, tf="5m", futures=True, need=NEED_IDEAL+FETCH_BUFFER):
     """
-    Сбор длинной истории окнами через /history-candles.
-    Если не удаётся — фолбэк на /candles (limit).
-    Выход: [(ts,o,h,l,c,v)] от старых к новым.
+    Сбор длинной истории окнами через /history-candles (узкие окна, много шагов).
+    Если не удалось — фолбэк на /candles.
+    Возвращает [(ts,o,h,l,c,v)] от старых к новым.
     """
     full_symbol = symbol + (FUT_SUFFIX if futures else "")
     gran_s   = _granularity_sec(tf)
 
     end_ms = int(time.time() * 1000)
     all_rows = {}
-    total_needed = min(MAX_TOTAL_BARS, max(need, NEED_BARS+FETCH_BUFFER))
+    total_target = min(MAX_TOTAL_BARS, max(need, NEED_IDEAL+FETCH_BUFFER))
     step_ms = STEP_BARS * gran_s * 1000
 
-    # 1) Идём назад окнами, пока не соберём достаточно баров.
-    attempts = 0
-    while len(all_rows) < total_needed and attempts < 12:  # максимум 12 окон
+    # 1) Идём назад окнами
+    for _ in range(MAX_WINDOWS):
         start_ms = max(0, end_ms - step_ms)
         try:
             part = _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=futures)
             for ts,o,h,l,c,v in part:
-                all_rows[ts] = (ts,o,h,l,c,v)   # защита от дублей
-        except requests.HTTPError as he:
-            # если 4xx/5xx — попробуем позже через /candles
-            break
+                all_rows[ts] = (ts,o,h,l,c,v)  # де-дупликация
         except Exception:
-            # сеть/парсинг — тоже прервём цикл, перейдём к фолбэку
+            # при ошибке просто выходим к фолбэку
             break
 
-        attempts += 1
-        end_ms = start_ms - 1     # двигаем окно назад
-        time.sleep(REQUEST_PAUSE) # не спамим API
+        if len(all_rows) >= total_target:
+            break
+
+        end_ms = start_ms - 1
+        time.sleep(REQUEST_PAUSE)
 
     rows = sorted(all_rows.values(), key=lambda x: x[0])
-    if len(rows) >= NEED_BARS:   # достаточно истории
-        return rows[-total_needed:] if len(rows) > total_needed else rows
+    if len(rows) >= NEED_MIN:
+        # режем по потолку, чтобы не раздувать память
+        return rows[-total_target:] if len(rows) > total_target else rows
 
-    # 2) Фолбэк: /candles (быстро, но короче)
+    # 2) Фолбэк: /candles (limit)
     base_cand = "https://api.bitget.com/api/mix/v1/market/candles" if futures \
                 else "https://api.bitget.com/api/spot/v1/market/candles"
     headers = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
     params = {
         "symbol": full_symbol,
         "granularity": str(gran_s),
-        "limit": str(min(total_needed, 600))  # часто позволяет до ~600
+        "limit": str(min(total_target, 600))  # обычно до 600 баров
     }
     r2 = requests.get(base_cand, params=params, headers=headers, timeout=15)
     r2.raise_for_status()
     js2 = r2.json()
     if isinstance(js2, list):
-        return _parse_rows(js2)
-    if isinstance(js2, dict) and "data" in js2:
-        return _parse_rows(js2["data"])
+        rows2 = _parse_rows(js2)
+    elif isinstance(js2, dict) and "data" in js2:
+        rows2 = _parse_rows(js2["data"])
+    else:
+        rows2 = []
 
-    return rows  # что собрали
+    # если у нас совместно (история + фолбэк) >= NEED_MIN — используем
+    merged = sorted({x[0]:x for x in rows + rows2}.values(), key=lambda x: x[0])
+    return merged[-total_target:] if len(merged) >= NEED_MIN else merged
 
-def get_close_series(symbol, tf, need=NEED_BARS):
+def get_close_series(symbol, tf, need=NEED_IDEAL):
+    # просим «идеал», но работать будем от NEED_MIN
     c = bitget_candles(symbol, tf=tf, futures=True, need=need+FETCH_BUFFER)
-    if not c: return [], []
-    if len(c) > need + FETCH_BUFFER:
+    if not c or len(c) < NEED_MIN:   # меньше 120 — реально недостаточно
+        return [], []
+    # если баров меньше идеала — тоже ок, просто считаем на том, что есть
+    if len(c) > min(MAX_TOTAL_BARS, need + FETCH_BUFFER):
         c = c[-(need+FETCH_BUFFER):]
-    if len(c) < need: return [], []
     closes=[x[4] for x in c]
     return c, closes
 
@@ -219,7 +228,7 @@ def strength_pct(e_fast, e_slow, close):
     return abs(e_fast - e_slow)/close
 
 def analyze_symbol(sym):
-    c5, cls5 = get_close_series(sym, BASE_TF, need=NEED_BARS)
+    c5, cls5 = get_close_series(sym, BASE_TF, need=NEED_IDEAL)
     if not cls5: return f"{sym}_UMCBL: недостаточно данных на {BASE_TF}"
 
     e50_5 = ema(cls5, 50); e200_5 = ema(cls5, 200)
@@ -232,8 +241,9 @@ def analyze_symbol(sym):
     strength = strength_pct(e50_5[-1], e200_5[-1], close5)
     atrp     = atr_pct(c5,14)
 
-    _, cls15 = get_close_series(sym, "15m", need=NEED_BARS)
-    _, cls1h = get_close_series(sym, "1h",  need=NEED_BARS)
+    # контроль тренда на старших ТФ — тоже в «умном» режиме
+    _, cls15 = get_close_series(sym, "15m", need=NEED_MIN)
+    _, cls1h = get_close_series(sym, "1h",  need=NEED_MIN)
     dir15, _, _ = trend_dir(cls15) if cls15 else (None, [], [])
     dir1h, _, _ = trend_dir(cls1h) if cls1h else (None, [], [])
 
@@ -293,7 +303,7 @@ def check_once():
 
 def loop():
     if SEND_STARTUP:
-        tg("🤖 Бот запущен (EMA50/200 + RSI + ATR; история собирается окнами).")
+        tg("🤖 Бот запущен (умный сбор истории: окна 100 баров, минимум 120 баров для расчёта).")
     while True:
         try:
             check_once()
