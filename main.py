@@ -15,27 +15,30 @@ SYMBOLS = [
     "DOTUSDT","OPUSDT","ARBUSDT","APTUSDT","LTCUSDT","PEPEUSDT"
 ]
 
-BASE_TF          = "5m"   # 1m / 3m / 5m / 15m / 30m / 1h / 4h / 1d
-CHECK_INTERVAL_S = 60
-SEND_STARTUP     = True
+BASE_TF              = "5m"   # 1m/3m/5m/15m/30m/1h/4h/1d
+CHECK_INTERVAL_S     = 300    # 🔕 проверяем раз в 5 минут
+SEND_STARTUP         = True
 
 # Пороги фильтров
 RSI_MIN_LONG  = 50
 RSI_MAX_SHORT = 50
-STRENGTH_MIN  = 0.0020
-ATR_MIN_PCT   = 0.0030
-ATR_MAX_PCT   = 0.0150
+STRENGTH_MIN  = 0.0020   # 0.20%
+ATR_MIN_PCT   = 0.0010   # 🔽 0.10%
+ATR_MAX_PCT   = 0.0150   # 1.50%
 
-# Требования по истории
-NEED_IDEAL = 210     # «идеально» для EMA200/RSI14
-NEED_MIN   = 120     # «умный минимум»: работаем, если >= 120
-FETCH_BUFFER = 60    # запас к need, чтобы EMA были гладкими
+# История/окна (умный режим)
+NEED_IDEAL     = 210       # цель для 5m
+NEED_MIN       = 120       # минимум для 5m
+NEED_MIN_HTF   = 60        # 🔽 минимум для 15m/1h
+FETCH_BUFFER   = 60
+STEP_BARS      = 100
+MAX_WINDOWS    = 30
+MAX_TOTAL_BARS = 1000
+REQUEST_PAUSE  = 0.25
 
-# Параметры догрузки истории
-STEP_BARS       = 100     # сколько баров затягиваем за один шаг окна
-MAX_WINDOWS     = 30      # максимум шагов назад (≈ до 3000 баров запрошено)
-MAX_TOTAL_BARS  = 1000    # жёсткий потолок на массив истории
-REQUEST_PAUSE   = 0.25    # сек пауза между запросами /history-candles
+# Анти-спам
+PING_COOLDOWN_MIN   = 60    # не пинговать «без изменений» чаще раза в час
+STATE_COOLDOWN_MIN  = 5     # не повторять одинаковый статус чаще, чем раз в 5 мин
 
 # ---------- infra ----------
 app = Flask(__name__)
@@ -113,9 +116,8 @@ def _granularity_sec(tf: str) -> int:
     return int(_granularity(tf))
 
 def _parse_rows(rows):
-    """rows -> [(ts,o,h,l,c,v)] от старых к новым"""
     rows = list(rows)
-    rows.reverse()  # API отдаёт от новых к старым
+    rows.reverse()  # от новых к старым -> в хронологию
     out=[]
     for R in rows:
         try:
@@ -127,7 +129,6 @@ def _parse_rows(rows):
     return out
 
 def _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=True):
-    """Один запрос к /history-candles. Возвращает [(ts,o,h,l,c,v)] или []."""
     base = "https://api.bitget.com/api/mix/v1/market/history-candles" if futures \
            else "https://api.bitget.com/api/spot/v1/market/history-candles"
     headers = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
@@ -147,11 +148,6 @@ def _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=True):
     return []
 
 def bitget_candles(symbol, tf="5m", futures=True, need=NEED_IDEAL+FETCH_BUFFER):
-    """
-    Сбор длинной истории окнами через /history-candles (узкие окна, много шагов).
-    Если не удалось — фолбэк на /candles.
-    Возвращает [(ts,o,h,l,c,v)] от старых к новым.
-    """
     full_symbol = symbol + (FUT_SUFFIX if futures else "")
     gran_s   = _granularity_sec(tf)
 
@@ -160,15 +156,13 @@ def bitget_candles(symbol, tf="5m", futures=True, need=NEED_IDEAL+FETCH_BUFFER):
     total_target = min(MAX_TOTAL_BARS, max(need, NEED_IDEAL+FETCH_BUFFER))
     step_ms = STEP_BARS * gran_s * 1000
 
-    # 1) Идём назад окнами
     for _ in range(MAX_WINDOWS):
         start_ms = max(0, end_ms - step_ms)
         try:
             part = _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=futures)
             for ts,o,h,l,c,v in part:
-                all_rows[ts] = (ts,o,h,l,c,v)  # де-дупликация
+                all_rows[ts] = (ts,o,h,l,c,v)
         except Exception:
-            # при ошибке просто выходим к фолбэку
             break
 
         if len(all_rows) >= total_target:
@@ -179,17 +173,16 @@ def bitget_candles(symbol, tf="5m", futures=True, need=NEED_IDEAL+FETCH_BUFFER):
 
     rows = sorted(all_rows.values(), key=lambda x: x[0])
     if len(rows) >= NEED_MIN:
-        # режем по потолку, чтобы не раздувать память
         return rows[-total_target:] if len(rows) > total_target else rows
 
-    # 2) Фолбэк: /candles (limit)
+    # Фолбэк: /candles (limit)
     base_cand = "https://api.bitget.com/api/mix/v1/market/candles" if futures \
                 else "https://api.bitget.com/api/spot/v1/market/candles"
     headers = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
     params = {
         "symbol": full_symbol,
         "granularity": str(gran_s),
-        "limit": str(min(total_target, 600))  # обычно до 600 баров
+        "limit": str(min(total_target, 600))
     }
     r2 = requests.get(base_cand, params=params, headers=headers, timeout=15)
     r2.raise_for_status()
@@ -200,23 +193,19 @@ def bitget_candles(symbol, tf="5m", futures=True, need=NEED_IDEAL+FETCH_BUFFER):
         rows2 = _parse_rows(js2["data"])
     else:
         rows2 = []
-
-    # если у нас совместно (история + фолбэк) >= NEED_MIN — используем
     merged = sorted({x[0]:x for x in rows + rows2}.values(), key=lambda x: x[0])
     return merged[-total_target:] if len(merged) >= NEED_MIN else merged
 
-def get_close_series(symbol, tf, need=NEED_IDEAL):
-    # просим «идеал», но работать будем от NEED_MIN
+def get_close_series(symbol, tf, need=NEED_IDEAL, min_need=NEED_MIN):
     c = bitget_candles(symbol, tf=tf, futures=True, need=need+FETCH_BUFFER)
-    if not c or len(c) < NEED_MIN:   # меньше 120 — реально недостаточно
+    if not c or len(c) < min_need:
         return [], []
-    # если баров меньше идеала — тоже ок, просто считаем на том, что есть
     if len(c) > min(MAX_TOTAL_BARS, need + FETCH_BUFFER):
         c = c[-(need+FETCH_BUFFER):]
     closes=[x[4] for x in c]
     return c, closes
 
-# ---------- логика ----------
+# ---------- логика сигналов ----------
 def trend_dir(closes):
     e50=ema(closes,50); e200=ema(closes,200)
     if math.isnan(e50[-1]) or math.isnan(e200[-1]): return None, e50, e200
@@ -228,22 +217,23 @@ def strength_pct(e_fast, e_slow, close):
     return abs(e_fast - e_slow)/close
 
 def analyze_symbol(sym):
-    c5, cls5 = get_close_series(sym, BASE_TF, need=NEED_IDEAL)
-    if not cls5: return f"{sym}_UMCBL: недостаточно данных на {BASE_TF}"
+    # базовый ТФ
+    c5, cls5 = get_close_series(sym, BASE_TF, need=NEED_IDEAL, min_need=NEED_MIN)
+    if not cls5: return ("NO_DATA", f"{sym}_UMCBL: недостаточно данных на {BASE_TF}")
 
     e50_5 = ema(cls5, 50); e200_5 = ema(cls5, 200)
     rsi5  = rsi(cls5, 14)
     if math.isnan(e200_5[-1]) or math.isnan(rsi5[-1]):
-        return f"{sym}_UMCBL: недостаточно данных для индикаторов ({BASE_TF})"
+        return ("NO_DATA", f"{sym}_UMCBL: недостаточно данных для индикаторов ({BASE_TF})")
 
     close5   = cls5[-1]
     dir5     = "LONG" if e50_5[-1] > e200_5[-1] else "SHORT"
     strength = strength_pct(e50_5[-1], e200_5[-1], close5)
     atrp     = atr_pct(c5,14)
 
-    # контроль тренда на старших ТФ — тоже в «умном» режиме
-    _, cls15 = get_close_series(sym, "15m", need=NEED_MIN)
-    _, cls1h = get_close_series(sym, "1h",  need=NEED_MIN)
+    # тренды на 15m/1h — с меньшим минимумом
+    _, cls15 = get_close_series(sym, "15m", need=NEED_MIN, min_need=NEED_MIN_HTF)
+    _, cls1h = get_close_series(sym, "1h",  need=NEED_MIN, min_need=NEED_MIN_HTF)
     dir15, _, _ = trend_dir(cls15) if cls15 else (None, [], [])
     dir1h, _, _ = trend_dir(cls1h) if cls1h else (None, [], [])
 
@@ -267,43 +257,68 @@ def analyze_symbol(sym):
     possible_short = (dir5 == "SHORT" and strength < STRENGTH_MIN and rsi5[-1] <= RSI_MAX_SHORT)
 
     trend_str = f"Тренды 15m/1h: " \
-                f"{'OK' if (dir15=='LONG') else '–'}/{ 'OK' if (dir1h=='LONG') else '–' } (для LONG); " \
-                f"{'OK' if (dir15=='SHORT') else '–'}/{ 'OK' if (dir1h=='SHORT') else '–' } (для SHORT)"
+                f"{'OK' if t15_ok_long else '–'}/{ 'OK' if t1h_ok_long else '–' } (для LONG); " \
+                f"{'OK' if t15_ok_short else '–'}/{ 'OK' if t1h_ok_short else '–' } (для SHORT)"
 
     info = (f"Цена: {round(close5,6)} • {BASE_TF}: {dir5}\n"
             f"{trend_str}\n"
             f"Сила={round(strength*100,2)}% (≥ {STRENGTH_MIN*100:.2f}%) • "
-            f"RSI(14)={round(rsi5[-1],1)} • ATR={round(atrp*100,2)}% в коридоре • "
-            f"EMA50/EMA200 OK")
+            f"RSI(14)={round(rsi5[-1],1)} • ATR={round(atrp*100,2)}% • EMA50/EMA200 OK")
 
-    msgs=[]
+    # Статус для анти-спама
     if filters_green_long:
-        msgs.append(f"🟢 {sym}_UMCBL: фильтры ЗЕЛЁНЫЕ (LONG)\n{info}")
+        return ("STRONG_LONG", f"🟩 СИЛЬНЫЙ LONG по {sym}_UMCBL\n{info}")
     if filters_green_short:
-        msgs.append(f"🟣 {sym}_UMCBL: фильтры ЗЕЛЁНЫЕ (SHORT)\n{info}")
-    if not msgs and possible_long:
-        msgs.append(f"⚡ Возможно вход LONG по {sym}_UMCBL\n{info}\n⌛ ждём подтверждения кросса EMA ↑")
-    if not msgs and possible_short:
-        msgs.append(f"⚡ Возможно вход SHORT по {sym}_UMCBL\n{info}\n⌛ ждём подтверждения кросса EMA ↓")
-    if not msgs:
-        msgs.append(f"⚪ {sym}_UMCBL: фильтры НЕ собраны\n{info}")
-    return "\n".join(msgs)
+        return ("STRONG_SHORT", f"🟪 СИЛЬНЫЙ SHORT по {sym}_UMCBL\n{info}")
+    if possible_long:
+        return ("POSSIBLE_LONG", f"⚡ Возможно вход LONG по {sym}_UMCBL\n{info}\n⌛ ждём подтверждения EMA ↑")
+    if possible_short:
+        return ("POSSIBLE_SHORT", f"⚡ Возможно вход SHORT по {sym}_UMCBL\n{info}\n⌛ ждём подтверждения EMA ↓")
+    return ("NEUTRAL", f"⚪ {sym}_UMCBL: фильтры НЕ собраны\n{info}")
+
+# ---------- анти-спам отправка ----------
+_last_state = {}       # symbol -> (state, ts_sent)
+_last_ping_ts = 0
+
+def send_changes(batch_msgs):
+    if not batch_msgs: 
+        return False
+    dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    tg("📊 Обновления (" + BASE_TF + ") — " + dt + "\n" + "\n\n".join(batch_msgs))
+    return True
 
 def check_once():
-    lines=[]
+    global _last_ping_ts
+    now = time.time()
+    changed_msgs = []
+
     for s in SYMBOLS:
         try:
-            lines.append(analyze_symbol(s))
+            state, text = analyze_symbol(s)
         except requests.HTTPError as he:
-            lines.append(f"{s}_UMCBL: HTTP ошибка — {he}")
+            state, text = ("ERROR", f"{s}_UMCBL: HTTP ошибка — {he}")
         except Exception as e:
-            lines.append(f"{s}_UMCBL: ошибка данных — {e}")
-    dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    tg("📊 Фильтры (" + BASE_TF + ") — " + dt + "\n" + "\n\n".join(lines))
+            state, text = ("ERROR", f"{s}_UMCBL: ошибка данных — {e}")
+
+        last = _last_state.get(s, (None, 0))
+        last_state, last_ts = last
+
+        # отправляем, если сменился статус или прошло N минут
+        if (state != last_state) or (now - last_ts >= STATE_COOLDOWN_MIN*60) or (state in ("STRONG_LONG","STRONG_SHORT")):
+            changed_msgs.append(text)
+            _last_state[s] = (state, now)
+
+    sent = send_changes(changed_msgs)
+
+    # если изменений не было — пингуем не чаще раза в час
+    if (not sent) and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60):
+        dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        tg(f"ℹ️ Без изменений по фильтрам ({BASE_TF}) — {dt}")
+        _last_ping_ts = now
 
 def loop():
     if SEND_STARTUP:
-        tg("🤖 Бот запущен (умный сбор истории: окна 100 баров, минимум 120 баров для расчёта).")
+        tg("🤖 Бот запущен: умный сбор истории (HTF от 60 баров), ATR≥0.1%, анти-спам включён.")
     while True:
         try:
             check_once()
