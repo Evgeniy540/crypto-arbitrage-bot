@@ -26,6 +26,13 @@ STRENGTH_MIN  = 0.0020
 ATR_MIN_PCT   = 0.0030
 ATR_MAX_PCT   = 0.0150
 
+# История (сколько хотим баров на расчёт индикаторов)
+NEED_BARS = 210          # минимум для EMA200/RSI14
+FETCH_BUFFER = 70        # запас, чтобы EMA были «гладкими»
+MAX_TOTAL_BARS = 600     # жёсткий потолок истории
+STEP_BARS = 240          # шаг окна при сборе истории (≈ сколько баров берём за один запрос)
+REQUEST_PAUSE = 0.2      # сек, пауза между запросами (уважительно к API)
+
 # ---------- infra ----------
 app = Flask(__name__)
 @app.route("/")
@@ -104,8 +111,7 @@ def _granularity_sec(tf: str) -> int:
 def _parse_rows(rows):
     """rows -> [(ts,o,h,l,c,v)] от старых к новым"""
     rows = list(rows)
-    # API отдаёт от новых к старым — переворачиваем
-    rows.reverse()
+    rows.reverse()  # API отдаёт от новых к старым
     out=[]
     for R in rows:
         try:
@@ -116,74 +122,87 @@ def _parse_rows(rows):
             continue
     return out
 
-def bitget_candles(symbol, tf="5m", futures=True, need=220):
-    """
-    Универсальный сбор свечей для Bitget MIX:
-    1) пытаемся /history-candles (требует startTime/endTime, ответ dict)
-    2) если пришёл список или ошибка — корректно обрабатываем
-    3) fallback: /candles (без времени, с limit, ответ list)
-    Возвращаем [(ts,o,h,l,c,v)] от старых к новым.
-    """
-    full_symbol = symbol + (FUT_SUFFIX if futures else "")
-    gran_s   = _granularity_sec(tf)
-    end_ms   = int(time.time() * 1000)
-    bars_wanted = need + 60
-    start_ms = end_ms - bars_wanted * gran_s * 1000
-
+def _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=True):
+    """Один запрос к /history-candles. Возвращает список [(ts, o,h,l,c,v)] или []."""
+    base = "https://api.bitget.com/api/mix/v1/market/history-candles" if futures \
+           else "https://api.bitget.com/api/spot/v1/market/history-candles"
     headers = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
-
-    # --- 1) пробуем /history-candles ---
-    base_hist = "https://api.bitget.com/api/mix/v1/market/history-candles" if futures \
-                else "https://api.bitget.com/api/spot/v1/market/history-candles"
-    params_hist = {
+    params = {
         "symbol": full_symbol,
         "granularity": str(gran_s),
         "startTime": str(start_ms),
-        "endTime": str(end_ms)
+        "endTime":   str(end_ms),
     }
+    r = requests.get(base, params=params, headers=headers, timeout=15)
+    r.raise_for_status()
+    js = r.json()
+    if isinstance(js, list):
+        return _parse_rows(js)
+    if isinstance(js, dict) and js.get("code") == "00000" and "data" in js:
+        return _parse_rows(js["data"])
+    return []
 
-    try:
-        r = requests.get(base_hist, params=params_hist, headers=headers, timeout=15)
-        r.raise_for_status()
-        js = r.json()
+def bitget_candles(symbol, tf="5m", futures=True, need=NEED_BARS+FETCH_BUFFER):
+    """
+    Сбор длинной истории окнами через /history-candles.
+    Если не удаётся — фолбэк на /candles (limit).
+    Выход: [(ts,o,h,l,c,v)] от старых к новым.
+    """
+    full_symbol = symbol + (FUT_SUFFIX if futures else "")
+    gran_s   = _granularity_sec(tf)
 
-        # Если это список — просто парсим как ряды
-        if isinstance(js, list):
-            return _parse_rows(js)
+    end_ms = int(time.time() * 1000)
+    all_rows = {}
+    total_needed = min(MAX_TOTAL_BARS, max(need, NEED_BARS+FETCH_BUFFER))
+    step_ms = STEP_BARS * gran_s * 1000
 
-        # Обычно приходит dict с code/data
-        if js.get("code") == "00000" and "data" in js:
-            return _parse_rows(js["data"])
+    # 1) Идём назад окнами, пока не соберём достаточно баров.
+    attempts = 0
+    while len(all_rows) < total_needed and attempts < 12:  # максимум 12 окон
+        start_ms = max(0, end_ms - step_ms)
+        try:
+            part = _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=futures)
+            for ts,o,h,l,c,v in part:
+                all_rows[ts] = (ts,o,h,l,c,v)   # защита от дублей
+        except requests.HTTPError as he:
+            # если 4xx/5xx — попробуем позже через /candles
+            break
+        except Exception:
+            # сеть/парсинг — тоже прервём цикл, перейдём к фолбэку
+            break
 
-        # если странный формат — упадём в fallback ниже
-    except Exception:
-        pass
+        attempts += 1
+        end_ms = start_ms - 1     # двигаем окно назад
+        time.sleep(REQUEST_PAUSE) # не спамим API
 
-    # --- 2) fallback: /candles (иногда на регионе/history бывают странности) ---
+    rows = sorted(all_rows.values(), key=lambda x: x[0])
+    if len(rows) >= NEED_BARS:   # достаточно истории
+        return rows[-total_needed:] if len(rows) > total_needed else rows
+
+    # 2) Фолбэк: /candles (быстро, но короче)
     base_cand = "https://api.bitget.com/api/mix/v1/market/candles" if futures \
                 else "https://api.bitget.com/api/spot/v1/market/candles"
-    params_cand = {
+    headers = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
+    params = {
         "symbol": full_symbol,
         "granularity": str(gran_s),
-        "limit": str(bars_wanted)
+        "limit": str(min(total_needed, 600))  # часто позволяет до ~600
     }
-    r2 = requests.get(base_cand, params=params_cand, headers=headers, timeout=15)
+    r2 = requests.get(base_cand, params=params, headers=headers, timeout=15)
     r2.raise_for_status()
     js2 = r2.json()
-
     if isinstance(js2, list):
         return _parse_rows(js2)
-    # иногда тоже приходит объект с "data"
     if isinstance(js2, dict) and "data" in js2:
         return _parse_rows(js2["data"])
 
-    raise RuntimeError(f"Bitget unexpected response: {js2.__class__.__name__}")
+    return rows  # что собрали
 
-def get_close_series(symbol, tf, need=210):
-    c = bitget_candles(symbol, tf=tf, futures=True, need=need+10)
+def get_close_series(symbol, tf, need=NEED_BARS):
+    c = bitget_candles(symbol, tf=tf, futures=True, need=need+FETCH_BUFFER)
     if not c: return [], []
-    if len(c) > need + 10:
-        c = c[-(need+10):]
+    if len(c) > need + FETCH_BUFFER:
+        c = c[-(need+FETCH_BUFFER):]
     if len(c) < need: return [], []
     closes=[x[4] for x in c]
     return c, closes
@@ -200,7 +219,7 @@ def strength_pct(e_fast, e_slow, close):
     return abs(e_fast - e_slow)/close
 
 def analyze_symbol(sym):
-    c5, cls5 = get_close_series(sym, BASE_TF, need=210)
+    c5, cls5 = get_close_series(sym, BASE_TF, need=NEED_BARS)
     if not cls5: return f"{sym}_UMCBL: недостаточно данных на {BASE_TF}"
 
     e50_5 = ema(cls5, 50); e200_5 = ema(cls5, 200)
@@ -213,8 +232,8 @@ def analyze_symbol(sym):
     strength = strength_pct(e50_5[-1], e200_5[-1], close5)
     atrp     = atr_pct(c5,14)
 
-    _, cls15 = get_close_series(sym, "15m", need=210)
-    _, cls1h = get_close_series(sym, "1h",  need=210)
+    _, cls15 = get_close_series(sym, "15m", need=NEED_BARS)
+    _, cls1h = get_close_series(sym, "1h",  need=NEED_BARS)
     dir15, _, _ = trend_dir(cls15) if cls15 else (None, [], [])
     dir1h, _, _ = trend_dir(cls1h) if cls1h else (None, [], [])
 
@@ -274,7 +293,7 @@ def check_once():
 
 def loop():
     if SEND_STARTUP:
-        tg("🤖 Бот запущен (LONG/SHORT: EMA50/200 + RSI + ATR; гибкий парсер свечей Bitget).")
+        tg("🤖 Бот запущен (EMA50/200 + RSI + ATR; история собирается окнами).")
     while True:
         try:
             check_once()
