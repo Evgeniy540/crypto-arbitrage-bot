@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-import os, time, math, threading, requests
+import os, time, math, threading, requests, json
 from datetime import datetime, timezone
 from flask import Flask
 
 # ==== ТВОИ ДАННЫЕ ====
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
-TELEGRAM_CHAT_ID   = "5723086631"
+TELEGRAM_CHAT_ID   = "5723086631"   # можно строкой; в коде сравнивается как int
 # =====================
 
 FUT_SUFFIX = "_UMCBL"
@@ -19,7 +19,72 @@ BASE_TF              = "5m"   # 1m/3m/5m/15m/30m/1h/4h/1d
 CHECK_INTERVAL_S     = 300    # проверяем раз в 5 минут
 SEND_STARTUP         = True
 
-# Пороги фильтров
+# ===== ПРЕСЕТЫ РЕЖИМОВ (/mode) =====
+PRESETS = {
+    "aggressive": {
+        "TREND_FAST": 20,  "TREND_SLOW": 100, "TREND_CONFIRM_BARS": 1,
+        "TREND_TFS": ["5m","15m","1h"], "TREND_ALERT_COOLDOWN_MIN": 5,
+        "STRENGTH_MIN": 0.0010, "ATR_MIN_PCT": 0.0005, "ATR_MAX_PCT": 0.0300,
+        "RSI_MIN_LONG": 48, "RSI_MAX_SHORT": 52
+    },
+    "balanced": {
+        "TREND_FAST": 50,  "TREND_SLOW": 200, "TREND_CONFIRM_BARS": 2,
+        "TREND_TFS": ["15m","1h"], "TREND_ALERT_COOLDOWN_MIN": 15,
+        "STRENGTH_MIN": 0.0020, "ATR_MIN_PCT": 0.0010, "ATR_MAX_PCT": 0.0150,
+        "RSI_MIN_LONG": 50, "RSI_MAX_SHORT": 50
+    },
+    "safe": {
+        "TREND_FAST": 100, "TREND_SLOW": 200, "TREND_CONFIRM_BARS": 3,
+        "TREND_TFS": ["1h","4h"], "TREND_ALERT_COOLDOWN_MIN": 30,
+        "STRENGTH_MIN": 0.0030, "ATR_MIN_PCT": 0.0020, "ATR_MAX_PCT": 0.0200,
+        "RSI_MIN_LONG": 55, "RSI_MAX_SHORT": 45
+    }
+}
+MODE_FILE = "mode.txt"
+_current_mode = None
+
+def save_mode(name: str):
+    try:
+        with open(MODE_FILE, "w", encoding="utf-8") as f:
+            f.write(name.strip())
+    except Exception:
+        pass
+
+def load_mode() -> str:
+    try:
+        with open(MODE_FILE, "r", encoding="utf-8") as f:
+            name = f.read().strip()
+            if name in PRESETS: return name
+    except Exception:
+        pass
+    return "balanced"
+
+def apply_mode(name: str):
+    """Применяет пресет в глобальные параметры фильтров/трендов."""
+    global TREND_FAST, TREND_SLOW, TREND_CONFIRM_BARS, TREND_TFS, TREND_ALERT_COOLDOWN_MIN
+    global STRENGTH_MIN, ATR_MIN_PCT, ATR_MAX_PCT, RSI_MIN_LONG, RSI_MAX_SHORT
+    cfg = PRESETS[name]
+    TREND_FAST = cfg["TREND_FAST"]
+    TREND_SLOW = cfg["TREND_SLOW"]
+    TREND_CONFIRM_BARS = cfg["TREND_CONFIRM_BARS"]
+    TREND_TFS = cfg["TREND_TFS"]
+    TREND_ALERT_COOLDOWN_MIN = cfg["TREND_ALERT_COOLDOWN_MIN"]
+    STRENGTH_MIN = cfg["STRENGTH_MIN"]
+    ATR_MIN_PCT = cfg["ATR_MIN_PCT"]
+    ATR_MAX_PCT = cfg["ATR_MAX_PCT"]
+    RSI_MIN_LONG = cfg["RSI_MIN_LONG"]
+    RSI_MAX_SHORT = cfg["RSI_MAX_SHORT"]
+
+def format_mode_settings(name: str) -> str:
+    c = PRESETS[name]
+    lines = [
+        f"Режим: {name}",
+        f"TREND: EMA{c['TREND_FAST']}/{c['TREND_SLOW']}, підтверждение={c['TREND_CONFIRM_BARS']} бар(ов), TFs={','.join(c['TREND_TFS'])}, cooldown={c['TREND_ALERT_COOLDOWN_MIN']} м.",
+        f"STRENGTH_MIN={c['STRENGTH_MIN']*100:.2f}% • ATR={c['ATR_MIN_PCT']*100:.2f}%..{c['ATR_MAX_PCT']*100:.2f}% • RSI long≥{c['RSI_MIN_LONG']} / short≤{c['RSI_MAX_SHORT']}"
+    ]
+    return "\n".join(lines)
+
+# ===== Значения по умолчанию (будут перезаписаны apply_mode(load_mode())) =====
 RSI_MIN_LONG  = 50
 RSI_MAX_SHORT = 50
 STRENGTH_MIN  = 0.0020   # 0.20%
@@ -27,8 +92,8 @@ ATR_MIN_PCT   = 0.0010   # 0.10%
 ATR_MAX_PCT   = 0.0150   # 1.50%
 
 # История/окна (умный режим)
-NEED_IDEAL     = 210       # цель для 5m (EMA200 «гладко»)
-NEED_MIN       = 120       # минимум для 5m (работаем, если >= 120)
+NEED_IDEAL     = 210       # цель для 5m
+NEED_MIN       = 120       # минимум для 5m
 NEED_MIN_HTF   = 60        # минимум для 15m/1h
 FETCH_BUFFER   = 60
 STEP_BARS      = 100
@@ -40,14 +105,13 @@ REQUEST_PAUSE  = 0.25
 PING_COOLDOWN_MIN   = 60    # «без изменений»/слабые статусы не чаще 1/час
 STATE_COOLDOWN_MIN  = 5     # одинаковый статус по тикеру — не чаще, чем раз в 5 мин
 
-# ===== Настройки алертов СМЕНЫ ТРЕНДА =====
-TREND_FAST = 50                 # быстрая EMA для тренда
-TREND_SLOW = 200                # медленная EMA для тренда
-TREND_CONFIRM_BARS = 2          # требуемое число подряд баров для подтверждения смены
-TREND_TFS = ["15m", "1h"]       # на каких ТФ следим за сменой тренда
-TREND_ALERT_COOLDOWN_MIN = 15   # минимальная пауза между алертами по одной паре/ТФ
-_last_trend = {}                # (symbol, tf) -> (last_trend, ts_last_alert)
-# ==========================================
+# ===== Настройки алертов СМЕНЫ ТРЕНДА (будут перезаписаны пресетом) =====
+TREND_FAST = 50
+TREND_SLOW = 200
+TREND_CONFIRM_BARS = 2
+TREND_TFS = ["15m","1h"]
+TREND_ALERT_COOLDOWN_MIN = 15
+_last_trend = {}  # (symbol, tf) -> (last_trend, ts_last_alert)
 
 # ---------- infra ----------
 app = Flask(__name__)
@@ -62,7 +126,7 @@ def tg(text: str):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10
+            json={"chat_id": int(TELEGRAM_CHAT_ID), "text": text}, timeout=10
         )
     except Exception:
         pass
@@ -197,7 +261,7 @@ def trend_dir(closes):
     if e50[-1] < e200[-1]:  return "SHORT", e50, e200
     return None, e50, e200
 
-def trend_dir_with_params(closes, fast=TREND_FAST, slow=TREND_SLOW):
+def trend_dir_with_params(closes, fast, slow):
     ef=ema(closes, fast); es=ema(closes, slow)
     if math.isnan(ef[-1]) or math.isnan(es[-1]): return None, ef, es
     if ef[-1] > es[-1]:  return "LONG",  ef, es
@@ -344,9 +408,78 @@ def check_once():
         tg(f"ℹ️ Без изменений по фильтрам ({BASE_TF}) — {dt}\n⏳ Следующая проверка через {CHECK_INTERVAL_S//60} минут")
         _last_ping_ts = now
 
+# ---------- Telegram команды (/mode, /help) ----------
+def tg_send(chat_id: int, text: str):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text}, timeout=10
+        )
+    except Exception:
+        pass
+
+def handle_command(chat_id: int, text: str):
+    global _current_mode
+    if chat_id != int(TELEGRAM_CHAT_ID):
+        tg_send(chat_id, "⛔ Нет доступа.")
+        return
+    t = (text or "").strip().lower()
+    if t == "/help" or t == "/start":
+        tg_send(chat_id,
+            "Команды:\n"
+            "/mode — показать режим и доступные пресеты\n"
+            "/mode aggressive — включить агрессивный режим\n"
+            "/mode balanced — включить сбалансированный режим\n"
+            "/mode safe — включить консервативный режим"
+        )
+        return
+    if t == "/mode":
+        msg = "Текущие настройки:\n" + format_mode_settings(_current_mode) + \
+              "\n\nДоступно: aggressive / balanced / safe\nПример: /mode aggressive"
+        tg_send(chat_id, msg)
+        return
+    if t.startswith("/mode "):
+        name = t.split(" ", 1)[1].strip()
+        if name not in PRESETS:
+            tg_send(chat_id, "Неизвестный режим. Доступно: aggressive / balanced / safe")
+            return
+        apply_mode(name)
+        save_mode(name)
+        _current_mode = name
+        tg_send(chat_id, "✅ Режим применён.\n" + format_mode_settings(name))
+        return
+    tg_send(chat_id, "Неизвестная команда. Напиши /help")
+
+def tg_poll_loop():
+    """Лонг-поллинг Telegram для команд /mode (без вебхука)."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    last_update_id = None
+    while True:
+        try:
+            params = {"timeout": 50}
+            if last_update_id is not None:
+                params["offset"] = last_update_id + 1
+            r = requests.get(url, params=params, timeout=60)
+            r.raise_for_status()
+            js = r.json()
+            if not js.get("ok"):
+                time.sleep(2); continue
+            for upd in js.get("result", []):
+                last_update_id = upd.get("update_id", last_update_id)
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg: continue
+                chat = msg.get("chat", {})
+                chat_id = chat.get("id")
+                text = msg.get("text", "")
+                if text and chat_id:
+                    handle_command(int(chat_id), text)
+        except Exception:
+            time.sleep(2)
+
 def loop():
     if SEND_STARTUP:
-        tg("🤖 Бот запущен: сильные сигналы сразу, нейтралка ≤ 1/ч, UTC-таймштамп и алерты смены тренда (15m/1h).")
+        tg("🤖 Бот запущен: сильные сигналы сразу, нейтралка ≤ 1/ч, UTC-таймштамп, алерты тренда (15m/1h).\n"
+           f"Текущий режим: {_current_mode}")
     while True:
         try:
             check_once()
@@ -354,6 +487,14 @@ def loop():
             tg(f"⚠️ Главный цикл: ошибка — {e}")
         time.sleep(CHECK_INTERVAL_S)
 
+# ====== STARTUP ======
 if __name__ == "__main__":
+    # загрузить и применить режим
+    _current_mode = load_mode()
+    apply_mode(_current_mode)
+
+    # стартуем Flask (healthcheck) + polling команд
     threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=tg_poll_loop, daemon=True).start()
+    # основной цикл
     loop()
