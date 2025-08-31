@@ -3,10 +3,10 @@ import os, time, math, threading, requests, json
 from datetime import datetime, timezone
 from flask import Flask
 
-# ==== ТВОИ ДАННЫЕ ====
+# ==== ТВОИ ДАННЫЕ (замени при необходимости) ====
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
-TELEGRAM_CHAT_ID   = "5723086631"   # можно строкой
-# =====================
+TELEGRAM_CHAT_ID   = "5723086631"
+# ================================================
 
 FUT_SUFFIX = "_UMCBL"
 SYMBOLS = [
@@ -15,11 +15,11 @@ SYMBOLS = [
     "DOTUSDT","OPUSDT","ARBUSDT","APTUSDT","LTCUSDT","PEPEUSDT"
 ]
 
-BASE_TF              = "5m"
-CHECK_INTERVAL_S     = 300    # проверяем раз в 5 минут
-SEND_STARTUP         = True
+BASE_TF          = "5m"
+CHECK_INTERVAL_S = 300
+SEND_STARTUP     = True
 
-# ===== ПРЕСЕТЫ РЕЖИМОВ (/mode) =====
+# ========= ПРЕСЕТЫ (/mode) =========
 PRESETS = {
     "aggressive": {
         "TREND_FAST": 20,  "TREND_SLOW": 100, "TREND_CONFIRM_BARS": 1,
@@ -44,19 +44,14 @@ MODE_FILE = "mode.txt"
 _current_mode = None
 
 def save_mode(name: str):
-    try:
-        with open(MODE_FILE, "w", encoding="utf-8") as f:
-            f.write(name.strip())
-    except Exception:
-        pass
+    try: open(MODE_FILE, "w", encoding="utf-8").write(name)
+    except Exception: pass
 
 def load_mode() -> str:
     try:
-        with open(MODE_FILE, "r", encoding="utf-8") as f:
-            name = f.read().strip()
-            if name in PRESETS: return name
-    except Exception:
-        pass
+        name = open(MODE_FILE, "r", encoding="utf-8").read().strip()
+        if name in PRESETS: return name
+    except Exception: pass
     return "balanced"
 
 def apply_mode(name: str):
@@ -64,16 +59,11 @@ def apply_mode(name: str):
     global TREND_FAST, TREND_SLOW, TREND_CONFIRM_BARS, TREND_TFS, TREND_ALERT_COOLDOWN_MIN
     global STRENGTH_MIN, ATR_MIN_PCT, ATR_MAX_PCT, RSI_MIN_LONG, RSI_MAX_SHORT
     cfg = PRESETS[name]
-    TREND_FAST = cfg["TREND_FAST"]
-    TREND_SLOW = cfg["TREND_SLOW"]
+    TREND_FAST = cfg["TREND_FAST"]; TREND_SLOW = cfg["TREND_SLOW"]
     TREND_CONFIRM_BARS = cfg["TREND_CONFIRM_BARS"]
-    TREND_TFS = cfg["TREND_TFS"]
-    TREND_ALERT_COOLDOWN_MIN = cfg["TREND_ALERT_COOLDOWN_MIN"]
-    STRENGTH_MIN = cfg["STRENGTH_MIN"]
-    ATR_MIN_PCT = cfg["ATR_MIN_PCT"]
-    ATR_MAX_PCT = cfg["ATR_MAX_PCT"]
-    RSI_MIN_LONG = cfg["RSI_MIN_LONG"]
-    RSI_MAX_SHORT = cfg["RSI_MAX_SHORT"]
+    TREND_TFS = cfg["TREND_TFS"]; TREND_ALERT_COOLDOWN_MIN = cfg["TREND_ALERT_COOLDOWN_MIN"]
+    STRENGTH_MIN = cfg["STRENGTH_MIN"]; ATR_MIN_PCT = cfg["ATR_MIN_PCT"]; ATR_MAX_PCT = cfg["ATR_MAX_PCT"]
+    RSI_MIN_LONG = cfg["RSI_MIN_LONG"]; RSI_MAX_SHORT = cfg["RSI_MAX_SHORT"]
 
 def format_mode_settings(name: str) -> str:
     c = PRESETS[name]
@@ -81,78 +71,66 @@ def format_mode_settings(name: str) -> str:
         f"Режим: {name}\n"
         f"TREND EMA{c['TREND_FAST']}/{c['TREND_SLOW']}, подтверждение={c['TREND_CONFIRM_BARS']}, "
         f"TFs={','.join(c['TREND_TFS'])}, cooldown={c['TREND_ALERT_COOLDOWN_MIN']} м.\n"
-        f"Сила≥{c['STRENGTH_MIN']*100:.2f}% • ATR {c['ATR_MIN_PCT']*100:.2f}%..{c['ATR_MAX_PCT']*100:.2f}% • "
+        f"Сила≥{c['STRENGTH_MIN']*100:.2f}% • ATR {c['ATR_MIN_PCT']*100:.2f}–{c['ATR_MAX_PCT']*100:.2f}% • "
         f"RSI long≥{c['RSI_MIN_LONG']} / short≤{c['RSI_MAX_SHORT']}"
     )
 
-# ===== Значения по умолчанию (будут перезаписаны apply_mode(load_mode())) =====
+# ===== Defaults (будут перезаписаны apply_mode(load_mode())) =====
 RSI_MIN_LONG  = 50
 RSI_MAX_SHORT = 50
-STRENGTH_MIN  = 0.0020   # 0.20%
-ATR_MIN_PCT   = 0.0010   # 0.10%
-ATR_MAX_PCT   = 0.0150   # 1.50%
+STRENGTH_MIN  = 0.0020
+ATR_MIN_PCT   = 0.0010
+ATR_MAX_PCT   = 0.0150
 
-# История/окна (умный режим)
-NEED_IDEAL     = 210
-NEED_MIN       = 120
-NEED_MIN_HTF   = 60
-FETCH_BUFFER   = 60
-STEP_BARS      = 100
-MAX_WINDOWS    = 30
-MAX_TOTAL_BARS = 1000
-REQUEST_PAUSE  = 0.25
+# История / загрузка данных
+NEED_IDEAL, NEED_MIN, NEED_MIN_HTF = 210, 120, 60
+FETCH_BUFFER, STEP_BARS, MAX_WINDOWS, MAX_TOTAL_BARS, REQUEST_PAUSE = 60, 100, 30, 1000, 0.25
 
 # Анти-спам
-PING_COOLDOWN_MIN   = 60    # «без изменений»/слабые статусы не чаще 1/час
-STATE_COOLDOWN_MIN  = 5     # одинаковый статус по тикеру — не чаще 5 мин
+PING_COOLDOWN_MIN = 60   # нейтралка/NO_DATA/ERR не чаще 1/ч
+STATE_COOLDOWN_MIN = 5   # одинаковый сильный статус не чаще 5 мин
 
-# ===== Настройки алертов СМЕНЫ ТРЕНДА (перезаписываются пресетом) =====
-TREND_FAST = 50
-TREND_SLOW = 200
-TREND_CONFIRM_BARS = 2
+# Настройки алертов смены тренда (перезаписываются пресетом)
+TREND_FAST, TREND_SLOW, TREND_CONFIRM_BARS = 50, 200, 2
 TREND_TFS = ["15m","1h"]
 TREND_ALERT_COOLDOWN_MIN = 15
-_last_trend = {}  # (symbol, tf) -> (last_trend, ts_last_alert)
+_last_trend = {}   # (symbol, tf) -> (last_trend, ts)
 
-# ===== Адресные пороги по тикерам =====
+# ===== Индивидуальные пороги (overrides) =====
 OV_FILE = "overrides.json"
-DEFAULT_OVERRIDES = {
-    # BTC: снижаем нижний порог ATR до 0.05%
+_symbol_overrides = {
+    # BTC — понижен нижний порог ATR до 0.05%
     "BTCUSDT": {"ATR_MIN_PCT": 0.0005}
 }
-_symbol_overrides = {}
 
 def load_overrides():
     global _symbol_overrides
-    _symbol_overrides = dict(DEFAULT_OVERRIDES)
     try:
         if os.path.exists(OV_FILE):
-            with open(OV_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        if isinstance(v, dict):
-                            _symbol_overrides.setdefault(k, {}).update(v)
+            data = json.load(open(OV_FILE, "r", encoding="utf-8"))
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, dict):
+                        _symbol_overrides.setdefault(k, {}).update(v)
     except Exception:
         pass
 
 def save_overrides():
     try:
-        with open(OV_FILE, "w", encoding="utf-8") as f:
-            json.dump(_symbol_overrides, f, ensure_ascii=False, indent=2)
+        json.dump(_symbol_overrides, open(OV_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     except Exception:
         pass
 
-def param_for(sym: str, name: str, default_value):
-    return _symbol_overrides.get(sym, {}).get(name, default_value)
+def param_for(sym: str, name: str, default):
+    return _symbol_overrides.get(sym, {}).get(name, default)
 
-# ---------- infra ----------
+# ============== infra ==============
 app = Flask(__name__)
 @app.route("/")
 def root(): return "OK"
 
 def run_flask():
-    port = int(os.environ.get("PORT","8000"))
+    port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
 
 def tg(text: str):
@@ -173,14 +151,11 @@ def tg_send(chat_id: int, text: str):
     except Exception:
         pass
 
-# ---------- индикаторы ----------
+# ============ Индикаторы ============
 def ema(vals, n):
-    if len(vals) < n: return [math.nan]*len(vals)
-    k = 2/(n+1)
-    out = [math.nan]*(n-1)
-    s  = sum(vals[:n])/n
-    out.append(s)
-    p = s
+    if len(vals) < n: return [math.nan] * len(vals)
+    k = 2/(n+1); out = [math.nan]*(n-1); s = sum(vals[:n])/n
+    out.append(s); p = s
     for x in vals[n:]:
         p = x*k + p*(1-k)
         out.append(p)
@@ -214,22 +189,18 @@ def atr_pct(candles, n=14):
     close = candles[-1][4]
     return atr/close
 
-# ---------- данные ----------
+# ============== Данные ==============
 def _granularity(tf: str) -> str:
-    tf = tf.lower().strip()
-    mapping = {
-        "1m":"60","3m":"180","5m":"300",
-        "15m":"900","30m":"1800","1h":"3600",
-        "4h":"14400","1d":"86400"
-    }
-    return mapping.get(tf, "300")
+    return {
+        "1m":"60","3m":"180","5m":"300","15m":"900","30m":"1800",
+        "1h":"3600","4h":"14400","1d":"86400"
+    }.get(tf, "300")
 
 def _granularity_sec(tf: str) -> int:
     return int(_granularity(tf))
 
 def _parse_rows(rows):
-    rows = list(rows)
-    rows.reverse()  # API отдаёт от новых к старым -> в хронологию
+    rows = list(rows); rows.reverse()  # API возвращает от новых к старым
     out=[]
     for R in rows:
         try:
@@ -244,62 +215,50 @@ def _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=True):
     base = "https://api.bitget.com/api/mix/v1/market/history-candles" if futures \
            else "https://api.bitget.com/api/spot/v1/market/history-candles"
     headers = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
-    params = {
-        "symbol": full_symbol,
-        "granularity": str(gran_s),
-        "startTime": str(start_ms),
-        "endTime":   str(end_ms),
-    }
+    params = {"symbol": full_symbol, "granularity": str(gran_s),
+              "startTime": str(start_ms), "endTime": str(end_ms)}
     r = requests.get(base, params=params, headers=headers, timeout=15)
     r.raise_for_status()
     js = r.json()
-    if isinstance(js, list):
+    if isinstance(js, list):  # иногда приходит сразу массив
         return _parse_rows(js)
-    if isinstance(js, dict) and js.get("code") == "00000" and "data" in js:
+    if isinstance(js, dict) and js.get("code")=="00000" and "data" in js:
         return _parse_rows(js["data"])
     return []
 
 def bitget_candles(symbol, tf="5m", futures=True, need=NEED_IDEAL+FETCH_BUFFER):
-    """
-    Сбор длинной истории окнами через /history-candles.
-    Возвращает [(ts,o,h,l,c,v)] от старых к новым.
-    """
+    """Сбор истории окнами через /history-candles; от старых к новым."""
     full_symbol = symbol + (FUT_SUFFIX if futures else "")
     gran_s = _granularity_sec(tf)
-
-    end_ms = int(time.time() * 1000)
+    end_ms = int(time.time()*1000)
     all_rows = {}
     step_ms = STEP_BARS * gran_s * 1000
-
     for _ in range(MAX_WINDOWS):
         start_ms = max(0, end_ms - step_ms)
         try:
             part = _fetch_hist_window(full_symbol, gran_s, start_ms, end_ms, futures=futures)
-            for ts,o,h,l,c,v in part:
-                all_rows[ts] = (ts,o,h,l,c,v)
+            for ts,o,h,l,c,v in part: all_rows[ts]=(ts,o,h,l,c,v)
         except Exception:
             break
         end_ms = start_ms - 1
         time.sleep(REQUEST_PAUSE)
-
-    rows = sorted(all_rows.values(), key=lambda x: x[0])
+    rows = sorted(all_rows.values(), key=lambda x:x[0])
     return rows
 
 def get_close_series(symbol, tf, need=NEED_IDEAL, min_need=NEED_MIN):
     c = bitget_candles(symbol, tf=tf, futures=True, need=need+FETCH_BUFFER)
-    if not c or len(c) < min_need:
-        return [], []
+    if not c or len(c) < min_need: return [], []
     if len(c) > min(MAX_TOTAL_BARS, need + FETCH_BUFFER):
         c = c[-(need+FETCH_BUFFER):]
     closes=[x[4] for x in c]
     return c, closes
 
-# ---------- тренд и сигналы ----------
+# ============ Сигналы =============
 def trend_dir(closes):
     e50=ema(closes,50); e200=ema(closes,200)
     if math.isnan(e50[-1]) or math.isnan(e200[-1]): return None, e50, e200
-    if e50[-1] > e200[-1]:  return "LONG",  e50, e200
-    if e50[-1] < e200[-1]:  return "SHORT", e50, e200
+    if e50[-1] > e200[-1]: return "LONG", e50, e200
+    if e50[-1] < e200[-1]: return "SHORT", e50, e200
     return None, e50, e200
 
 def strength_pct(e_fast, e_slow, close):
@@ -309,16 +268,13 @@ def analyze_symbol(sym):
     # базовый ТФ
     c5, cls5 = get_close_series(sym, BASE_TF, need=NEED_IDEAL, min_need=NEED_MIN)
     if not cls5: return ("NO_DATA", f"{sym}_UMCBL: недостаточно данных")
+    e50_5=ema(cls5,50); e200_5=ema(cls5,200); rsi5=rsi(cls5,14)
+    if math.isnan(e200_5[-1]) or math.isnan(rsi5[-1]): return ("NO_DATA", f"{sym}_UMCBL: нет индикаторов")
 
-    e50_5 = ema(cls5, 50); e200_5 = ema(cls5, 200)
-    rsi5  = rsi(cls5, 14)
-    if math.isnan(e200_5[-1]) or math.isnan(rsi5[-1]):
-        return ("NO_DATA", f"{sym}_UMCBL: недостаточно индикаторов")
-
-    close5   = cls5[-1]
-    dir5     = "LONG" if e50_5[-1] > e200_5[-1] else "SHORT"
+    close5 = cls5[-1]
+    dir5 = "LONG" if e50_5[-1] > e200_5[-1] else "SHORT"
     strength = strength_pct(e50_5[-1], e200_5[-1], close5)
-    atrp     = atr_pct(c5,14)
+    atrp = atr_pct(c5,14)
 
     # старшие ТФ
     _, cls15 = get_close_series(sym, "15m", need=NEED_MIN, min_need=NEED_MIN_HTF)
@@ -326,12 +282,7 @@ def analyze_symbol(sym):
     dir15, _, _ = trend_dir(cls15) if cls15 else (None, [], [])
     dir1h, _, _ = trend_dir(cls1h) if cls1h else (None, [], [])
 
-    t15_ok_long  = (dir15 == "LONG")
-    t1h_ok_long  = (dir1h == "LONG")
-    t15_ok_short = (dir15 == "SHORT")
-    t1h_ok_short = (dir1h == "SHORT")
-
-    # --- локальные пороги с учётом overrides
+    # локальные пороги (с учётом overrides)
     atr_min       = param_for(sym, "ATR_MIN_PCT", ATR_MIN_PCT)
     atr_max       = param_for(sym, "ATR_MAX_PCT", ATR_MAX_PCT)
     strength_min  = param_for(sym, "STRENGTH_MIN", STRENGTH_MIN)
@@ -339,44 +290,39 @@ def analyze_symbol(sym):
     rsi_max_short = param_for(sym, "RSI_MAX_SHORT", RSI_MAX_SHORT)
 
     filters_long = (
-        dir5 == "LONG" and t15_ok_long and t1h_ok_long and
-        strength >= strength_min and rsi5[-1] >= rsi_min_long and
-        (not math.isnan(atrp) and atr_min <= atrp <= atr_max)
+        dir5=="LONG" and dir15=="LONG" and dir1h=="LONG" and
+        strength>=strength_min and rsi5[-1]>=rsi_min_long and
+        (not math.isnan(atrp) and atr_min<=atrp<=atr_max)
     )
     filters_short = (
-        dir5 == "SHORT" and t15_ok_short and t1h_ok_short and
-        strength >= strength_min and rsi5[-1] <= rsi_max_short and
-        (not math.isnan(atrp) and atr_min <= atrp <= atr_max)
+        dir5=="SHORT" and dir15=="SHORT" and dir1h=="SHORT" and
+        strength>=strength_min and rsi5[-1]<=rsi_max_short and
+        (not math.isnan(atrp) and atr_min<=atrp<=atr_max)
     )
 
     info = (f"Цена: {round(close5,6)} • {BASE_TF}: {dir5}\n"
             f"RSI={round(rsi5[-1],1)} • ATR={round(atrp*100,2)}% • "
             f"Сила={round(strength*100,2)}% • EMA50/200 OK")
-
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    if filters_long:
-        return ("STRONG_LONG", f"🟩 СИЛЬНЫЙ LONG {sym}_UMCBL ({now_str})\n{info}")
-    if filters_short:
-        return ("STRONG_SHORT", f"🟪 СИЛЬНЫЙ SHORT {sym}_UMCBL ({now_str})\n{info}")
+
+    if filters_long:  return ("STRONG_LONG",  f"🟩 СИЛЬНЫЙ LONG {sym}_UMCBL ({now_str})\n{info}")
+    if filters_short: return ("STRONG_SHORT", f"🟪 СИЛЬНЫЙ SHORT {sym}_UMCBL ({now_str})\n{info}")
     return ("WEAK", f"⚪ {sym}_UMCBL: фильтры НЕ собраны\n{info}")
 
-# --- детектор смены тренда на HTF ---
+# -------- Алерты смены тренда --------
 def detect_trend_change(sym, tf, need, min_need):
     _, cls = get_close_series(sym, tf, need=need, min_need=min_need)
     if not cls: return None
-    ef = ema(cls, TREND_FAST)
-    es = ema(cls, TREND_SLOW)
+    ef = ema(cls, TREND_FAST); es = ema(cls, TREND_SLOW)
 
-    states = []
+    states=[]
     for i in range(TREND_CONFIRM_BARS):
-        a = ef[-1 - i]; b = es[-1 - i]
+        a=ef[-1-i]; b=es[-1-i]
         if math.isnan(a) or math.isnan(b): return None
-        states.append("LONG" if a > b else "SHORT" if a < b else None)
-    if None in states or not all(s == states[0] for s in states): return None
+        states.append("LONG" if a>b else "SHORT")
     curr = states[0]
 
-    key = (sym, tf)
-    prev, ts_prev = _last_trend.get(key, (None, 0))
+    key = (sym, tf); prev, ts_prev = _last_trend.get(key, (None, 0))
     now = time.time()
     if prev != curr and (now - ts_prev) >= TREND_ALERT_COOLDOWN_MIN*60:
         _last_trend[key] = (curr, now)
@@ -386,15 +332,15 @@ def detect_trend_change(sym, tf, need, min_need):
         _last_trend[key] = (curr, now)
     return None
 
-# ---------- анти-спам и отправка ----------
-_last_state = {}       # symbol -> (state, ts_sent)
+# ============ Основной цикл ============
+_last_state = {}    # symbol -> (state, ts_sent)
 _last_ping_ts = 0
 
 def send_changes(msgs):
     if not msgs: return False
     dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     msgs.append(f"⏳ Следующая проверка через {CHECK_INTERVAL_S//60} минут")
-    tg("📊 Обновления (" + BASE_TF + ") — " + dt + "\n" + "\n\n".join(msgs))
+    tg("📊 Обновления ("+BASE_TF+") — "+dt+"\n"+"\n\n".join(msgs))
     return True
 
 def check_once():
@@ -411,30 +357,24 @@ def check_once():
 
         last_state, last_ts = _last_state.get(s, (None, 0))
 
-        if state in ("STRONG_LONG", "STRONG_SHORT"):
+        if state in ("STRONG_LONG","STRONG_SHORT"):
             if state != last_state or (now - last_ts >= STATE_COOLDOWN_MIN*60):
-                changed_msgs.append(text)
-                _last_state[s] = (state, now)
+                changed_msgs.append(text); _last_state[s] = (state, now)
         elif state == "WEAK":
-            if (state != last_state and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60)):
-                changed_msgs.append(text)
-                _last_state[s] = (state, now)
-                _last_ping_ts = now
+            if state != last_state and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60):
+                changed_msgs.append(text); _last_state[s] = (state, now); _last_ping_ts = now
         else:
-            if (state != last_state and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60)):
-                changed_msgs.append(text)
-                _last_state[s] = (state, now)
-                _last_ping_ts = now
+            if state != last_state and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60):
+                changed_msgs.append(text); _last_state[s] = (state, now); _last_ping_ts = now
 
-        # 2) алерты смены тренда по выбранным ТФ
+        # 2) смены тренда на заданных ТФ
         for tf in TREND_TFS:
             msg = detect_trend_change(
                 s, tf,
                 need=NEED_MIN if tf in ("15m","1h") else NEED_IDEAL,
                 min_need=NEED_MIN_HTF if tf in ("15m","1h") else NEED_MIN
             )
-            if msg:
-                changed_msgs.append(msg)
+            if msg: changed_msgs.append(msg)
 
     sent = send_changes(changed_msgs)
     if (not sent) and (now - _last_ping_ts >= PING_COOLDOWN_MIN*60):
@@ -442,22 +382,23 @@ def check_once():
         tg(f"ℹ️ Без изменений по фильтрам ({BASE_TF}) — {dt}\n⏳ Следующая проверка через {CHECK_INTERVAL_S//60} минут")
         _last_ping_ts = now
 
-# ---------- Telegram команды ----------
+# ============ Telegram команды ============
 def handle_command(chat_id: int, text: str):
     global _current_mode
     if int(chat_id) != int(TELEGRAM_CHAT_ID):
-        tg_send(chat_id, "⛔ Нет доступа.")
-        return
+        tg_send(chat_id, "⛔ Нет доступа."); return
+
     t = (text or "").strip().lower()
 
-    if t in ("/help", "/start"):
+    if t in ("/help","/start"):
         tg_send(chat_id,
             "Команды:\n"
             "/mode — показать режим и пресеты\n"
             "/mode aggressive|balanced|safe — применить пресет\n"
             "/get <symbol> — показать overrides для монеты (пример: /get btcusdt)\n"
-            "/set <symbol> <param> <value> — задать override, параметры: atr_min, atr_max, strength_min, rsi_min_long, rsi_max_short\n"
-            "/overrides — показать все overrides"
+            "/set <symbol> <param> <value> — задать override (atr_min|atr_max|strength_min|rsi_min_long|rsi_max_short)\n"
+            "/overrides — показать все overrides\n"
+            "/status — сводка по рынку"
         ); return
 
     if t == "/mode":
@@ -506,6 +447,38 @@ def handle_command(chat_id: int, text: str):
                              "пример: /set btcusdt atr_min 0.0005")
         return
 
+    if t == "/status":
+        lines=[]
+        for s in SYMBOLS:
+            try:
+                # 5m сводка
+                c5,cl5 = get_close_series(s,"5m",need=120,min_need=60)
+                if not cl5:
+                    lines.append(f"{s}: no data"); continue
+                e50,e200 = ema(cl5,50), ema(cl5,200)
+                rsi5 = rsi(cl5,14)
+                atrp = atr_pct(c5,14)
+                dir5 = "LONG" if (not math.isnan(e50[-1]) and not math.isnan(e200[-1]) and e50[-1]>e200[-1]) else "SHORT"
+                strength = (abs(e50[-1]-e200[-1])/cl5[-1]) if not math.isnan(e50[-1]) and not math.isnan(e200[-1]) else math.nan
+
+                # 15m / 1h тренды
+                _,cl15 = get_close_series(s,"15m",need=120,min_need=60)
+                _,cl1h = get_close_series(s,"1h", need=120,min_need=60)
+                d15 = None if not cl15 else ("LONG" if ema(cl15,50)[-1] > ema(cl15,200)[-1] else "SHORT")
+                d1h = None if not cl1h else ("LONG" if ema(cl1h,50)[-1] > ema(cl1h,200)[-1] else "SHORT")
+
+                lines.append(
+                    f"{s}: 5m={dir5}, 15m={d15 or '—'}, 1h={d1h or '—'} • "
+                    f"RSI={round(rsi5[-1],1) if not math.isnan(rsi5[-1]) else '—'} • "
+                    f"ATR={round(atrp*100,2) if not math.isnan(atrp) else '—'}% • "
+                    f"Сила={round(strength*100,2) if not math.isnan(strength) else '—'}%"
+                )
+                time.sleep(0.1)  # чуть разгрузим API
+            except Exception as e:
+                lines.append(f"{s}: ошибка {e}")
+        tg_send(chat_id, "📋 Статус рынка:\n" + "\n".join(lines))
+        return
+
     tg_send(chat_id, "Неизвестная команда. Напиши /help")
 
 def tg_poll_loop():
@@ -546,14 +519,10 @@ def loop():
 
 # ====== STARTUP ======
 if __name__ == "__main__":
-    # загрузить overrides и режим
     load_overrides()
     _current_mode = load_mode()
     apply_mode(_current_mode)
 
-    # фоновые потоки: Flask healthcheck + Telegram команды
-    threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=tg_poll_loop, daemon=True).start()
-
-    # основной цикл
+    threading.Thread(target=run_flask, daemon=True).start()    # healthcheck
+    threading.Thread(target=tg_poll_loop, daemon=True).start() # команды
     loop()
