@@ -98,22 +98,45 @@ def _granularity(tf: str) -> str:
     }
     return mapping.get(tf, "300")  # default 5m
 
-def bitget_candles(symbol, tf="5m", futures=True):
+def _granularity_sec(tf: str) -> int:
+    return int(_granularity(tf))
+
+def bitget_candles(symbol, tf="5m", futures=True, need=220):
     """
     Возвращает свечи (ts,o,h,l,c,v) от старых к новым.
-    Важно: history-candles НЕ принимает limit — не передаём его вообще.
+    Bitget /history-candles для MIX требует окно времени: startTime & endTime (в мс).
+    limit не поддерживается – забираем окно чуть с запасом.
     """
     base = "https://api.bitget.com/api/mix/v1/market/history-candles" if futures \
            else "https://api.bitget.com/api/spot/v1/market/history-candles"
+
+    # финальное имя символа
+    full_symbol = symbol + (FUT_SUFFIX if futures else "")
+
+    # считаем окно времени
+    gran_s   = _granularity_sec(tf)                # секунд на свечу
+    end_ms   = int(time.time() * 1000)             # сейчас
+    # берем need + запас, чтобы гладко посчитать EMA/ATR
+    bars_wanted = need + 60
+    start_ms = end_ms - bars_wanted * gran_s * 1000
+
     params = {
-        "symbol": symbol + (FUT_SUFFIX if futures else ""),
-        "granularity": _granularity(tf)
+        "symbol": full_symbol,
+        "granularity": str(gran_s),
+        "startTime": str(start_ms),
+        "endTime": str(end_ms)
     }
-    r = requests.get(base, params=params, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
+
+    r = requests.get(
+        base, params=params,
+        headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"},
+        timeout=15
+    )
     r.raise_for_status()
     js = r.json()
     if js.get("code") != "00000" or "data" not in js:
         raise RuntimeError(f"Bitget API error: {js}")
+
     rows = js["data"]  # от новых к старым
     rows.reverse()
     out=[]
@@ -128,12 +151,12 @@ def bitget_candles(symbol, tf="5m", futures=True):
 
 def get_close_series(symbol, tf, need=210):
     """
-    Забираем все свечи и берём хвост нужной длины (history-candles не поддерживает limit).
+    Забираем окно по времени (history-candles требует start/end) и берём хвост нужной длины.
     """
-    c = bitget_candles(symbol, tf=tf, futures=True)
+    c = bitget_candles(symbol, tf=tf, futures=True, need=need+10)
     if not c: return [], []
     if len(c) > need + 10:
-        c = c[-(need+10):]  # оставляем «хвост» с запасом для EMA
+        c = c[-(need+10):]  # оставляем хвост с запасом для EMA
     if len(c) < need: return [], []
     closes=[x[4] for x in c]
     return c, closes
@@ -228,7 +251,7 @@ def check_once():
 
 def loop():
     if SEND_STARTUP:
-        tg("🤖 Бот запущен (LONG/SHORT: EMA50/200 + RSI + ATR; history-candles без limit).")
+        tg("🤖 Бот запущен (LONG/SHORT: EMA50/200 + RSI + ATR; history-candles со start/end).")
     while True:
         try:
             check_once()
