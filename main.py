@@ -5,12 +5,11 @@ main.py — EMA-сигнальный бот для Bitget UMCBL (фьючерс�
 - ВАЖНО:
   * granularity = секунды (60, 300, 900, 1800, 3600, 14400, 43200, 86400, 604800)
   * endTime (мс) обязателен
-  * limit <= 200
-- EMA(9/21), сила сигнала, ATR-коридор
+  * limit фиксированно 200 (макс у Bitget)
+- EMA(9/21), ATR-фильтр, сила сигнала
 - fallback 5m -> 15m, ретраи, антиспам "нет сигналов"
-- cooldown по символу, Telegram уведомления и команды
-- Настройки через Telegram
-- Flask keep-alive
+- cooldown по символу, Telegram команды/пресеты, хранение config.json
+- Flask keep-alive для Render
 """
 
 import os
@@ -35,16 +34,19 @@ DEFAULT_SYMBOLS = [
 FUT_SUFFIX = "_UMCBL"
 BASE_TF    = "5m"
 
-# TF -> seconds
+# TF -> seconds (для /market/candles)
 TF_SEC = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
     "1h": 3600, "4h": 14400, "12h": 43200, "1d": 86400, "1w": 604800
 }
 def tf_to_seconds(x):
-    if isinstance(x, (int, float)): return int(x)
+    if isinstance(x, (int, float)):
+        return int(x)
     s = str(x).strip().lower()
-    if s.isdigit(): return int(s)
-    if s in TF_SEC: return TF_SEC[s]
+    if s.isdigit():
+        return int(s)
+    if s in TF_SEC:
+        return TF_SEC[s]
     raise ValueError(f"Unsupported timeframe: {x}")
 
 CONFIG_PATH = "config.json"
@@ -98,12 +100,15 @@ def set_cfg(key, value):
     save_config()
 
 # ===================== УТИЛИТЫ =====================
-def now_ts() -> float: return time.time()
+def now_ts() -> float:
+    return time.time()
 
-def pct(a, b): return (a - b) / b if b != 0 else 0.0
+def pct(a, b):
+    return (a - b) / b if b != 0 else 0.0
 
 def ema(series, length):
-    if len(series) < length: return None
+    if len(series) < length:
+        return None
     k = 2.0 / (length + 1.0)
     e = series[0]
     for v in series[1:]:
@@ -111,26 +116,32 @@ def ema(series, length):
     return e
 
 def atr_like(series_closes, period=14):
-    if len(series_closes) < period + 1: return None
+    if len(series_closes) < period + 1:
+        return None
     diffs = [abs(series_closes[i] - series_closes[i-1]) for i in range(1, len(series_closes))]
     return sum(diffs[-period:]) / float(period)
 
 def ts_iso(ts=None):
-    if ts is None: ts = now_ts()
+    if ts is None:
+        ts = now_ts()
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def parse_number(s: str):
     s = s.strip().replace(",", ".")
     is_percent = s.endswith("%")
-    if is_percent: s = s[:-1].strip()
+    if is_percent:
+        s = s[:-1].strip()
     val = float(s)
-    return val/100.0 if is_percent else val
+    return val / 100.0 if is_percent else val
 
 def parse_duration_seconds(s: str) -> int:
     s = s.strip().lower()
-    if s.endswith("s"): return int(float(s[:-1]))
-    if s.endswith("m"): return int(float(s[:-1]) * 60)
-    if s.endswith("h"): return int(float(s[:-1]) * 3600)
+    if s.endswith("s"):
+        return int(float(s[:-1]))
+    if s.endswith("m"):
+        return int(float(s[:-1]) * 60)
+    if s.endswith("h"):
+        return int(float(s[:-1]) * 3600)
     return int(float(s))
 
 # ===================== Telegram =====================
@@ -146,7 +157,8 @@ def send_tele(text: str):
 def get_updates(offset=None, timeout=10):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     params = {"timeout": timeout}
-    if offset is not None: params["offset"] = offset
+    if offset is not None:
+        params["offset"] = offset
     try:
         r = requests.get(url, params=params, timeout=timeout+5)
         r.raise_for_status()
@@ -157,12 +169,13 @@ def get_updates(offset=None, timeout=10):
 # ===================== Bitget API =====================
 BITGET_MIX_CANDLES_URL = "https://api.bitget.com/api/mix/v1/market/candles"
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
+BITGET_LIMIT = 200  # фиксированно
 
-def fetch_candles(symbol: str, granularity="5m", limit: int = 200):
+def fetch_candles(symbol: str, granularity="5m"):
     """
     Возвращает (closes:list[float], n:int, err:str|None)
     Делает 1 запрос + 2 ретрая, сортирует бары по времени (старые -> новые),
-    отбрасывает возможный дубль последней свечи.
+    аккуратно отбрасывает возможный дубль последней свечи.
     """
     try:
         gran_sec = tf_to_seconds(granularity)
@@ -173,9 +186,10 @@ def fetch_candles(symbol: str, granularity="5m", limit: int = 200):
     params = {
         "symbol": f"{symbol}{FUT_SUFFIX}",
         "granularity": gran_sec,
-        "limit": min(int(limit), 200),     # Bitget максимум 200
+        "limit": BITGET_LIMIT,     # Bitget max 200
         "endTime": end_ts_ms
     }
+
     last_err = None
     for _ in range(3):
         try:
@@ -184,9 +198,10 @@ def fetch_candles(symbol: str, granularity="5m", limit: int = 200):
             data = r.json()
             if "data" not in data or not isinstance(data["data"], list):
                 last_err = "bad payload"
-                time.sleep(0.4); continue
+                time.sleep(0.4)
+                continue
             candles = sorted(data["data"], key=lambda x: int(x[0]))  # старые -> новые
-            closes  = [float(c[4]) for c in candles]
+            closes = [float(c[4]) for c in candles]
             if len(candles) >= 2 and candles[-1][0] == candles[-2][0]:
                 closes = closes[:-1]
             return closes, len(closes), None
@@ -196,10 +211,14 @@ def fetch_candles(symbol: str, granularity="5m", limit: int = 200):
     return None, 0, last_err or "unknown error"
 
 def get_closes_with_fallback(symbol: str, min_candles: int):
-    closes, n, err = fetch_candles(symbol, "5m", 200)
+    """
+    Пробуем 5m; если < min_candles — переходим на 15m.
+    Возвращает (closes, tf_used, n_bars, fb_flag|None, err|None)
+    """
+    closes, n, err = fetch_candles(symbol, "5m")
     if closes and n >= min_candles:
         return closes, "5m", n, None, None
-    closes15, n15, err15 = fetch_candles(symbol, "15m", 200)
+    closes15, n15, err15 = fetch_candles(symbol, "15m")
     if closes15 and n15 >= min_candles:
         return closes15, "15m", n15, "fallback", None
     best_n = max(n, n15 if closes15 else 0)
@@ -285,8 +304,10 @@ def signals_loop():
         try:
             check_signals_once()
         except Exception as e:
-            try: send_tele(f"⚠️ Ошибка цикла сигналов: {e}")
-            except: pass
+            try:
+                send_tele(f"⚠️ Ошибка цикла сигналов: {e}")
+            except:
+                pass
         time.sleep(get_cfg("CHECK_INTERVAL_S"))
 
 # ===================== Команды Telegram =====================
@@ -368,13 +389,15 @@ def telegram_commands_loop():
         try:
             data = get_updates(offset=offset, timeout=10)
             if not data.get("ok", False):
-                time.sleep(2); continue
+                time.sleep(2)
+                continue
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or {}
                 text = (msg.get("text") or "").strip()
                 chat_id = ((msg.get("chat") or {}).get("id"))
-                if not text or chat_id != TELEGRAM_CHAT_ID: continue
+                if not text or chat_id != TELEGRAM_CHAT_ID:
+                    continue
 
                 t = text.lower()
                 if t.startswith("/ping"):
@@ -389,7 +412,8 @@ def telegram_commands_loop():
                     try:
                         raw = text.split(" ", 1)[1]
                         arr = [s.strip().upper() for s in raw.split(",") if s.strip()]
-                        if not arr: raise ValueError("пустой список")
+                        if not arr:
+                            raise ValueError("пустой список")
                         set_cfg("SYMBOLS", arr)
                         send_tele("✅ Обновлён список монет: " + ", ".join(arr))
                     except Exception as e:
@@ -397,7 +421,8 @@ def telegram_commands_loop():
                 elif t.startswith("/setstrength"):
                     try:
                         val = parse_number(text.split(" ", 1)[1])
-                        if not (0.0001 <= val <= 0.05): raise ValueError("0.01%..5%")
+                        if not (0.0001 <= val <= 0.05):
+                            raise ValueError("0.01%..5%")
                         set_cfg("STRENGTH_MAIN", val)
                         send_tele(f"✅ strength порог установлен: {val*100:.3f}%")
                     except Exception as e:
@@ -405,9 +430,11 @@ def telegram_commands_loop():
                 elif t.startswith("/setatr"):
                     try:
                         parts = text.split()
-                        if len(parts) < 3: raise ValueError("нужно два числа")
+                        if len(parts) < 3:
+                            raise ValueError("нужно два числа")
                         vmin = parse_number(parts[1]); vmax = parse_number(parts[2])
-                        if not (0.0005 <= vmin < vmax <= 0.10): raise ValueError("0.05%..10%, min<max")
+                        if not (0.0005 <= vmin < vmax <= 0.10):
+                            raise ValueError("0.05%..10%, min<max")
                         set_cfg("ATR_MIN", vmin); set_cfg("ATR_MAX", vmax)
                         send_tele(f"✅ ATR-диапазон: {vmin*100:.2f}% — {vmax*100:.2f}%")
                     except Exception as e:
@@ -415,14 +442,17 @@ def telegram_commands_loop():
                 elif t.startswith("/setmincandles"):
                     try:
                         n = int(text.split()[1])
-                        if not (5 <= n <= 500): raise ValueError("5..500")
-                        set_cfg("MIN_CANDLES", n); send_tele(f"✅ MIN_CANDLES = {n}")
+                        if not (5 <= n <= 500):
+                            raise ValueError("5..500")
+                        set_cfg("MIN_CANDLES", n)
+                        send_tele(f"✅ MIN_CANDLES = {n}")
                     except Exception as e:
                         send_tele(f"❌ Пример: /setmincandles 21\nОшибка: {e}")
                 elif t.startswith("/setcooldown"):
                     try:
                         minutes = int(text.split()[1])
-                        if not (1 <= minutes <= 240): raise ValueError("1..240")
+                        if not (1 <= minutes <= 240):
+                            raise ValueError("1..240")
                         set_cfg("HARD_COOLDOWN_S", minutes * 60)
                         send_tele(f"✅ Cooldown = {minutes}m")
                     except Exception as e:
@@ -430,23 +460,26 @@ def telegram_commands_loop():
                 elif t.startswith("/setcheck"):
                     try:
                         secs = parse_duration_seconds(text.split()[1])
-                        if not (10 <= secs <= 3600): raise ValueError("10..3600 сек")
+                        if not (10 <= secs <= 3600):
+                            raise ValueError("10..3600 сек")
                         set_cfg("CHECK_INTERVAL_S", secs)
                         send_tele(f"✅ Интервал проверки = {secs}s")
                     except Exception as e:
                         send_tele(f"❌ Пример: /setcheck 5m   (или 300, 300s, 1h)\nОшибка: {e}")
                 elif t.startswith("/preset"):
                     try:
-                        msg = apply_preset(text.split()[1])
+                        name = text.split()[1]
+                        msg = apply_preset(name)
                         send_tele(msg + "\n" + status_text())
                     except Exception:
                         send_tele("❌ Пример: /preset aggressive\nДоступны: aggressive, neutral, conservative")
                 else:
-                    if text.startswith("/"): send_tele("Команда не распознана. /help")
+                    if text.startswith("/"):
+                        send_tele("Команда не распознана. /help")
         except Exception:
             time.sleep(2)
 
-# ===================== Flask =====================
+# ===================== Flask keep-alive =====================
 app = Flask(__name__)
 
 @app.route("/")
@@ -468,7 +501,8 @@ def root():
 def run_threads():
     t1 = threading.Thread(target=signals_loop, daemon=True)
     t2 = threading.Thread(target=telegram_commands_loop, daemon=True)
-    t1.start(); t2.start()
+    t1.start()
+    t2.start()
 
 if __name__ == "__main__":
     run_threads()
