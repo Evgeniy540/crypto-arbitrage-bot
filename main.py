@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 main.py — EMA-сигнальный бот для Bitget UMCBL (фьючерсы)
-- Свечи: /api/mix/v1/market/history-candles
-- ВАЖНО: granularity у Bitget = строки: "1min","5min","15min","30min","1h","4h","12h","1day","1week"
+- Свечи: /api/mix/v1/market/candles    ← ИСПРАВЛЕНО
+- granularity: "1min","5min","15min","30min","1h","4h","12h","1day","1week"
 - EMA(9/21), сила сигнала, ATR-коридор
 - fallback 5m -> 15m, ретраи, антиспам "нет сигналов"
 - cooldown по символу, Telegram уведомления и команды
@@ -41,6 +41,9 @@ TF_MAP = {
 NUM_TO_TF = {60: "1min", 180: "3min", 300: "5min", 900: "15min", 1800: "30min",
              3600: "1h", 14400: "4h", 43200: "12h", 86400: "1day"}
 
+def _raise(msg):  # вспомогательно
+    raise ValueError(msg)
+
 def tf_to_str(x):
     """
     Принимает '5m', '15m', '1h', '5min', 300, '300' и т.п.
@@ -51,17 +54,12 @@ def tf_to_str(x):
     s = str(x).strip().lower()
     if s in TF_MAP:
         return TF_MAP[s]
-    # уже полный формат?
-    if s in TF_MAP.values():
+    if s in TF_MAP.values():       # уже полный формат?
         return s
-    # число в строке
-    if s.isdigit():
+    if s.isdigit():                # число в строке
         n = int(s)
         return NUM_TO_TF.get(n, None) or (_raise(f"Unsupported numeric TF: {x}"))
     return _raise(f"Unsupported timeframe: {x}")
-
-def _raise(msg):
-    raise ValueError(msg)
 
 # Горячие параметры (будут загружены/перезаписаны из config.json)
 CONFIG_PATH = "config.json"
@@ -160,8 +158,7 @@ def parse_number(s: str):
 
 def parse_duration_seconds(s: str) -> int:
     """
-    Поддерживает '300', '300s', '5m', '1h'.
-    Возвращает секунды.
+    Поддерживает '300', '300s', '5m', '1h'. Возвращает секунды.
     """
     s = s.strip().lower()
     if s.endswith("s"):
@@ -170,7 +167,6 @@ def parse_duration_seconds(s: str) -> int:
         return int(float(s[:-1]) * 60)
     if s.endswith("h"):
         return int(float(s[:-1]) * 3600)
-    # по умолчанию в секундах
     return int(float(s))
 
 # ===================== Telegram =====================
@@ -196,7 +192,7 @@ def get_updates(offset=None, timeout=10):
         return {"ok": False, "result": []}
 
 # ===================== Bitget API =====================
-BITGET_MIX_CANDLES_URL = "https://api.bitget.com/api/mix/v1/market/history-candles"
+BITGET_MIX_CANDLES_URL = "https://api.bitget.com/api/mix/v1/market/candles"  # ← ИСПРАВЛЕНО
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 def fetch_candles(symbol: str, granularity="5m", limit: int = 300):
@@ -388,7 +384,6 @@ HELP_TEXT = (
 def apply_preset(name: str):
     name = name.lower().strip()
     if name == "aggressive":
-        # Больше сигналов, выше шум
         set_cfg("STRENGTH_MAIN", 0.0010)   # 0.10%
         set_cfg("ATR_MIN", 0.0020)         # 0.20%
         set_cfg("ATR_MAX", 0.0250)         # 2.50%
@@ -396,17 +391,16 @@ def apply_preset(name: str):
         set_cfg("HARD_COOLDOWN_S", 15*60)
         return "✅ Пресет AGGRESSIVE применён: strength 0.10%, ATR 0.20–2.50%, min_candles 15, cooldown 15m"
     elif name == "neutral":
-        set_cfg("STRENGTH_MAIN", 0.0015)   # 0.15%
-        set_cfg("ATR_MIN", 0.0025)         # 0.25%
-        set_cfg("ATR_MAX", 0.0180)         # 1.80%
+        set_cfg("STRENGTH_MAIN", 0.0015)
+        set_cfg("ATR_MIN", 0.0025)
+        set_cfg("ATR_MAX", 0.0180)
         set_cfg("MIN_CANDLES", 18)
         set_cfg("HARD_COOLDOWN_S", 25*60)
         return "✅ Пресет NEUTRAL применён: strength 0.15%, ATR 0.25–1.80%, min_candles 18, cooldown 25m"
     elif name == "conservative":
-        # Меньше ложных, реже сигналы
-        set_cfg("STRENGTH_MAIN", 0.0025)   # 0.25%
-        set_cfg("ATR_MIN", 0.0030)         # 0.30%
-        set_cfg("ATR_MAX", 0.0120)         # 1.20%
+        set_cfg("STRENGTH_MAIN", 0.0025)
+        set_cfg("ATR_MIN", 0.0030)
+        set_cfg("ATR_MAX", 0.0120)
         set_cfg("MIN_CANDLES", 21)
         set_cfg("HARD_COOLDOWN_S", 35*60)
         return "✅ Пресет CONSERVATIVE применён: strength 0.25%, ATR 0.30–1.20%, min_candles 21, cooldown 35m"
