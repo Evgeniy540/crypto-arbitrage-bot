@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Bitget UMCBL сигнальный бот с Telegram-командами:
-/status, /mode, /set, /cooldown, /symbols (add/remove)
-Сообщения как на скрине: 🟢 «фильтры ЗЕЛЁНЫЕ» и ⚡ «Возможен вход ... ⏳»
+Bitget UMCBL сигнальный бот:
+— Сообщения как на скрине: 🟢 «фильтры ЗЕЛЁНЫЕ» и ⚡ «Возможен вход ... ⏳»
+— Анализ: 5m; тренды-подтверждения: 15m и 1h
+— Индикаторы/фильтры: EMA9/21, сила, RSI(14), ATR% коридор, EMA50/200 (5m), тренды 15m/1h
+— Управление через Telegram: /status, /mode, /set, /cooldown, /symbols, /check
+— Диагностика: heartbeat и причины молчания
 """
 
 import os, time, threading, requests
 from datetime import datetime, timezone
 from flask import Flask
 
-# ===== ТВОИ ДАННЫЕ =====
+# ================= ТВОИ ДАННЫЕ =================
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
 FUT_SUFFIX = "_UMCBL"
-# =======================
+# ===============================================
 
 # Монеты по умолчанию
 SYMBOLS = [
@@ -22,12 +25,12 @@ SYMBOLS = [
     "DOTUSDT","OPUSDT","ARBUSDT","APTUSDT","LTCUSDT","PEPEUSDT"
 ]
 
-# -------- ПАРАМЕТРЫ (меняемые через Telegram) --------
+# -------- ПАРАМЕТРЫ (меняются через Telegram) --------
 EMA_FAST, EMA_SLOW = 9, 21
 EMA_TREND_FAST, EMA_TREND_SLOW = 50, 200
 CHECK_INTERVAL_S = 90
 
-STRENGTH_MIN = 0.20     # |EMA9-EMA21|/Close*100, %  (сила)
+STRENGTH_MIN = 0.20     # |EMA9-EMA21|/Close*100, %  (сила сигнала)
 NEAR_BAND_PCT = 0.10    # зона near-cross, %
 RSI_MIN_LONG  = 50
 RSI_MAX_SHORT = 50
@@ -44,36 +47,55 @@ PRESETS = {
     "strict":{"STRENGTH_MIN":0.30, "NEAR_BAND_PCT":0.06, "RSI_MIN_LONG":55, "RSI_MAX_SHORT":45, "ATR_MIN_PCT":0.35, "ATR_MAX_PCT":1.20},
 }
 
+# Диагностика / heartbeat
+LAST_MSG_TS = 0
+LAST_CAUSES = {}   # symbol -> краткая причина отсутствия сигнала
+HEARTBEAT_MIN = 60  # раз в N минут, если не было сообщений — шлём «жив»
+
+# Bitget API
 BITGET_URL = "https://api.bitget.com/api/mix/v1/market/history-candles"
 GRAN_MAP = {"1m":"1min","5m":"5min","15m":"15min","1h":"1h","4h":"4h"}
 
+# Flask keep-alive
 app = Flask(__name__)
 
+# ================= ВСПОМОГАТЕЛЬНЫЕ =================
 def now_utc_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def tg_send(text: str):
+    """Отправка в Telegram + обновление таймштампа активности."""
+    global LAST_MSG_TS
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             timeout=10
         )
+        LAST_MSG_TS = time.time()
     except Exception as e:
         print("TG error:", e)
 
 def fetch_candles(symbol: str, tf: str, limit: int = 300):
-    r = requests.get(
-        BITGET_URL,
-        params={"symbol": f"{symbol}{FUT_SUFFIX}", "granularity": GRAN_MAP[tf], "limit": str(limit)},
-        timeout=15,
-        headers={"User-Agent":"Mozilla/5.0"}
-    )
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    rows = [(int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4])) for x in data]
-    rows.sort(key=lambda t: t[0])
-    return rows
+    """Возвращает [(ts, o, h, l, c)] по возрастанию. Шлёт предупреждение, если Bitget вернул пусто."""
+    try:
+        r = requests.get(
+            BITGET_URL,
+            params={"symbol": f"{symbol}{FUT_SUFFIX}", "granularity": GRAN_MAP[tf], "limit": str(limit)},
+            timeout=15,
+            headers={"User-Agent":"Mozilla/5.0"}
+        )
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        if not data:
+            tg_send(f"⚠️ Нет свечей от Bitget для {symbol}{FUT_SUFFIX} на {tf}")
+            return []
+        rows = [(int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4])) for x in data]
+        rows.sort(key=lambda t: t[0])
+        return rows
+    except Exception as e:
+        print("fetch_candles error:", symbol, tf, e)
+        return []
 
 def ema(series, period):
     k = 2/(period+1.0)
@@ -116,24 +138,32 @@ def cooldown_ok(store, key, minutes): return (time.time() - store.get(key, 0)) >
 def mark_sent(store, key): store[key] = time.time()
 
 def trend_ok(symbol: str):
+    """Возвращает «LONG», если на 15m и 1h EMA50>EMA200; «SHORT», если EMA50<EMA200."""
     try:
         for tf in ("15m","1h"):
             rows = fetch_candles(symbol, tf, limit=240)
+            if not rows: return None
             closes = [r[4] for r in rows]
             e50 = ema(closes, 50)[-1]; e200 = ema(closes, 200)[-1]
             if e50 <= e200:
-                return "SHORT"   # медвежий доминирует
-        return "LONG"            # бычий на обоих ТФ
+                return "SHORT"
+        return "LONG"
     except Exception as e:
         print("trend_ok error:", symbol, e)
         return None
 
-def trend_text(_): return "тренды 15m/1h OK"
+def trend_text(_):  # на карточке пишем просто «OK»
+    return "тренды 15m/1h OK"
 
+# ================= ОСНОВНАЯ ЛОГИКА =================
 def check_symbol(symbol: str):
+    """Проверка монеты, отправка сигналов и запись причины в LAST_CAUSES."""
     try:
         rows = fetch_candles(symbol, "5m", limit=300)
-        if len(rows) < 220: return
+        if len(rows) < 220:
+            LAST_CAUSES[symbol] = "мало свечей 5m"
+            return
+
         _, o, h, l, c = zip(*rows)
         closes, highs, lows = list(c), list(h), list(l)
 
@@ -151,6 +181,7 @@ def check_symbol(symbol: str):
         bull_5m = ema50 > ema200
         bear_5m = ema50 < ema200
 
+        # подтверждённые 🟢
         long_ok = (diff_now>0 and strength>=STRENGTH_MIN and rsi is not None and rsi>=RSI_MIN_LONG
                    and atrp is not None and ATR_MIN_PCT<=atrp<=ATR_MAX_PCT
                    and bull_5m and dom_trend=="LONG")
@@ -158,6 +189,7 @@ def check_symbol(symbol: str):
                     and atrp is not None and ATR_MIN_PCT<=atrp<=ATR_MAX_PCT
                     and bear_5m and dom_trend=="SHORT")
 
+        # near-cross ⚡
         near_band = (abs(diff_now)/price*100.0) <= NEAR_BAND_PCT
         cross_incoming_long  = (diff_prev < 0 and diff_now >= 0) or (near_band and ema9 >= ema21)
         cross_incoming_short = (diff_prev > 0 and diff_now <= 0) or (near_band and ema9 <= ema21)
@@ -172,24 +204,51 @@ def check_symbol(symbol: str):
                     f"Тренды 15m/1h: OK • Сила={strength:.2f}% (≥ {STRENGTH_MIN:.2f}%) • "
                     f"RSI(14)={rsi:.1f} • ATR={atrp:.2f}% в коридоре • EMA50/EMA200 OK")
 
+        # 🟢 подтверждённые
         if long_ok and cooldown_ok(last_hard_sent, (symbol,"LONG"), HARD_COOLDOWN_MIN):
             tg_send(f"🟢 {symbol}{FUT_SUFFIX}: фильтры ЗЕЛЁНЫЕ\n{line_filters('LONG')}")
-            mark_sent(last_hard_sent, (symbol,"LONG")); return
+            mark_sent(last_hard_sent, (symbol,"LONG"))
+            LAST_CAUSES[symbol] = "сигнал LONG отправлен"
+            return
+
         if short_ok and cooldown_ok(last_hard_sent, (symbol,"SHORT"), HARD_COOLDOWN_MIN):
             tg_send(f"🟢 {symbol}{FUT_SUFFIX}: фильтры ЗЕЛЁНЫЕ\n{line_filters('SHORT')}")
-            mark_sent(last_hard_sent, (symbol,"SHORT")); return
+            mark_sent(last_hard_sent, (symbol,"SHORT"))
+            LAST_CAUSES[symbol] = "сигнал SHORT отправлен"
+            return
 
+        # ⚡ возможен вход
         if cross_incoming_long and cooldown_ok(last_near_sent, (symbol,"LONG"), NEAR_COOLDOWN_MIN):
             tg_send(f"⚡ Возможен вход LONG по {symbol}{FUT_SUFFIX}\n{snapshot('LONG')}\n⏳ ждём подтверждения кросса EMA ↑")
-            mark_sent(last_near_sent, (symbol,"LONG")); return
+            mark_sent(last_near_sent, (symbol,"LONG"))
+            LAST_CAUSES[symbol] = "near LONG"
+            return
+
         if cross_incoming_short and cooldown_ok(last_near_sent, (symbol,"SHORT"), NEAR_COOLDOWN_MIN):
             tg_send(f"⚡ Возможен вход SHORT по {symbol}{FUT_SUFFIX}\n{snapshot('SHORT')}\n⏳ ждём подтверждения кросса EMA ↓")
-            mark_sent(last_near_sent, (symbol,"SHORT")); return
+            mark_sent(last_near_sent, (symbol,"SHORT"))
+            LAST_CAUSES[symbol] = "near SHORT"
+            return
+
+        # --- если ничего не отправили — запишем короткую причину
+        reason = []
+        if strength < STRENGTH_MIN: reason.append(f"сила {strength:.2f}%<{STRENGTH_MIN:.2f}%")
+        if rsi is None: reason.append("RSI n/a")
+        else:
+            if diff_now>0 and rsi<RSI_MIN_LONG: reason.append(f"RSI {rsi:.1f}<long {RSI_MIN_LONG}")
+            if diff_now<0 and rsi>RSI_MAX_SHORT: reason.append(f"RSI {rsi:.1f}>short {RSI_MAX_SHORT}")
+        if atrp is None: reason.append("ATR n/a")
+        else:
+            if not (ATR_MIN_PCT <= atrp <= ATR_MAX_PCT): reason.append(f"ATR {atrp:.2f}% вне {ATR_MIN_PCT:.2f}–{ATR_MAX_PCT:.2f}%")
+        if diff_now>0 and not (ema50>ema200 and dom_trend=="LONG"): reason.append("тренд LONG не подтверждён")
+        if diff_now<0 and not (ema50<ema200 and dom_trend=="SHORT"): reason.append("тренд SHORT не подтверждён")
+        LAST_CAUSES[symbol] = "; ".join(reason[:3]) or "ожидание кросса"
 
     except Exception as e:
         print(f"[{now_utc_iso()}] {symbol} error:", e)
+        LAST_CAUSES[symbol] = "ошибка расчёта"
 
-# ---------- Telegram команды (long polling) ----------
+# ================== TELEGRAM КОМАНДЫ ==================
 def apply_preset(name: str):
     global STRENGTH_MIN, NEAR_BAND_PCT, RSI_MIN_LONG, RSI_MAX_SHORT, ATR_MIN_PCT, ATR_MAX_PCT
     conf = PRESETS.get(name.lower())
@@ -247,20 +306,24 @@ def tg_poll():
                 if low.startswith("/set "):
                     try:
                         parts = low.split()
-                        if parts[1]=="strength":
-                            global STRENGTH_MIN; STRENGTH_MIN = float(parts[2]); tg_send("OK: strength=" + parts[2]); 
-                        elif parts[1]=="near":
-                            global NEAR_BAND_PCT; NEAR_BAND_PCT = float(parts[2]); tg_send("OK: near=" + parts[2])
-                        elif parts[1]=="rsi_long":
-                            global RSI_MIN_LONG; RSI_MIN_LONG = int(parts[2]); tg_send("OK: rsi_long=" + parts[2])
-                        elif parts[1]=="rsi_short":
-                            global RSI_MAX_SHORT; RSI_MAX_SHORT = int(parts[2]); tg_send("OK: rsi_short=" + parts[2])
-                        elif parts[1]=="atr" and len(parts)>=4:
+                        if len(parts)<3:
+                            tg_send("❗ Нужно указать значение.\nПримеры:\n/set strength 0.25\n/set near 0.15\n/set rsi_long 55\n/set rsi_short 45\n/set atr 0.30 1.50")
+                            continue
+                        key, val = parts[1], parts[2]
+                        if key=="strength":
+                            global STRENGTH_MIN; STRENGTH_MIN = float(val); tg_send(f"OK: strength={val}")
+                        elif key=="near":
+                            global NEAR_BAND_PCT; NEAR_BAND_PCT = float(val); tg_send(f"OK: near={val}")
+                        elif key=="rsi_long":
+                            global RSI_MIN_LONG; RSI_MIN_LONG = int(val); tg_send(f"OK: rsi_long={val}")
+                        elif key=="rsi_short":
+                            global RSI_MAX_SHORT; RSI_MAX_SHORT = int(val); tg_send(f"OK: rsi_short={val}")
+                        elif key=="atr" and len(parts)>=4:
                             global ATR_MIN_PCT, ATR_MAX_PCT
                             ATR_MIN_PCT = float(parts[2]); ATR_MAX_PCT = float(parts[3])
                             tg_send(f"OK: atr={ATR_MIN_PCT}-{ATR_MAX_PCT}")
                         else:
-                            tg_send("Примеры:\n/set strength 0.25\n/set near 0.12\n/set rsi_long 55\n/set rsi_short 45\n/set atr 0.30 1.50")
+                            tg_send("Неизвестный параметр. Доступно: strength, near, rsi_long, rsi_short, atr")
                     except Exception:
                         tg_send("Ошибка в формате /set")
                     continue
@@ -268,12 +331,14 @@ def tg_poll():
                 if low.startswith("/cooldown"):
                     try:
                         parts = low.split()
+                        if len(parts)<3:
+                            tg_send("Примеры:\n/cooldown near 20\n/cooldown hard 40"); continue
                         if parts[1]=="near":
                             global NEAR_COOLDOWN_MIN; NEAR_COOLDOWN_MIN = int(parts[2]); tg_send("OK: near cooldown=" + parts[2])
                         elif parts[1]=="hard":
                             global HARD_COOLDOWN_MIN; HARD_COOLDOWN_MIN = int(parts[2]); tg_send("OK: hard cooldown=" + parts[2])
                         else:
-                            tg_send("Примеры:\n/cooldown near 20\n/cooldown hard 40")
+                            tg_send("Используй near|hard")
                     except Exception:
                         tg_send("Ошибка в формате /cooldown")
                     continue
@@ -299,25 +364,53 @@ def tg_poll():
                     tg_send("Команды:\n/symbols\n/symbols add DOGEUSDT\n/symbols remove DOGEUSDT")
                     continue
 
-                tg_send("Команды: /status, /mode soft|mid|strict, /set ..., /cooldown ..., /symbols")
+                if low.startswith("/check"):
+                    parts = low.split()
+                    sym = parts[1].upper() if len(parts)>=2 else None
+                    if sym is None:
+                        tg_send("Используй: /check BTCUSDT")
+                        continue
+                    check_symbol(sym)  # прогоняем свежий расчёт
+                    cause = LAST_CAUSES.get(sym, "нет данных")
+                    tg_send(f"🔎 {sym}{FUT_SUFFIX}: {cause}")
+                    continue
+
+                tg_send("Команды: /status, /mode soft|mid|strict, /set ..., /cooldown ..., /symbols, /check SYMBOL")
         except Exception as e:
             print("tg_poll error:", e)
             time.sleep(2)
 
-# ---------- Рабочий цикл сигналов ----------
+# ================== РАБОЧИЕ ПОТОКИ ==================
 def signal_worker():
     while True:
         for s in list(SYMBOLS):
-            check_symbol(s); time.sleep(1.2)
+            check_symbol(s); time.sleep(1.2)  # бережём API
         time.sleep(CHECK_INTERVAL_S)
 
-# ---------- Flask keep-alive ----------
+def heartbeat_worker():
+    while True:
+        try:
+            # если давно не было ни одного сообщения — отправим «жив» + причины
+            if time.time() - LAST_MSG_TS > HEARTBEAT_MIN*60:
+                top = []
+                for s in list(SYMBOLS)[:10]:
+                    if s in LAST_CAUSES:
+                        top.append(f"{s}: {LAST_CAUSES[s]}")
+                extra = "\n".join(top[:5]) if top else "нет причин (мало активности)"
+                tg_send("⏱ Жив. За последний час сигналов не было.\n" + extra)
+            time.sleep(60)
+        except Exception as e:
+            print("heartbeat error:", e)
+            time.sleep(5)
+
+# ================== FLASK KEEP-ALIVE ==================
 @app.route("/")
 def index(): return f"OK {now_utc_iso()}"
 
 def main():
     threading.Thread(target=signal_worker, daemon=True).start()
     threading.Thread(target=tg_poll, daemon=True).start()
+    threading.Thread(target=heartbeat_worker, daemon=True).start()
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
 
