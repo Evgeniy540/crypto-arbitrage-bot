@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 main.py — EMA-сигнальный бот для Bitget UMCBL (фьючерсы)
-- Свечи: /api/mix/v1/market/candles    ← ИСПРАВЛЕНО
-- granularity: "1min","5min","15min","30min","1h","4h","12h","1day","1week"
+- Свечи: /api/mix/v1/market/candles
+- granularity (ТФ): ЦЕЛОЕ ЧИСЛО СЕКУНД (60, 300, 900, 1800, 3600, 14400, 86400, 604800)
 - EMA(9/21), сила сигнала, ATR-коридор
 - fallback 5m -> 15m, ретраи, антиспам "нет сигналов"
 - cooldown по символу, Telegram уведомления и команды
@@ -33,33 +33,24 @@ DEFAULT_SYMBOLS = [
 FUT_SUFFIX = "_UMCBL"   # Bitget USDT-M perpetual
 BASE_TF    = "5m"       # базовый ТФ; при нехватке данных — fallback на 15m
 
-# ---- Маппер таймфреймов для Bitget (строки) ----
-TF_MAP = {
-    "1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min", "30m": "30min",
-    "1h": "1h", "4h": "4h", "12h": "12h", "1d": "1day", "1w": "1week"
+# ---- Маппер таймфреймов -> СЕКУНДЫ для /market/candles ----
+TF_SEC = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "4h": 14400, "12h": 43200, "1d": 86400, "1w": 604800
 }
-NUM_TO_TF = {60: "1min", 180: "3min", 300: "5min", 900: "15min", 1800: "30min",
-             3600: "1h", 14400: "4h", 43200: "12h", 86400: "1day"}
-
-def _raise(msg):  # вспомогательно
-    raise ValueError(msg)
-
-def tf_to_str(x):
+def tf_to_seconds(x):
     """
-    Принимает '5m', '15m', '1h', '5min', 300, '300' и т.п.
-    Возвращает корректную строку для Bitget.
+    Принимает '5m','15m','1h', 300, '300' и т.п.
+    Возвращает int секунд. Кидает ValueError если не распознано.
     """
     if isinstance(x, (int, float)):
-        return NUM_TO_TF.get(int(x), None) or (_raise(f"Unsupported numeric TF: {x}"))
+        return int(x)
     s = str(x).strip().lower()
-    if s in TF_MAP:
-        return TF_MAP[s]
-    if s in TF_MAP.values():       # уже полный формат?
-        return s
-    if s.isdigit():                # число в строке
-        n = int(s)
-        return NUM_TO_TF.get(n, None) or (_raise(f"Unsupported numeric TF: {x}"))
-    return _raise(f"Unsupported timeframe: {x}")
+    if s.isdigit():
+        return int(s)
+    if s in TF_SEC:
+        return TF_SEC[s]
+    raise ValueError(f"Unsupported timeframe: {x}")
 
 # Горячие параметры (будут загружены/перезаписаны из config.json)
 CONFIG_PATH = "config.json"
@@ -94,7 +85,6 @@ def load_config():
             pass
 
 def save_config():
-    tmp = None
     with cfg_lock:
         tmp = dict(cfg)
     try:
@@ -192,7 +182,7 @@ def get_updates(offset=None, timeout=10):
         return {"ok": False, "result": []}
 
 # ===================== Bitget API =====================
-BITGET_MIX_CANDLES_URL = "https://api.bitget.com/api/mix/v1/market/candles"  # ← ИСПРАВЛЕНО
+BITGET_MIX_CANDLES_URL = "https://api.bitget.com/api/mix/v1/market/candles"
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 def fetch_candles(symbol: str, granularity="5m", limit: int = 300):
@@ -200,14 +190,15 @@ def fetch_candles(symbol: str, granularity="5m", limit: int = 300):
     Возвращает (closes:list[float], n:int, err:str|None)
     Делает 1 запрос + 2 ретрая, сортирует бары по времени (старые -> новые),
     аккуратно отбрасывает дубль/незакрытую последнюю свечу.
-    granularity может быть '5m'/'15m'/'5min' или 300/900 — в запрос уходит строка Bitget.
+    granularity принимает '5m'/'15m' или число/строку с числом — в запрос уходит ЦЕЛОЕ ЧИСЛО СЕКУНД.
     """
+    # --- ключевое исправление: всегда переводим в секунды ---
     try:
-        gran_str = tf_to_str(granularity)  # КЛЮЧЕВОЕ: всегда строка Bitget
+        gran_sec = tf_to_seconds(granularity)
     except Exception as conv_err:
         return None, 0, f"granularity convert error: {conv_err}"
 
-    params = {"symbol": f"{symbol}{FUT_SUFFIX}", "granularity": gran_str, "limit": limit}
+    params = {"symbol": f"{symbol}{FUT_SUFFIX}", "granularity": gran_sec, "limit": limit}
     last_err = None
     for _ in range(3):
         try:
@@ -219,10 +210,8 @@ def fetch_candles(symbol: str, granularity="5m", limit: int = 300):
                 time.sleep(0.4)
                 continue
             candles = data["data"]
-            # Bitget часто отдаёт от новых к старым — отсортируем на всякий случай
             candles = sorted(candles, key=lambda x: int(x[0]))  # старые -> новые
             closes  = [float(c[4]) for c in candles]
-            # отрезаем возможный дубль последней по TS
             if len(candles) >= 2 and candles[-1][0] == candles[-2][0]:
                 closes = closes[:-1]
             return closes, len(closes), None
