@@ -2,6 +2,7 @@
 """
 main.py — EMA-сигнальный бот для Bitget UMCBL (фьючерсы)
 - Свечи: /api/mix/v1/market/history-candles
+- ВАЖНО: granularity у Bitget = секунды (60, 300, 900, 1800, 3600, 14400, 86400)
 - EMA(9/21), сила сигнала, ATR-коридор
 - fallback 5m -> 15m, ретраи, антиспам "нет сигналов"
 - cooldown по символу, Telegram уведомления и команды
@@ -21,7 +22,7 @@ from flask import Flask, jsonify
 
 # ===================== ДАННЫЕ (ВПИСАНО) =====================
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
-TELEGRAM_CHAT_ID   = 5723086631  # твой чат
+TELEGRAM_CHAT_ID   = 5723086631  # твой чат (int)
 
 # ===================== НАСТРОЙКИ ПО УМОЛЧАНИЮ =====================
 DEFAULT_SYMBOLS = [
@@ -31,6 +32,25 @@ DEFAULT_SYMBOLS = [
 ]
 FUT_SUFFIX = "_UMCBL"   # Bitget USDT-M perpetual
 BASE_TF    = "5m"       # базовый ТФ; при нехватке данных — fallback на 15m
+
+# ---- Маппер таймфреймов -> секунды для Bitget ----
+TF_MAP = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "4h": 14400, "1d": 86400
+}
+def tf_to_seconds(x):
+    """
+    Принимает "5m", "15m", "1h", 300, "300" и т.п.
+    Возвращает int секунд. Поднимает ValueError если не распознано.
+    """
+    if isinstance(x, (int, float)):
+        return int(x)
+    s = str(x).strip().lower()
+    if s.isdigit():
+        return int(s)
+    if s in TF_MAP:
+        return TF_MAP[s]
+    raise ValueError(f"Unsupported timeframe: {x}")
 
 # Горячие параметры (будут загружены/перезаписаны из config.json)
 CONFIG_PATH = "config.json"
@@ -168,13 +188,20 @@ def get_updates(offset=None, timeout=10):
 BITGET_MIX_CANDLES_URL = "https://api.bitget.com/api/mix/v1/market/history-candles"
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-def fetch_candles(symbol: str, granularity: str = "5m", limit: int = 300):
+def fetch_candles(symbol: str, granularity="5m", limit: int = 300):
     """
     Возвращает (closes:list[float], n:int, err:str|None)
     Делает 1 запрос + 2 ретрая, сортирует бары по времени (старые -> новые),
     аккуратно отбрасывает дубль/незакрытую последнюю свечу.
+    granularity может быть '5m'/'15m'/300/900 и т.п. — в запрос уходит число секунд.
     """
-    params = {"symbol": f"{symbol}{FUT_SUFFIX}", "granularity": granularity, "limit": limit}
+    # --- ключевое исправление: всегда переводим в секунды ---
+    try:
+        gran_sec = tf_to_seconds(granularity)
+    except Exception as conv_err:
+        return None, 0, f"granularity convert error: {conv_err}"
+
+    params = {"symbol": f"{symbol}{FUT_SUFFIX}", "granularity": gran_sec, "limit": limit}
     last_err = None
     for _ in range(3):
         try:
@@ -185,14 +212,16 @@ def fetch_candles(symbol: str, granularity: str = "5m", limit: int = 300):
                 last_err = "bad payload"
                 time.sleep(0.4)
                 continue
-            candles = sorted(data["data"], key=lambda x: int(x[0]))  # старые -> новые
+            candles = data["data"]
+            # Bitget обычно отдаёт от новых к старым — отсортируем на всякий случай
+            candles = sorted(candles, key=lambda x: int(x[0]))  # старые -> новые
             closes  = [float(c[4]) for c in candles]
             # отрезаем возможный дубль последней по TS
             if len(candles) >= 2 and candles[-1][0] == candles[-2][0]:
                 closes = closes[:-1]
             return closes, len(closes), None
         except Exception as e:
-            last_err = str(e)
+            last_err = f"{type(e).__name__}: {e}"
             time.sleep(0.5)
     return None, 0, last_err or "unknown error"
 
