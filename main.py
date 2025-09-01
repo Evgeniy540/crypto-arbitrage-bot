@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 main.py — EMA-сигнальный бот для Bitget UMCBL (фьючерсы)
-- Свечи: /api/mix/v1/market/candles
-- granularity (ТФ): ЦЕЛОЕ ЧИСЛО СЕКУНД (60, 300, 900, 1800, 3600, 14400, 86400, 604800)
+- Свечи: GET /api/mix/v1/market/candles
+- ВАЖНО:
+  * granularity = целое число секунд (60, 300, 900, 1800, 3600, 14400, 86400, 604800)
+  * endTime (мс) обязателен — конец окна (обычно текущее время)
 - EMA(9/21), сила сигнала, ATR-коридор
 - fallback 5m -> 15m, ретраи, антиспам "нет сигналов"
 - cooldown по символу, Telegram уведомления и команды
@@ -33,16 +35,13 @@ DEFAULT_SYMBOLS = [
 FUT_SUFFIX = "_UMCBL"   # Bitget USDT-M perpetual
 BASE_TF    = "5m"       # базовый ТФ; при нехватке данных — fallback на 15m
 
-# ---- Маппер таймфреймов -> СЕКУНДЫ для /market/candles ----
+# ---- Таймфреймы -> секунды для /market/candles ----
 TF_SEC = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
     "1h": 3600, "4h": 14400, "12h": 43200, "1d": 86400, "1w": 604800
 }
 def tf_to_seconds(x):
-    """
-    Принимает '5m','15m','1h', 300, '300' и т.п.
-    Возвращает int секунд. Кидает ValueError если не распознано.
-    """
+    """Принимает '5m'/'15m'/'1h', 300, '300' и т.п. → int секунд."""
     if isinstance(x, (int, float)):
         return int(x)
     s = str(x).strip().lower()
@@ -190,15 +189,22 @@ def fetch_candles(symbol: str, granularity="5m", limit: int = 300):
     Возвращает (closes:list[float], n:int, err:str|None)
     Делает 1 запрос + 2 ретрая, сортирует бары по времени (старые -> новые),
     аккуратно отбрасывает дубль/незакрытую последнюю свечу.
-    granularity принимает '5m'/'15m' или число/строку с числом — в запрос уходит ЦЕЛОЕ ЧИСЛО СЕКУНД.
+    granularity принимает '5m'/'15m' или число/строку с числом — в запрос уходит ИНТ СЕКУНД + обязательный endTime (мс).
     """
-    # --- ключевое исправление: всегда переводим в секунды ---
+    # --- ключевое: всегда секунды ---
     try:
         gran_sec = tf_to_seconds(granularity)
     except Exception as conv_err:
         return None, 0, f"granularity convert error: {conv_err}"
 
-    params = {"symbol": f"{symbol}{FUT_SUFFIX}", "granularity": gran_sec, "limit": limit}
+    end_ts_ms = int(time.time() * 1000)  # текущее время в мс (обязательный параметр)
+
+    params = {
+        "symbol": f"{symbol}{FUT_SUFFIX}",
+        "granularity": gran_sec,
+        "limit": limit,
+        "endTime": end_ts_ms
+    }
     last_err = None
     for _ in range(3):
         try:
