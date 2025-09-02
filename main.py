@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-main.py — сигнальный EMA-бот для Bitget (UMCBL фьючерсы, только сигналы)
-- Свечи: /api/mix/v1/market/history-candles (PUBLIC)
+main.py — СИГНАЛЬНЫЙ EMA-бот для Bitget (UMCBL фьючерсы)
+- Свечи: /api/mix/v1/market/candles  ← ПРАВИЛЬНЫЙ ЭНДПОИНТ
+- granularity — в секундах (60, 300, 900, 1800, 3600, 14400, 86400)
+- Символы указываем полными: BTCUSDT_UMCBL и т.п. (без конкатенаций)
 - EMA(9/21), пресеты /mode ultra|normal, ручные /set*
-- Антиспам "нет сигнала" не чаще 1/час на символ
-- Flask для Render + фоновая проверка + прием команд через getUpdates
+- Антиспам «нет сигнала» не чаще 1/час; кулдаун после сигнала 5 мин
+- Flask для Render + фоновая проверка + команды через getUpdates
 """
 
 import os
@@ -16,10 +18,10 @@ from collections import defaultdict
 import requests
 from flask import Flask
 
-# ==== ТВОИ ДАННЫЕ (вписано) ====
+# ==== ТВОИ ДАННЫЕ ====
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
-# ===============================
+# =====================
 
 # Полные фьючерсные символы Bitget (USDT-M perpetual)
 SYMBOLS = [
@@ -27,7 +29,7 @@ SYMBOLS = [
     "ETHUSDT_UMCBL",
     "SOLUSDT_UMCBL",
     "XRPUSDT_UMCBL",
-    "TRXUSDT_UMCBL"
+    "TRXUSDT_UMCBL",
 ]
 
 # Базовые настройки
@@ -38,7 +40,7 @@ MIN_CANDLES = 120
 EMA_FAST, EMA_SLOW = 9, 21
 
 # Фильтры
-EPS_PCT = 0.0008     # близость EMA (0.08% от цены)
+EPS_PCT = 0.0008     # близость EMA (0.08%)
 ATR_FACTOR = 0.25    # фильтр по волатильности
 SLOPE_MIN = 0.0      # минимальный наклон быстрой EMA
 
@@ -46,9 +48,9 @@ SLOPE_MIN = 0.0      # минимальный наклон быстрой EMA
 NO_SIGNAL_COOLDOWN_S = 3600
 SIGNAL_COOLDOWN_S = 300
 
-# Bitget публичный эндпоинт
+# Bitget PUBLIC API (candles!)
+BITGET_MIX_CANDLES = "https://api.bitget.com/api/mix/v1/market/candles"
 HEADERS = {"User-Agent": "Mozilla/5.0 (EMA-signal-bot/1.0)"}
-BITGET_MIX_CANDLES = "https://api.bitget.com/api/mix/v1/market/history-candles"
 
 # Глобальное состояние
 app = Flask(__name__)
@@ -69,21 +71,20 @@ state = {
     "mode": "normal",
 }
 
-# ===== Утилиты
+# ==== Утилиты
 def now_ts(): return time.time()
 def fmt_dt(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def send_tg(text: str):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
-        requests.post(url, json=payload, timeout=15)
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
     except Exception as e:
         print("Telegram error:", e)
 
 def ema(series, period):
     if len(series) < period: return []
-    k = 2.0 / (period+1)
+    k = 2.0 / (period + 1.0)
     out = []
     ema_prev = sum(series[:period]) / period
     out.extend([None]*(period-1))
@@ -113,22 +114,25 @@ def atr(h,l,c,period=14):
     return out
 
 def gran_ok(tf: str) -> str:
-    # Bitget ждёт секунды
+    # Bitget ждёт СЕКУНДЫ
     mapping = {
-        "1m":"60","5m":"300","15m":"900","30m":"1800",
-        "1h":"3600","4h":"14400","1d":"86400"
+        "1m":"60", "5m":"300", "15m":"900", "30m":"1800",
+        "1h":"3600", "4h":"14400", "1d":"86400",
     }
     return mapping.get(tf, "300")
 
 def parse_candles(data):
+    """data: [[ts, open, high, low, close, volume], ...] — строки"""
     rows=[]
     for row in data:
         try:
             ts=int(row[0])/1000.0; o=float(row[1]); h=float(row[2]); l=float(row[3]); c=float(row[4])
             rows.append((ts,o,h,l,c))
         except: pass
-    rows.sort(key=lambda x: x[0])
-    t=[r[0] for r in rows]; o=[r[1] for r in rows]; h=[r[2] for r in rows]; l=[r[3] for r in rows]; c=[r[4] for r in rows]
+    rows.sort(key=lambda x: x[0])  # по времени
+    t=[r[0] for r in rows]; o=[r[1] for r in rows]; h=[r[2]]; l=[r[3]]; c=[r[4]]
+    # фикс длины списков
+    h=[r[2] for r in rows]; l=[r[3] for r in rows]
     return t,o,h,l,c
 
 def fetch_candles(full_symbol: str, tf: str, limit: int = 300):
@@ -138,11 +142,13 @@ def fetch_candles(full_symbol: str, tf: str, limit: int = 300):
         j = r.json()
     except Exception as e:
         return None, f"Network error: {e}"
-    if not isinstance(j, dict): return None, "Bad response"
+    if not isinstance(j, dict):
+        return None, "Bad response"
     if j.get("code") != "00000":
         return None, f"Bitget error {j.get('code')}: {j.get('msg')}"
     data = j.get("data", [])
-    if not data: return None, "No candles"
+    if not data:
+        return None, "No candles"
     t,o,h,l,c = parse_candles(data)
     return {"t":t,"o":o,"h":h,"l":l,"c":c}, None
 
@@ -153,8 +159,7 @@ def last_cross_signal(efast, eslow, eps_pct, slope_min, atr_arr, atr_k):
         return None, "мало EMA"
     df_prev = efast[-2]-eslow[-2] if efast[-2] is not None and eslow[-2] is not None else None
     df_curr = efast[-1]-eslow[-1]
-    price = efast[-1]
-    eps_abs = price*eps_pct
+    price = efast[-1]; eps_abs = price*eps_pct
     slope = (efast[-1]-efast[-2]) if efast[-2] is not None else 0.0
     if slope < slope_min: return None, "slope низкий"
     a = atr_arr[-1] if atr_arr and atr_arr[-1] is not None else None
@@ -178,14 +183,14 @@ def make_signal_text(sym, side, price, tf, note):
             f"Причина: {note}\n"
             f"{fmt_dt()}")
 
-# ===== Логика проверки
+# ==== Логика
 def check_symbol(full_symbol: str):
     if now_ts() < cooldown_per_symbol[full_symbol]:
         return
     candles, err = fetch_candles(full_symbol, state["base_tf"], limit=max(300, state["min_candles"]+50))
     tf_used = state["base_tf"]
     if err:
-        # fallback на 15m
+        # fallback на другой ТФ
         candles_fb, err_fb = fetch_candles(full_symbol, state["fallback_tf"], limit=max(300, state["min_candles"]+50))
         if candles_fb:
             candles = candles_fb; tf_used = state["fallback_tf"]
@@ -209,7 +214,7 @@ def check_symbol(full_symbol: str):
     else:
         maybe_send_no_signal(full_symbol)
 
-# ===== Пресеты и команды
+# ==== Пресеты и команды
 def apply_mode(mode: str):
     mode = mode.lower()
     if mode == "ultra":
@@ -259,8 +264,7 @@ def handle_command(text: str):
         try:
             payload = txt.split(None,1)[1]
             items = [x.strip().upper() for x in payload.replace(",", " ").split() if x.strip()]
-            # ожидаем уже полные названия *_UMCBL
-            state["symbols"] = items
+            state["symbols"] = items  # ожидаем *_UMCBL
             send_tg(f"✅ SYMBOLS:\n{', '.join(state['symbols'])}")
         except: send_tg("Формат: /setsymbols BTCUSDT_UMCBL ETHUSDT_UMCBL ...")
         return
@@ -299,13 +303,13 @@ def tg_updates_loop():
             print("tg loop err:", e)
         time.sleep(1)
 
-# ===== Основной воркер
+# ==== Основной воркер
 def worker():
     send_tg("🤖 Бот запущен (сигнальный). Используй /mode ultra или /mode normal.")
-    # Быстрая диагностика: пробуем BTCUSDT_UMCBL 5m
+    # Диагностика: пробуем BTCUSDT_UMCBL
     test, err = fetch_candles("BTCUSDT_UMCBL", state["base_tf"], 100)
     if err: send_tg(f"⚠️ Диагностика Bitget: {err}")
-    else:   send_tg("✅ Bitget подключен (history-candles OK).")
+    else:   send_tg("✅ Bitget подключен (candles OK).")
 
     while True:
         start = now_ts()
@@ -314,10 +318,9 @@ def worker():
                 check_symbol(sym)
             except Exception as e:
                 print("check_symbol error", sym, e)
-        spent = now_ts()-start
-        time.sleep(max(2.0, state["check_s"]-spent))
+        time.sleep(max(2.0, state["check_s"] - (now_ts()-start)))
 
-# ===== Flask (Render keep-alive)
+# ==== Flask (Render keep-alive)
 @app.route("/")
 def root(): return "ok"
 
