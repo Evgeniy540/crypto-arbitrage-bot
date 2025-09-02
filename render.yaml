@@ -1,21 +1,10 @@
 services:
   - type: web
-    name: bitget-trading-bot
+    name: crypto-alert-bot
     env: python
+    buildCommand: ""
+    startCommand: python main.py
     plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
-    autoDeploy: true
     envVars:
-      - key: BITGET_API_KEY
-        value: "bg_7bd202760f36727cedf11a481dbca611"
-      - key: BITGET_API_SECRET
-        value: "b6bd206dfbe827ee5b290604f6097d781ce5adabc3f215bba2380fb39c0e9711"
-      - key: BITGET_API_PASSPHRASE
-        value: "Evgeniy84"
-      - key: TELEGRAM_TOKEN
-        value: "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
-      - key: TELEGRAM_CHAT_ID
-        value: "5723086631"
-    build:
-      pythonVersion: 3.11
+      - key: PYTHON_VERSION
+        value: 3.11.9
