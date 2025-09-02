@@ -1,15 +1,7 @@
 # -*- coding: utf-8 -*-
-"""
-EMA-сигнальный бот для Bitget UMCBL (фьючерсы)
-- Свечи: GET /api/mix/v1/market/candles
-- granularity: секунды (60,300,900,1800,3600,14400,43200,86400,604800)
-- limit: 200 (макс Bitget)
-- Всегда передаём startTime и endTime (мс)
-- Полный набор команд, пресеты, fallback 5m→15m, антиспам, cooldown
-"""
-
 import os
 import time
+import math
 import json
 import threading
 from datetime import datetime, timezone
@@ -17,437 +9,482 @@ from datetime import datetime, timezone
 import requests
 from flask import Flask, jsonify
 
-# ===================== TOKEN/CHAT =====================
-TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
-TELEGRAM_CHAT_ID   = 5723086631
+# ========= ТВОИ ДАННЫЕ (можешь оставить как есть) =========
+# Лучше брать из переменных окружения на Render, но по твоим просьбам вписал напрямую.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "5723086631")  # строкой — так надёжнее
+# ==========================================================
 
-# ===================== DEFAULTS =====================
-DEFAULT_SYMBOLS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT",
-    "LINKUSDT","NEARUSDT","ATOMUSDT","INJUSDT","SUIUSDT",
-    "DOTUSDT","OPUSDT","ARBUSDT","APTUSDT","LTCUSDT","PEPEUSDT"
-]
-FUT_SUFFIX = "_UMCBL"
-BASE_TF    = "5m"   # fallback -> 15m при нехватке баров
+app = Flask(__name__)
 
-TF_SEC = {
-    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
-    "1h": 3600, "4h": 14400, "12h": 43200, "1d": 86400, "1w": 604800
+# -------- Общие настройки --------
+FUT_SUFFIX = "_UMCBL"  # Bitget USDT-M perpetual
+DEFAULT_SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","TRXUSDT","PEPEUSDT"]
+
+CONFIG = {
+    "symbols": DEFAULT_SYMBOLS[:],
+    "base_tf": "5m",
+    "fallback_tf": "1m",      # используем для "усиления" сигналов, если на 5m тихо
+    "ema_fast": 9,
+    "ema_slow": 21,
+    "min_candles": 10,
+    "strength": 0.05,         # доля (0.05=5%)
+    "atr_min": 0.05,          # доля; по итогу парсинга приведём к 0.05..0.10
+    "atr_max": 0.10,
+    "check_interval_s": 120,  # период проверки
+    "cooldown_min": 10,       # антиспам по символу
+    "near_cross_eps": 0.001,  # 0.10% близость EMA9/EMA21
+    "ema_slope_min": 0.0,     # фильтр наклона EMA9 (0=отключен)
 }
-def tf_to_seconds(x):
-    if isinstance(x, (int, float)): return int(x)
-    s = str(x).strip().lower()
-    if s.isdigit(): return int(s)
-    if s in TF_SEC: return TF_SEC[s]
-    raise ValueError(f"Unsupported timeframe: {x}")
 
-CONFIG_PATH = "config.json"
-cfg_lock = threading.Lock()
-cfg = {
-    "MIN_CANDLES": 18,
-    "STRENGTH_MAIN": 0.0015,   # 0.15%
-    "ATR_MIN": 0.0025,         # 0.25%
-    "ATR_MAX": 0.0180,         # 1.80%
-    "CHECK_INTERVAL_S": 300,
-    "HARD_COOLDOWN_S": 25*60,
-    "NO_SIGNAL_INTERVAL_S": 60*60,
-    "SYMBOLS": DEFAULT_SYMBOLS
-}
-_env_symbols = os.getenv("SYMBOLS", "").strip()
-if _env_symbols:
-    cfg["SYMBOLS"] = [s.strip().upper() for s in _env_symbols.split(",") if s.strip()]
+# Разрешённые пределы для ATR (доли)
+ATR_MIN_ALLOWED = 0.001   # 0.10%
+ATR_MAX_ALLOWED = 0.20    # 20.0%
 
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            with cfg_lock:
-                for k, v in data.items():
-                    if k in cfg: cfg[k] = v
-        except Exception: pass
-def save_config():
-    with cfg_lock: tmp = dict(cfg)
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(tmp, f, ensure_ascii=False, indent=2)
-    except Exception: pass
-load_config()
+# Антиспам и живость
+_last_signal_ts_any = 0.0
+_last_alive_notice_ts = 0.0
+_symbol_cooldown = {}    # { "BTCUSDT": unixtime_last_signal }
+_updates_offset = 0
 
-def get_cfg(k): 
-    with cfg_lock: return cfg[k]
-def set_cfg(k, v):
-    with cfg_lock: cfg[k] = v
-    save_config()
+# --------- Утилиты времени/логов ----------
+def now_ts() -> float:
+    return time.time()
 
-# ===================== UTILS =====================
-def now_ts(): return time.time()
-def pct(a, b): return (a - b) / b if b else 0.0
-def ema(series, length):
-    if len(series) < length: return None
-    k = 2.0/(length+1.0); e = series[0]
-    for v in series[1:]: e = v*k + e*(1-k)
-    return e
-def atr_like(closes, period=14):
-    if len(closes) < period+1: return None
-    diffs = [abs(closes[i]-closes[i-1]) for i in range(1, len(closes))]
-    return sum(diffs[-period:]) / float(period)
-def ts_iso(ts=None):
-    if ts is None: ts = now_ts()
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-def parse_number(s: str):
-    s = s.strip().replace(",", "."); is_percent = s.endswith("%")
-    if is_percent: s = s[:-1].strip()
-    v = float(s); return v/100.0 if is_percent else v
-def parse_duration_seconds(s: str) -> int:
-    s = s.strip().lower()
-    if s.endswith("s"): return int(float(s[:-1]))
-    if s.endswith("m"): return int(float(s[:-1]) * 60)
-    if s.endswith("h"): return int(float(s[:-1]) * 3600)
-    return int(float(s))
+def ts_to_str(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
-# ===================== Telegram =====================
-def send_tele(text: str):
+def log(msg: str):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+# --------- Telegram ----------
+def tg_url(method: str) -> str:
+    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+
+def send_msg(chat_id: str, text: str, disable_web_page_preview=True):
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text}
+            tg_url("sendMessage"),
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": disable_web_page_preview,
+                "parse_mode": "HTML"
+            },
+            timeout=15
         )
-    except Exception: pass
+    except Exception as e:
+        log(f"TG send error: {e}")
 
-def get_updates(offset=None, timeout=10):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"timeout": timeout}
-    if offset is not None: params["offset"] = offset
+def _parse_pct(x: str) -> float:
+    """
+    Принятая нотация:
+    - '0.05' или '.05' -> 0.05 (5%)
+    - '5' или '5%'     -> 0.05 (5%)
+    """
+    s = x.strip().lower().replace(',', '.')
+    if s.endswith('%'):
+        s = s[:-1].strip()
+        val = float(s) / 100.0
+        return val
+    if s.startswith('.'):
+        s = '0' + s
+    val = float(s)
+    if val > 1.0:
+        val = val / 100.0
+    return val
+
+def apply_mode(mode: str):
+    m = mode.lower()
+    if m == "ultra":
+        CONFIG.update({
+            "strength": 0.03,           # 3%
+            "atr_min": 0.05,            # 5%
+            "atr_max": 0.10,            # 10% (у тебя код исторически держал 5..10)
+            "min_candles": 8,
+            "cooldown_min": 5,
+            "check_interval_s": 60,
+            "near_cross_eps": 0.0015,   # 0.15%
+            "ema_slope_min": 0.0,
+        })
+        return True
+    elif m == "normal":
+        CONFIG.update({
+            "strength": 0.05,           # 5%
+            "atr_min": 0.05,            # 5%
+            "atr_max": 0.10,            # 10%
+            "min_candles": 15,
+            "cooldown_min": 15,
+            "check_interval_s": 300,
+            "near_cross_eps": 0.001,    # 0.10%
+            "ema_slope_min": 0.0,
+        })
+        return True
+    return False
+
+# --------- Bitget свечи ----------
+BITGET_HOST = "https://api.bitget.com"
+HISTORY_CANDLES = "/api/mix/v1/market/history-candles"
+
+# TF -> granularity
+GRANULARITY_MAP = {
+    "1m": "1min",
+    "3m": "3min",
+    "5m": "5min",
+    "15m": "15min",
+}
+
+def fetch_candles(symbol: str, tf: str, limit: int = 300):
+    """
+    Возвращает candles в виде списков (ts, open, high, low, close) — от старых к новым.
+    """
+    inst_id = f"{symbol}{FUT_SUFFIX}"
+    gran = GRANULARITY_MAP.get(tf, "5min")
+    params = {"symbol": inst_id, "granularity": gran}
+    headers = {"User-Agent": "Mozilla/5.0"}
+
     try:
-        r = requests.get(url, params=params, timeout=timeout+5)
-        r.raise_for_status(); return r.json()
-    except Exception: return {"ok": False, "result": []}
+        r = requests.get(BITGET_HOST + HISTORY_CANDLES, params=params, headers=headers, timeout=15)
+        data = r.json()
+        if data.get("code") not in (None, "00000", 0):
+            log(f"Bitget error {data.get('code')}: {data.get('msg')}")
+            return []
+        arr = data.get("data") or []
+        # Формат: [timestamp(ms), open, high, low, close, volume, ...] — строки
+        # Разворачиваем к старым -> новым
+        arr = list(reversed(arr))
+        out = []
+        for row in arr[-limit:]:
+            ts_ms = int(float(row[0]))
+            o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
+            out.append((ts_ms/1000.0, o, h, l, c))
+        return out
+    except Exception as e:
+        log(f"fetch_candles error {symbol} {tf}: {e}")
+        return []
 
-# ===================== Bitget API =====================
-BITGET_MIX_CANDLES_URL = "https://api.bitget.com/api/mix/v1/market/candles"
-HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
-BITGET_LIMIT = 200  # макс
-
-def _extract_candles(json_obj):
+# --------- ТА: EMA и ATR ----------
+def ema_series(values, period):
     """
-    Поддерживаем оба формата Bitget:
-    1) {"code":"00000","data":[[...], ...]}
-    2) [[...], ...]  (иногда сервис отдаёт так)
-    -> возвращаем list[list]
+    Экспоненциальная средняя. Возвращает список такой же длины.
     """
-    if isinstance(json_obj, list):
-        return json_obj
-    if isinstance(json_obj, dict):
-        data = json_obj.get("data")
-        if isinstance(data, list):
-            return data
-    return None
+    if not values or period <= 0:
+        return []
+    k = 2.0 / (period + 1.0)
+    ema = []
+    s = sum(values[:period]) / period if len(values) >= period else sum(values)/len(values)
+    ema.append(s)
+    start = 1
+    if len(values) >= period:
+        start = period
+    for i in range(start, len(values)):
+        s = values[i]*k + ema[-1]*(1-k)
+        ema.append(s)
+    # выровнять длину
+    if len(ema) < len(values):
+        ema = [ema[0]]*(len(values)-len(ema)) + ema
+    return ema
 
-def fetch_candles(symbol: str, granularity="5m"):
+def atr_percent(highs, lows, closes, period=14):
     """
-    Возвращает (closes:list[float], n:int, err:str|None)
-    - granularity в СЕКУНДАХ
-    - передаём startTime и endTime
+    Возвращает ATR в долях (например 0.05=5%) — берём ATR/close.
     """
-    try:
-        gran_sec = tf_to_seconds(granularity)  # "5m" -> 300
-    except Exception as conv_err:
-        return None, 0, f"granularity convert error: {conv_err}"
+    n = len(closes)
+    if n < period+1:
+        return None
+    trs = []
+    prev_close = closes[0]
+    for i in range(1, n):
+        tr = max(highs[i]-lows[i], abs(highs[i]-prev_close), abs(lows[i]-prev_close))
+        trs.append(tr)
+        prev_close = closes[i]
+    # simple moving average TR за 'period' последних
+    if len(trs) < period:
+        return None
+    atr = sum(trs[-period:]) / period
+    last_close = closes[-1]
+    if last_close <= 0:
+        return None
+    return atr / last_close
 
-    end_ts_ms   = int(time.time() * 1000)
-    start_ts_ms = end_ts_ms - gran_sec * BITGET_LIMIT * 1000
+# --------- Логика силы/сигнала ----------
+def compute_strength(ema_f, ema_s):
+    # %-расхождение EMA: |EMA9-EMA21|/EMA21
+    return abs(ema_f - ema_s) / max(1e-9, ema_s)
 
-    params = {
-        "symbol": f"{symbol}{FUT_SUFFIX}",
-        "granularity": gran_sec,     # ЧИСЛО секунд
-        "limit": BITGET_LIMIT,
-        "startTime": start_ts_ms,
-        "endTime": end_ts_ms
-    }
+def near_cross(ema_f, ema_s, eps):
+    return abs(ema_f - ema_s) / max(1e-9, ema_s) <= eps
 
-    last_err = None
-    for _ in range(3):
-        try:
-            r = requests.get(BITGET_MIX_CANDLES_URL, params=params,
-                             headers=HTTP_HEADERS, timeout=10)
-            r.raise_for_status()
-            data = r.json()
+def slope(series):
+    if len(series) < 2:
+        return 0.0
+    return (series[-1] - series[-2]) / max(1e-9, series[-2])
 
-            arr = _extract_candles(data)
-            if not isinstance(arr, list):
-                # дружелюбный сниппет для диагностики
-                return None, 0, f"bad payload: {str(data)[:200]}"
+def should_alert(ema9, ema21, ema9_series, atr_val):
+    # 1) ATR в коридоре
+    if atr_val is None or not (CONFIG["atr_min"] <= atr_val <= CONFIG["atr_max"]):
+        return False, f"ATR {atr_val*100:.2f}% вне [{CONFIG['atr_min']*100:.2f}..{CONFIG['atr_max']*100:.2f}]"
+    # 2) сила сигнала
+    st = compute_strength(ema9, ema21)
+    if st >= CONFIG["strength"]:
+        return True, f"strength {st*100:.2f}% >= {CONFIG['strength']*100:.2f}%"
+    # 3) near-cross + наклон EMA9
+    if near_cross(ema9, ema21, CONFIG["near_cross_eps"]):
+        sl = slope(ema9_series)
+        if sl >= CONFIG["ema_slope_min"]:
+            return True, f"near-cross {CONFIG['near_cross_eps']*100:.2f}%, slope {sl:.5f}"
+    return False, f"weak strength {st*100:.2f}%"
 
-            # ожидаемый формат свечи: [ts, open, high, low, close, vol, quoteVol]
-            candles = sorted(arr, key=lambda x: int(x[0]))
-            closes  = [float(c[4]) for c in candles if isinstance(c, (list, tuple)) and len(c) > 5]
-            if not closes:
-                return None, 0, "no closes parsed"
-            return closes, len(closes), None
+def tf_label(tf: str) -> str:
+    return tf
 
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            time.sleep(0.5)
-
-    return None, 0, last_err or "unknown error"
-
-def get_closes_with_fallback(symbol: str, min_candles: int):
-    closes, n, err = fetch_candles(symbol, "5m")
-    if closes and n >= min_candles:
-        return closes, "5m", n, None, None
-    closes15, n15, err15 = fetch_candles(symbol, "15m")
-    if closes15 and n15 >= min_candles:
-        return closes15, "15m", n15, "fallback", None
-    best_n = max(n, n15 if closes15 else 0)
-    return None, None, best_n, None, (err15 if not closes else err)
-
-# ===================== СИГНАЛЫ =====================
-last_signal_ts_by_symbol = {}
-last_no_signal_ts = 0.0
-
-def symbol_on_cooldown(symbol: str, hard_cooldown_s: int) -> bool:
-    ts = last_signal_ts_by_symbol.get(symbol, 0.0)
-    return (now_ts() - ts) < hard_cooldown_s
-
-def mark_signal(symbol: str):
-    last_signal_ts_by_symbol[symbol] = now_ts()
-
-def check_signals_once():
-    global last_no_signal_ts
-    had_any_signal = False
-
-    MIN_CANDLES        = get_cfg("MIN_CANDLES")
-    STRENGTH_MAIN      = get_cfg("STRENGTH_MAIN")
-    ATR_MIN            = get_cfg("ATR_MIN")
-    ATR_MAX            = get_cfg("ATR_MAX")
-    HARD_COOLDOWN_S    = get_cfg("HARD_COOLDOWN_S")
-    NO_SIGNAL_INTERVAL = get_cfg("NO_SIGNAL_INTERVAL_S")
-    SYMBOLS            = get_cfg("SYMBOLS")
-
-    for symbol in SYMBOLS:
-        if symbol_on_cooldown(symbol, HARD_COOLDOWN_S):
+# --------- Основной цикл проверок ----------
+def analyze_symbol(symbol: str):
+    """
+    Возвращает (signal_text|None, reason, used_tf)
+    """
+    # Сначала базовый TF
+    for tf in (CONFIG["base_tf"], CONFIG["fallback_tf"]):
+        candles = fetch_candles(symbol, tf)
+        if len(candles) < CONFIG["min_candles"]:
+            reason = f"недостаточно свечей ({len(candles)}<{CONFIG['min_candles']}) на {tf}"
             continue
 
-        closes, tf_used, n_bars, fb, err = get_closes_with_fallback(symbol, MIN_CANDLES)
-        if not closes:
-            send_tele(f"{symbol}: свечей={n_bars} — недостаточно данных{'' if not err else f' (err: {err})'}")
+        closes = [c[4] for c in candles]
+        highs  = [c[2] for c in candles]
+        lows   = [c[3] for c in candles]
+
+        ema9  = ema_series(closes, CONFIG["ema_fast"])
+        ema21 = ema_series(closes, CONFIG["ema_slow"])
+
+        if len(ema9) < CONFIG["min_candles"] or len(ema21) < CONFIG["min_candles"]:
+            reason = f"EMA не готовы на {tf}"
             continue
 
-        ema9  = ema(closes[-200:], 9)
-        ema21 = ema(closes[-200:], 21)
-        if ema9 is None or ema21 is None:
-            send_tele(f"{symbol}: свечей={len(closes)} — EMA не посчитать")
+        e9  = ema9[-1]
+        e21 = ema21[-1]
+        atr = atr_percent(highs, lows, closes, period=14)
+
+        ok, why = should_alert(e9, e21, ema9, atr if atr is not None else 0.0)
+        if not ok:
+            # тихо — пытаемся другим tf (fallback) на следующей итерации for
+            reason = why
+            if tf == CONFIG["fallback_tf"]:
+                return None, reason, tf
             continue
 
-        strength = abs(pct(ema9, ema21))      # |EMA9-EMA21| / EMA21
-        atrv     = atr_like(closes, 14)
-        atr_rel  = pct(atrv, closes[-1]) if atrv else None
+        side = "LONG 📈" if e9 > e21 else "SHORT 📉"
+        msg = (
+            f"🔔 <b>{symbol}</b> {side}\n"
+            f"TF: {tf_label(tf)} | ATR: {atr*100:.2f}% | ΔEMA: {abs(e9-e21)/e21*100:.2f}%\n"
+            f"Причина: {why}\n"
+            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+        )
+        return msg, why, tf
 
-        # ATR-фильтр
-        if atr_rel is None or not (ATR_MIN <= abs(atr_rel) <= ATR_MAX):
-            continue
+    # Ни на одном TF не прошло
+    return None, reason if 'reason' in locals() else "тихо", CONFIG["base_tf"]
 
-        note = "" if not fb else " (fallback 15m)"
-        long_cross  = (ema9 > ema21) and (strength >= STRENGTH_MAIN)
-        short_cross = (ema9 < ema21) and (strength >= STRENGTH_MAIN)
+def can_alert_symbol(symbol: str) -> bool:
+    last = _symbol_cooldown.get(symbol, 0.0)
+    return (now_ts() - last) >= CONFIG["cooldown_min"]*60.0
 
-        if long_cross:
-            had_any_signal = True
-            mark_signal(symbol)
-            send_tele(
-                f"✅ LONG {symbol}{note}\n"
-                f"TF: {tf_used} | strength: {strength*100:.2f}% | ATR: {abs(atr_rel)*100:.2f}%\n"
-                f"{ts_iso()}"
-            )
-            continue
+def mark_alert_symbol(symbol: str):
+    _symbol_cooldown[symbol] = now_ts()
 
-        if short_cross:
-            had_any_signal = True
-            mark_signal(symbol)
-            send_tele(
-                f"✅ SHORT {symbol}{note}\n"
-                f"TF: {tf_used} | strength: {strength*100:.2f}% | ATR: {abs(atr_rel)*100:.2f}%\n"
-                f"{ts_iso()}"
-            )
-            continue
-
-    if not had_any_signal and (now_ts() - last_no_signal_ts) >= NO_SIGNAL_INTERVAL:
-        last_no_signal_ts = now_ts()
-        send_tele("⏰ Жив. За последний час сигналов не было.")
-
-# ===================== ЦИКЛЫ =====================
-def signals_loop():
-    send_tele("🤖 Бот сигналов запущен! (UMCBL)")
+def scan_loop():
+    global _last_signal_ts_any, _last_alive_notice_ts
+    log("Scan loop started")
+    send_msg(TELEGRAM_CHAT_ID, "🤖 Бот запущен (сигнальный). Используй /mode ultra или /mode normal для пресета.")
     while True:
-        try:
-            check_signals_once()
-        except Exception as e:
-            try: send_tele(f"⚠️ Ошибка цикла сигналов: {e}")
-            except: pass
-        time.sleep(get_cfg("CHECK_INTERVAL_S"))
+        started = now_ts()
+        any_signal = False
+        reasons = []  # собираем краткие причины по монетам, полезно для живого отчёта
 
-# ===================== КОМАНДЫ =====================
-def status_text():
-    MIN_CANDLES        = get_cfg("MIN_CANDLES")
-    STRENGTH_MAIN      = get_cfg("STRENGTH_MAIN")
-    ATR_MIN            = get_cfg("ATR_MIN")
-    ATR_MAX            = get_cfg("ATR_MAX")
-    HARD_COOLDOWN_S    = get_cfg("HARD_COOLDOWN_S")
-    NO_SIGNAL_INTERVAL = get_cfg("NO_SIGNAL_INTERVAL_S")
-    SYMBOLS            = get_cfg("SYMBOLS")
-    active_cooldowns = []
-    now = now_ts()
-    for s in SYMBOLS:
-        ts = last_signal_ts_by_symbol.get(s, 0.0)
-        left = max(0, int(HARD_COOLDOWN_S - (now - ts))) if ts else 0
-        if left > 0: active_cooldowns.append(f"{s}:{left//60}m")
-    parts = [
-        "⚙️ Статус бота:",
-        f"TF base: {BASE_TF} (fallback→15m)",
-        f"Параметры: strength≥{STRENGTH_MAIN*100:.2f}% | ATR∈[{ATR_MIN*100:.2f}%; {ATR_MAX*100:.2f}%]",
-        f"MIN_CANDLES: {MIN_CANDLES}",
-        f"Cooldown: {HARD_COOLDOWN_S//60}m",
-        f"Антиспам: {NO_SIGNAL_INTERVAL//3600}ч",
-        f"Интервал проверки: {get_cfg('CHECK_INTERVAL_S')}s",
-        f"Монеты: {', '.join(SYMBOLS)}",
-        f"Активные cooldown: {', '.join(active_cooldowns) if active_cooldowns else 'нет'}",
-        f"Время: {ts_iso()}",
-    ]
-    return "\n".join(parts)
-
-HELP_TEXT = (
-    "🛠 Команды:\n"
-    "/status — показать текущие параметры\n"
-    "/ping — проверка связи\n"
-    "/symbols — текущие монеты\n"
-    "/setsymbols BTCUSDT,ETHUSDT,SOLUSDT — задать монеты\n"
-    "/setstrength 0.2 | 0.2% — порог силы\n"
-    "/setatr 0.25 1.8 — ATR-диапазон (в % или долях)\n"
-    "/setmincandles 21 — требуемое число свечей\n"
-    "/setcooldown 25 — cooldown в минутах\n"
-    "/setcheck 5m — интервал проверки (например: 300, 300s, 5m, 1h)\n"
-    "/preset aggressive|neutral|conservative — пресеты порогов\n"
-)
-
-def apply_preset(name: str):
-    name = name.lower().strip()
-    if name == "aggressive":
-        set_cfg("STRENGTH_MAIN", 0.0010)
-        set_cfg("ATR_MIN", 0.0020); set_cfg("ATR_MAX", 0.0250)
-        set_cfg("MIN_CANDLES", 15); set_cfg("HARD_COOLDOWN_S", 15*60)
-        return "✅ AGGRESSIVE применён"
-    elif name == "neutral":
-        set_cfg("STRENGTH_MAIN", 0.0015)
-        set_cfg("ATR_MIN", 0.0025); set_cfg("ATR_MAX", 0.0180)
-        set_cfg("MIN_CANDLES", 18); set_cfg("HARD_COOLDOWN_S", 25*60)
-        return "✅ NEUTRAL применён"
-    elif name == "conservative":
-        set_cfg("STRENGTH_MAIN", 0.0025)
-        set_cfg("ATR_MIN", 0.0030); set_cfg("ATR_MAX", 0.0120)
-        set_cfg("MIN_CANDLES", 21); set_cfg("HARD_COOLDOWN_S", 35*60)
-        return "✅ CONSERVATIVE применён"
-    else:
-        return "❌ Неизвестный пресет. Доступны: aggressive, neutral, conservative."
-
-def telegram_commands_loop():
-    offset = None
-    send_tele("📮 Команды активны: /status, /ping, /symbols, /setsymbols, /setstrength, /setatr, /setmincandles, /setcooldown, /setcheck, /preset\n\n"+HELP_TEXT)
-    while True:
-        try:
-            data = get_updates(offset=offset, timeout=10)
-            if not data.get("ok", False): time.sleep(2); continue
-            for upd in data.get("result", []):
-                offset = upd["update_id"] + 1
-                msg = upd.get("message") or {}
-                text = (msg.get("text") or "").strip()
-                chat_id = ((msg.get("chat") or {}).get("id"))
-                if not text or chat_id != TELEGRAM_CHAT_ID: continue
-                t = text.lower()
-                if t.startswith("/ping"): send_tele(f"🏓 Pong! {ts_iso()}")
-                elif t.startswith("/help"): send_tele(HELP_TEXT)
-                elif t.startswith("/status"): send_tele(status_text())
-                elif t.startswith("/symbols"): send_tele("Монеты: " + ", ".join(get_cfg("SYMBOLS")))
-                elif t.startswith("/setsymbols"):
-                    try:
-                        raw = text.split(" ", 1)[1]
-                        arr = [s.strip().upper() for s in raw.split(",") if s.strip()]
-                        if not arr: raise ValueError("пустой список")
-                        set_cfg("SYMBOLS", arr); send_tele("✅ Обновлён список: " + ", ".join(arr))
-                    except Exception as e:
-                        send_tele(f"❌ Пример: /setsymbols BTCUSDT,ETHUSDT,SOLUSDT\nОшибка: {e}")
-                elif t.startswith("/setstrength"):
-                    try:
-                        val = parse_number(text.split(" ", 1)[1])
-                        if not (0.0001 <= val <= 0.05): raise ValueError("0.01%..5%")
-                        set_cfg("STRENGTH_MAIN", val); send_tele(f"✅ strength = {val*100:.3f}%")
-                    except Exception as e:
-                        send_tele(f"❌ Пример: /setstrength 0.2  (или 0.2%)\nОшибка: {e}")
-                elif t.startswith("/setatr"):
-                    try:
-                        parts = text.split()
-                        if len(parts) < 3: raise ValueError("нужно два числа")
-                        vmin = parse_number(parts[1]); vmax = parse_number(parts[2])
-                        if not (0.0005 <= vmin < vmax <= 0.10): raise ValueError("0.05%..10%, min<max")
-                        set_cfg("ATR_MIN", vmin); set_cfg("ATR_MAX", vmax)
-                        send_tele(f"✅ ATR: {vmin*100:.2f}% — {vmax*100:.2f}%")
-                    except Exception as e:
-                        send_tele(f"❌ Пример: /setatr 0.25 1.8\nОшибка: {e}")
-                elif t.startswith("/setmincandles"):
-                    try:
-                        n = int(text.split()[1])
-                        if not (5 <= n <= 500): raise ValueError("5..500")
-                        set_cfg("MIN_CANDLES", n); send_tele(f"✅ MIN_CANDLES = {n}")
-                    except Exception as e:
-                        send_tele(f"❌ Пример: /setmincandles 21\nОшибка: {e}")
-                elif t.startswith("/setcooldown"):
-                    try:
-                        minutes = int(text.split()[1])
-                        if not (1 <= minutes <= 240): raise ValueError("1..240")
-                        set_cfg("HARD_COOLDOWN_S", minutes*60); send_tele(f"✅ Cooldown = {minutes}m")
-                    except Exception as e:
-                        send_tele(f"❌ Пример: /setcooldown 25\nОшибка: {e}")
-                elif t.startswith("/setcheck"):
-                    try:
-                        secs = parse_duration_seconds(text.split()[1])
-                        if not (10 <= secs <= 3600): raise ValueError("10..3600 сек")
-                        set_cfg("CHECK_INTERVAL_S", secs); send_tele(f"✅ Интервал проверки = {secs}s")
-                    except Exception as e:
-                        send_tele(f"❌ Пример: /setcheck 5m  (или 300, 300s, 1h)\nОшибка: {e}")
-                elif t.startswith("/preset"):
-                    try:
-                        msg = apply_preset(text.split()[1]); send_tele(msg + "\n" + status_text())
-                    except Exception:
-                        send_tele("❌ Пример: /preset aggressive|neutral|conservative")
+        for sym in CONFIG["symbols"]:
+            try:
+                text, reason, used_tf = analyze_symbol(sym)
+                if text and can_alert_symbol(sym):
+                    send_msg(TELEGRAM_CHAT_ID, text)
+                    mark_alert_symbol(sym)
+                    any_signal = True
+                    _last_signal_ts_any = now_ts()
                 else:
-                    if text.startswith("/"): send_tele("Команда не распознана. /help")
-        except Exception:
+                    reasons.append(f"{sym}:{used_tf} {reason}")
+            except Exception as e:
+                reasons.append(f"{sym}: ошибка {e}")
+
+        # Если за последний час не было сигналов — отправим «жив»
+        nowt = now_ts()
+        if (nowt - _last_signal_ts_any) >= 3600 and (nowt - _last_alive_notice_ts) >= 3600:
+            msg = "🟡 Жив. За последний час сигналов не было.\n" \
+                  + ("Причины:\n" + "\n".join(reasons[:10]) if reasons else "")
+            send_msg(TELEGRAM_CHAT_ID, msg)
+            _last_alive_notice_ts = nowt
+
+        # Держим период
+        elapsed = now_ts() - started
+        sleep_s = max(1.0, CONFIG["check_interval_s"] - elapsed)
+        time.sleep(sleep_s)
+
+# --------- Telegram команды (Long Poll) ----------
+def handle_command(chat_id: str, text: str):
+    # только из твоего чата
+    if str(chat_id) != str(TELEGRAM_CHAT_ID):
+        return
+
+    parts = text.strip().split()
+    cmd = parts[0].lower()
+    args = parts[1:]
+
+    if cmd == "/start":
+        send_msg(chat_id, "👋 Готов к работе. Команды: /status, /mode ultra|normal, /setstrength, /setatr, /setmincandles, /setcooldown, /setcheck, /setsymbols")
+    elif cmd == "/status":
+        cfg = CONFIG
+        msg = (
+            "📟 <b>Статус</b>\n"
+            f"Монеты: {', '.join(cfg['symbols'])}\n"
+            f"TF: base={cfg['base_tf']} fallback={cfg['fallback_tf']}\n"
+            f"EMA: {cfg['ema_fast']}/{cfg['ema_slow']}\n"
+            f"MIN_CANDLES: {cfg['min_candles']}\n"
+            f"strength: {cfg['strength']*100:.2f}%\n"
+            f"ATR: {cfg['atr_min']*100:.2f}% — {cfg['atr_max']*100:.2f}%\n"
+            f"check: {cfg['check_interval_s']}s | cooldown: {cfg['cooldown_min']}m\n"
+        )
+        send_msg(chat_id, msg)
+    elif cmd == "/mode":
+        if len(args) != 1:
+            send_msg(chat_id, "❌ Пример: /mode ultra  | /mode normal")
+            return
+        if apply_mode(args[0]):
+            send_msg(chat_id, f"✅ Режим {args[0].upper()} применён.")
+            handle_command(chat_id, "/status")
+        else:
+            send_msg(chat_id, "❌ Неизвестный режим. Используй ultra | normal")
+    elif cmd == "/setstrength":
+        if len(args) != 1:
+            send_msg(chat_id, "❌ Пример: /setstrength 0.03  (или 3%)")
+            return
+        try:
+            val = _parse_pct(args[0])
+            if not (0.001 <= val <= 0.20):
+                send_msg(chat_id, "❌ strength допустимо 0.10%..20%")
+                return
+            CONFIG["strength"] = val
+            send_msg(chat_id, f"✅ strength = {val*100:.2f}%")
+        except Exception as e:
+            send_msg(chat_id, f"❌ Ошибка: {e}")
+    elif cmd == "/setatr":
+        if len(args) != 2:
+            send_msg(chat_id, "❌ Пример: /setatr 0.05 0.10  (или 5% 10%)")
+            return
+        try:
+            lo = _parse_pct(args[0]); hi = _parse_pct(args[1])
+            # Исторически у тебя бот держал 5..10%, оставим такие пределы по умолчанию:
+            lo = max(lo, 0.05); hi = min(hi, 0.10)
+            if not (lo < hi):
+                send_msg(chat_id, "❌ ATR: min должен быть < max. Диапазон 5%..10%.")
+                return
+            CONFIG["atr_min"], CONFIG["atr_max"] = lo, hi
+            send_msg(chat_id, f"✅ ATR: {lo*100:.2f}% — {hi*100:.2f}%")
+        except Exception as e:
+            send_msg(chat_id, f"❌ Ошибка: {e}")
+    elif cmd == "/setmincandles":
+        if len(args) != 1:
+            send_msg(chat_id, "❌ Пример: /setmincandles 10")
+            return
+        try:
+            v = int(float(args[0]))
+            v = max(5, min(200, v))
+            CONFIG["min_candles"] = v
+            send_msg(chat_id, f"✅ MIN_CANDLES = {v}")
+        except Exception as e:
+            send_msg(chat_id, f"❌ Ошибка: {e}")
+    elif cmd == "/setcooldown":
+        if len(args) != 1:
+            send_msg(chat_id, "❌ Пример: /setcooldown 10")
+            return
+        try:
+            m = int(float(args[0]))
+            m = max(1, min(120, m))
+            CONFIG["cooldown_min"] = m
+            send_msg(chat_id, f"✅ cooldown = {m} мин")
+        except Exception as e:
+            send_msg(chat_id, f"❌ Ошибка: {e}")
+    elif cmd == "/setcheck":
+        if len(args) != 1:
+            send_msg(chat_id, "❌ Пример: /setcheck 120  (секунды)")
+            return
+        try:
+            s = int(float(args[0]))
+            s = max(15, min(600, s))
+            CONFIG["check_interval_s"] = s
+            send_msg(chat_id, f"✅ check = {s} сек")
+        except Exception as e:
+            send_msg(chat_id, f"❌ Ошибка: {e}")
+    elif cmd == "/setsymbols":
+        if not args:
+            send_msg(chat_id, "❌ Пример: /setsymbols BTCUSDT,ETHUSDT,SOLUSDT")
+            return
+        raw = " ".join(args)
+        parts = [p.strip().upper() for p in raw.replace(";", ",").split(",")]
+        parts = [p for p in parts if p.endswith("USDT")]
+        if not parts:
+            send_msg(chat_id, "❌ Укажи пары через запятую, например: BTCUSDT,ETHUSDT")
+            return
+        CONFIG["symbols"] = parts
+        send_msg(chat_id, f"✅ Монеты: {', '.join(parts)}")
+    else:
+        # игнорим неизвестные команды, чтобы не спамить
+        pass
+
+def tg_polling_loop():
+    global _updates_offset
+    log("TG polling started")
+    while True:
+        try:
+            resp = requests.get(
+                tg_url("getUpdates"),
+                params={"timeout": 50, "offset": _updates_offset},
+                timeout=70
+            ).json()
+            if not resp.get("ok"):
+                time.sleep(2)
+                continue
+            for upd in resp.get("result", []):
+                _updates_offset = max(_updates_offset, upd["update_id"] + 1)
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg: 
+                    continue
+                chat_id = msg["chat"]["id"]
+                text = msg.get("text", "") or ""
+                if not text:
+                    continue
+                handle_command(chat_id, text)
+        except Exception as e:
+            log(f"TG poll error: {e}")
             time.sleep(2)
 
-# ===================== Flask keep-alive =====================
-app = Flask(__name__)
+# --------- Flask keep-alive ----------
 @app.route("/")
 def root():
-    return jsonify({
-        "ok": True,
-        "service": "bitget-umcbl-ema-signals",
-        "time": ts_iso(),
-        "symbols": get_cfg("SYMBOLS"),
-        "base_tf": BASE_TF,
-        "min_candles": get_cfg("MIN_CANDLES"),
-        "strength_main": get_cfg("STRENGTH_MAIN"),
-        "atr_range": [get_cfg("ATR_MIN"), get_cfg("ATR_MAX")],
-        "cooldown_s": get_cfg("HARD_COOLDOWN_S"),
-        "check_interval_s": get_cfg("CHECK_INTERVAL_S")
-    })
+    return jsonify({"status":"ok","time": datetime.now().isoformat()})
 
-# ===================== RUN =====================
-def run_threads():
-    t1 = threading.Thread(target=signals_loop, daemon=True)
-    t2 = threading.Thread(target=telegram_commands_loop, daemon=True)
+@app.route("/ping")
+def ping():
+    return "pong", 200
+
+# --------- Запуск ----------
+def main():
+    # привет и статус
+    apply_mode("ultra")  # можно сразу ультра — по твоему запросу
+    log("Starting threads...")
+    t1 = threading.Thread(target=scan_loop, daemon=True)
+    t2 = threading.Thread(target=tg_polling_loop, daemon=True)
     t1.start(); t2.start()
 
-if __name__ == "__main__":
-    run_threads()
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    main()
