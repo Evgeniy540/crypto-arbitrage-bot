@@ -1,283 +1,228 @@
 # -*- coding: utf-8 -*-
 """
-signal_bot.py — EMA-сигнальный бот для Bitget (UMCBL фьючерсы)
-- Сигналы по EMA(9/21), ATR и EPS
-- Telegram уведомления
-- Команды: /mode, /status, /setsymbols, /seteps, /setatr, /setcooldown
-- Flask keep-alive
+Bitget EMA Signal Bot (только сигналы, без торговли)
+Фильтры: EMA, RSI, ATR
+Команды в Telegram: /status, /setcooldown, /settf, /setsymbols, /help
 """
 
-import os
 import time
-import threading
-from datetime import datetime
-from collections import defaultdict
 import requests
-from flask import Flask
+import pandas as pd
+import numpy as np
+from flask import Flask, request
+from threading import Thread
 
 # ==== ТВОИ ДАННЫЕ ====
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
-TELEGRAM_CHAT_ID   = "5723086631"
-# =====================
+TELEGRAM_CHAT_ID = "5723086631"
 
-SYMBOLS = [
-    "BTCUSDT_UMCBL",
-    "ETHUSDT_UMCBL",
-    "SOLUSDT_UMCBL",
-]
+# ==== НАСТРОЙКИ ====
+BITGET_CANDLES_URL = "https://api.bitget.com/api/mix/v1/market/candles"
+SYMBOLS = ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "XRPUSDT_UMCBL",
+           "SOLUSDT_UMCBL", "TRXUSDT_UMCBL"]
+TIMEFRAMES = {"5m": 300, "15m": 900, "1h": 3600}
+SLEEP = 60  # проверка раз в минуту
+SIGNAL_COOLDOWN = 300  # кулдаун сигналов (5 минут)
 
-BASE_TF = "5m"
-FALLBACK_TF = "15m"
-CHECK_INTERVAL_S = 60
-MIN_CANDLES = 120
-EMA_FAST, EMA_SLOW = 9, 21
+last_signals = {}  # { "BTCUSDT_UMCBL_5m": timestamp }
 
-EPS_PCT = 0.0008
-ATR_FACTOR = 0.25
-SLOPE_MIN = 0.0
+# ==== ФУНКЦИИ ====
+def send_telegram(msg: str):
+    """Отправка сообщения в телеграм"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    except Exception as e:
+        print(f"Ошибка отправки в Telegram: {e}")
 
-NO_SIGNAL_COOLDOWN_S = 3600
-SIGNAL_COOLDOWN_S = 300
 
-BITGET_CANDLES = "https://api.bitget.com/api/mix/v1/market/candles"
-HEADERS = {"User-Agent": "EMA-signal-bot/1.0"}
+def get_candles(symbol: str, tf: str, limit: int = 200):
+    """Получение свечей с Bitget"""
+    params = {"symbol": symbol, "granularity": TIMEFRAMES[tf], "limit": limit}
+    try:
+        r = requests.get(BITGET_CANDLES_URL, params=params, timeout=10)
+        data = r.json()
+        if "data" not in data:
+            print("Ошибка Bitget:", data)
+            return None
+        df = pd.DataFrame(data["data"],
+                          columns=["ts", "open", "high", "low", "close", "volume", "baseVolume"])
+        df["close"] = df["close"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df = df.iloc[::-1].reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"Ошибка загрузки свечей {symbol}: {e}")
+        return None
 
+
+def rsi(series, period=14):
+    """RSI"""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def atr(df, period=14):
+    """ATR"""
+    high_low = df["high"] - df["low"]
+    high_close = np.abs(df["high"] - df["close"].shift())
+    low_close = np.abs(df["low"] - df["close"].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def filters(df):
+    """Фильтры рынка"""
+    close = df["close"].iloc[-1]
+    ema50 = df["close"].ewm(span=50).mean().iloc[-1]
+    ema200 = df["close"].ewm(span=200).mean().iloc[-1]
+    rsi_val = rsi(df["close"]).iloc[-1]
+    atr_val = atr(df).iloc[-1] / close * 100
+    trend_ok = ema50 > ema200
+    rsi_ok = 40 < rsi_val < 70
+    atr_ok = atr_val > 0.5
+    all_green = trend_ok and rsi_ok and atr_ok
+    return all_green, trend_ok, rsi_val, atr_val
+
+
+def ema_strategy(symbol: str, tf: str):
+    """EMA стратегия с фильтрами"""
+    df = get_candles(symbol, tf)
+    if df is None or len(df) < 200:
+        return None
+
+    df["EMA9"] = df["close"].ewm(span=9).mean()
+    df["EMA21"] = df["close"].ewm(span=21).mean()
+
+    signal = None
+    if df["EMA9"].iloc[-2] < df["EMA21"].iloc[-2] and df["EMA9"].iloc[-1] > df["EMA21"].iloc[-1]:
+        signal = "🟢 Возможен LONG"
+    elif df["EMA9"].iloc[-2] > df["EMA21"].iloc[-2] and df["EMA9"].iloc[-1] < df["EMA21"].iloc[-1]:
+        signal = "🔴 Возможен SHORT"
+
+    if signal:
+        key = f"{symbol}_{tf}"
+        now = time.time()
+        if key in last_signals and now - last_signals[key] < SIGNAL_COOLDOWN:
+            return None  # кулдаун
+        last_signals[key] = now
+
+        all_green, trend_ok, rsi_val, atr_val = filters(df)
+        status = "✅ Фильтры ЗЕЛЁНЫЕ" if all_green else "❌ Фильтры КРАСНЫЕ"
+        return f"{signal}\n{symbol} {tf}\n{status}\nRSI={rsi_val:.1f} | ATR={atr_val:.2f}%"
+    return None
+
+
+def main_loop():
+    send_telegram(
+        "🤖 Бот запущен (EMA/RSI/ATR)\n"
+        "Доступные команды: /status, /setcooldown, /settf, /setsymbols, /help"
+    )
+    while True:
+        for symbol in SYMBOLS:
+            for tf in TIMEFRAMES:
+                signal = ema_strategy(symbol, tf)
+                if signal:
+                    send_telegram(signal)
+                time.sleep(1)  # чтобы не спамить API
+        time.sleep(SLEEP)
+
+
+# ==== Flask для keep-alive и команд ====
 app = Flask(__name__)
 
-last_notif_no_signal = defaultdict(lambda: 0.0)
-cooldown_per_symbol = defaultdict(lambda: 0.0)
+@app.route("/", methods=["GET", "POST"])
+def home():
+    return "EMA Signal Bot работает!"
 
-state = {
-    "symbols": SYMBOLS[:],
-    "base_tf": BASE_TF,
-    "fallback_tf": FALLBACK_TF,
-    "check_s": CHECK_INTERVAL_S,
-    "min_candles": MIN_CANDLES,
-    "ema_fast": EMA_FAST,
-    "ema_slow": EMA_SLOW,
-    "eps_pct": EPS_PCT,
-    "atr_k": ATR_FACTOR,
-    "slope_min": SLOPE_MIN,
-    "signal_cooldown_s": SIGNAL_COOLDOWN_S,
-    "mode": "normal",
-}
 
-def now_ts(): return time.time()
-def fmt_dt(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+def telegram_webhook():
+    """Webhook для обработки команд в Telegram"""
+    global SIGNAL_COOLDOWN, TIMEFRAMES, SYMBOLS
 
-def send_tg(text: str):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }, timeout=15)
-    except Exception as e:
-        print("Telegram error:", e)
+    data = request.get_json()
+    if not data or "message" not in data:
+        return "ok"
 
-# === Индикаторы ===
-def ema(series, period):
-    if len(series) < period:
-        return []
-    k = 2.0 / (period + 1.0)
-    out = []
-    ema_prev = sum(series[:period]) / period
-    out.extend([None] * (period - 1))
-    out.append(ema_prev)
-    for x in series[period:]:
-        ema_prev = x * k + ema_prev * (1 - k)
-        out.append(ema_prev)
-    return out
+    chat_id = str(data["message"]["chat"]["id"])
+    text = data["message"].get("text", "")
 
-def true_range(h, l, c):
-    tr = [None]
-    for i in range(1, len(c)):
-        tr.append(max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1])))
-    return tr
+    if chat_id != TELEGRAM_CHAT_ID:
+        return "ok"
 
-def atr(h, l, c, period=14):
-    tr = true_range(h, l, c)
-    vals = [x for x in tr if x is not None]
-    if len(vals) < period:
-        return [None] * len(c)
-    k = 2.0 / (period + 1.0)
-    out = [None]
-    atr_prev = sum(vals[:period]) / period
-    for i in range(period, len(vals)):
-        atr_prev = vals[i] * k + atr_prev * (1 - k)
-        out.append(atr_prev)
-    while len(out) < len(c):
-        out.append(atr_prev)
-    return out
+    if text.strip().lower() == "/status":
+        report = []
+        for symbol in SYMBOLS:
+            for tf in TIMEFRAMES:
+                df = get_candles(symbol, tf)
+                if df is None:
+                    continue
+                all_green, trend_ok, rsi_val, atr_val = filters(df)
+                status = "✅" if all_green else "❌"
+                report.append(f"{symbol} {tf}: {status} | RSI={rsi_val:.1f} | ATR={atr_val:.2f}%")
+        send_telegram("📊 Статус фильтров:\n" + "\n".join(report))
 
-def gran_ok(tf: str) -> str:
-    mapping = {"1m": "60","5m": "300","15m": "900","30m": "1800","1h": "3600","4h": "14400","1d": "86400"}
-    return mapping.get(tf, "300")
-
-def parse_candles(data):
-    rows = []
-    for row in data:
+    elif text.startswith("/setcooldown"):
         try:
-            ts = int(row[0]) / 1000.0
-            o = float(row[1]); h = float(row[2]); l = float(row[3]); c = float(row[4])
-            rows.append((ts, o, h, l, c))
-        except: pass
-    rows.sort(key=lambda x: x[0])
-    t = [r[0] for r in rows]; o = [r[1] for r in rows]; h = [r[2] for r in rows]
-    l = [r[3] for r in rows]; c = [r[4] for r in rows]
-    return t, o, h, l, c
+            value = int(text.split()[1])
+            SIGNAL_COOLDOWN = value
+            send_telegram(f"✅ Кулдаун сигналов установлен: {SIGNAL_COOLDOWN} сек.")
+        except:
+            send_telegram("⚠️ Используй: /setcooldown 300")
 
-def fetch_candles(symbol: str, tf: str, limit: int = 300):
-    params = {"symbol": symbol, "granularity": gran_ok(tf), "limit": str(limit)}
-    try:
-        r = requests.get(BITGET_CANDLES, params=params, headers=HEADERS, timeout=20)
-        j = r.json()
-    except Exception as e:
-        return None, f"Network error: {e}"
-    if not isinstance(j, dict):
-        return None, "Bad response"
-    if j.get("code") != "00000":
-        return None, f"Bitget error {j.get('code')}: {j.get('msg')}"
-    data = j.get("data", [])
-    if not data:
-        return None, "No candles"
-    t, o, h, l, c = parse_candles(data)
-    return {"t": t, "o": o, "h": h, "l": l, "c": c}, None
-
-def last_cross_signal(efast, eslow, eps_pct, slope_min, atr_arr, atr_k):
-    if not efast or not eslow or efast[-1] is None or eslow[-1] is None:
-        return None, "нет EMA"
-    if len(efast) < 3 or len(eslow) < 3:
-        return None, "мало EMA"
-    df_prev = efast[-2] - eslow[-2] if efast[-2] and eslow[-2] else None
-    df_curr = efast[-1] - eslow[-1]; price = efast[-1]
-    eps_abs = price * eps_pct; slope = (efast[-1] - efast[-2]) if efast[-2] else 0.0
-    if slope < slope_min: return None, "slope низкий"
-    a = atr_arr[-1] if atr_arr and atr_arr[-1] else None
-    if a and abs(df_curr) < a * atr_k: return None, "diff < ATR*k"
-    if df_prev is not None and (df_prev <= 0.0 < df_curr): return "LONG", "кросс вверх"
-    if df_prev is not None and (df_prev >= 0.0 > df_curr): return "SHORT", "кросс вниз"
-    if abs(df_curr) <= eps_abs: return ("LONG" if slope > 0 else "SHORT"), "близко к кроссу"
-    return None, "нет условия"
-
-def maybe_send_no_signal(sym):
-    ts = now_ts()
-    if ts - last_notif_no_signal[sym] >= NO_SIGNAL_COOLDOWN_S:
-        last_notif_no_signal[sym] = ts
-        send_tg(f"ℹ️ По {sym} сейчас нет сигнала ({fmt_dt()}).")
-
-def make_signal_text(sym, side, price, tf, note):
-    arrow = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
-    return (f"📣 <b>{sym}</b> | TF <b>{tf}</b>\n"
-            f"{arrow} | Цена ~ <b>{price:.4f}</b>\n"
-            f"Причина: {note}\n"
-            f"{fmt_dt()}")
-
-def check_symbol(symbol: str):
-    if now_ts() < cooldown_per_symbol[symbol]: return
-    candles, err = fetch_candles(symbol, state["base_tf"], limit=max(300, state["min_candles"]+50))
-    tf_used = state["base_tf"]
-    if err:
-        candles_fb, err_fb = fetch_candles(symbol, state["fallback_tf"], limit=max(300, state["min_candles"]+50))
-        if candles_fb: candles = candles_fb; tf_used = state["fallback_tf"]
-        else: send_tg(f"❌ Ошибка {symbol}: {err or err_fb}"); return
-    t,o,h,l,c = candles["t"], candles["o"], candles["h"], candles["l"], candles["c"]
-    if len(c) < state["min_candles"]: maybe_send_no_signal(symbol); return
-    efast = ema(c, state["ema_fast"]); eslow = ema(c, state["ema_slow"]); atr_arr = atr(h, l, c, 14)
-    side, note = last_cross_signal(efast, eslow, state["eps_pct"], state["slope_min"], atr_arr, state["atr_k"])
-    if side:
-        price = c[-1]; send_tg(make_signal_text(symbol, side, price, tf_used, note))
-        cooldown_per_symbol[symbol] = now_ts() + state["signal_cooldown_s"]
-    else: maybe_send_no_signal(symbol)
-
-# === Telegram команды ===
-def apply_mode(mode: str):
-    mode = mode.lower()
-    if mode == "ultra":
-        state["eps_pct"] = 0.0005; state["atr_k"] = 0.35; state["mode"] = "ultra"
-    else:
-        state["eps_pct"] = 0.0008; state["atr_k"] = 0.25; state["mode"] = "normal"
-
-def handle_command(text: str):
-    txt = text.strip()
-    if txt.startswith("/mode"):
-        parts = txt.split(); apply_mode(parts[1] if len(parts) >= 2 else "normal")
-        send_tg(f"✅ mode={state['mode']} | eps={state['eps_pct']}, atr_k={state['atr_k']}")
-    elif txt.startswith("/setsymbols"):
+    elif text.startswith("/settf"):
         try:
-            payload = txt.split(None, 1)[1]
-            items = [x.strip().upper() for x in payload.replace(",", " ").split() if x.strip()]
-            state["symbols"] = items; send_tg(f"✅ SYMBOLS:\n{', '.join(state['symbols'])}")
-        except: send_tg("Формат: /setsymbols BTCUSDT_UMCBL ETHUSDT_UMCBL ...")
-    elif txt.startswith("/seteps"):
+            parts = text.split()[1].split(",")
+            new_tfs = {}
+            for p in parts:
+                p = p.strip()
+                if p == "5m":
+                    new_tfs["5m"] = 300
+                elif p == "15m":
+                    new_tfs["15m"] = 900
+                elif p == "1h":
+                    new_tfs["1h"] = 3600
+            if new_tfs:
+                TIMEFRAMES = new_tfs
+                send_telegram(f"✅ Таймфреймы изменены: {','.join(TIMEFRAMES.keys())}")
+            else:
+                send_telegram("⚠️ Ошибка формата. Пример: /settf 5m,15m")
+        except:
+            send_telegram("⚠️ Ошибка. Пример: /settf 5m,15m")
+
+    elif text.startswith("/setsymbols"):
         try:
-            v = float(txt.split()[1]); state["eps_pct"] = v
-            send_tg(f"✅ EPS %={v}")
-        except: send_tg("Формат: /seteps 0.0008")
-    elif txt.startswith("/setatr"):
-        try:
-            v = float(txt.split()[1]); state["atr_k"] = v
-            send_tg(f"✅ ATR k={v}")
-        except: send_tg("Формат: /setatr 0.25")
-    elif txt.startswith("/setcooldown"):
-        try:
-            v = int(txt.split()[1]); state["signal_cooldown_s"] = v
-            send_tg(f"✅ cooldown={v}s")
-        except: send_tg("Формат: /setcooldown 300")
-    elif txt.startswith("/status"):
-        send_tg(
-            "🩺 Статус:\n"
-            f"symbols: {', '.join(state['symbols'])}\n"
-            f"tf: {state['base_tf']} (fb {state['fallback_tf']})\n"
-            f"eps: {state['eps_pct']}, atr_k: {state['atr_k']}\n"
-            f"cooldown: {state['signal_cooldown_s']}s\n"
-            f"mode: {state['mode']}\n"
-            f"time: {fmt_dt()}"
+            parts = text.split()[1].split(",")
+            new_syms = [p.strip() for p in parts if p.strip()]
+            if new_syms:
+                SYMBOLS = new_syms
+                send_telegram(f"✅ Список монет изменён: {','.join(SYMBOLS)}")
+            else:
+                send_telegram("⚠️ Ошибка формата. Пример: /setsymbols BTCUSDT_UMCBL,ETHUSDT_UMCBL")
+        except:
+            send_telegram("⚠️ Ошибка. Пример: /setsymbols BTCUSDT_UMCBL,ETHUSDT_UMCBL")
+
+    elif text.strip().lower() == "/help":
+        help_msg = (
+            "📖 Доступные команды:\n"
+            "/status → показать фильтры (RSI/ATR/EMA)\n"
+            "/setcooldown X → кулдаун сигналов (сек.)\n"
+            "/settf 5m,15m,1h → задать таймфреймы\n"
+            "/setsymbols BTCUSDT_UMCBL,ETHUSDT_UMCBL → выбрать монеты\n"
+            "/help → показать список команд"
         )
+        send_telegram(help_msg)
 
-def tg_updates_loop():
-    offset = None; url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    while True:
-        try:
-            params = {"timeout": 20}; 
-            if offset is not None: params["offset"] = offset
-            j = requests.get(url, params=params, timeout=25).json()
-            if j.get("ok"):
-                for upd in j.get("result", []):
-                    offset = upd["update_id"] + 1
-                    msg = upd.get("message") or upd.get("edited_message")
-                    if not msg: continue
-                    if str(msg["chat"]["id"]) != TELEGRAM_CHAT_ID: continue
-                    text = msg.get("text", "")
-                    if text: handle_command(text)
-        except Exception as e:
-            print("tg loop err:", e)
-        time.sleep(1)
+    return "ok"
 
-def worker():
-    send_tg("🤖 Бот запущен (сигнальный).")
-    test, err = fetch_candles("BTCUSDT_UMCBL", state["base_tf"], 100)
-    if err: send_tg(f"⚠️ Диагностика Bitget: {err}")
-    else: send_tg("✅ Bitget подключен (candles OK).")
-    while True:
-        start = now_ts()
-        for sym in state["symbols"][:]:
-            try: check_symbol(sym)
-            except Exception as e: print("check_symbol error", sym, e)
-        time.sleep(max(2.0, state["check_s"] - (now_ts() - start)))
-
-@app.route("/")
-def root(): return "ok"
-
-@app.route("/ping")
-def ping(): return {"ok": True, "time": fmt_dt()}
-
-def run_threads():
-    threading.Thread(target=worker, daemon=True).start()
-    threading.Thread(target=tg_updates_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    run_threads()
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    Thread(target=main_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=5000)
