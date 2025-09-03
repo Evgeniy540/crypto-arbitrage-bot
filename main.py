@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-EMA(9/21)+ATR сигнальный бот для Bitget UMCBL.
-Свечи: GET /api/mix/v1/market/candles  (symbol, granularity, limit)
-Flask + фоновые потоки. Без pandas/numpy.
+EMA(9/21)+ATR сигнальный бот • Bitget SPOT
+Свечи: /api/spot/v1/market/candles  (fallback: /api/spot/v1/market/history-candles)
+— Символы без _UMCBL: BTCUSDT, ETHUSDT, ...
+— Пробуем 2 формата параметров: granularity(сек) ИЛИ period("5min"), + limit.
+— Flask + фоновые потоки. Без pandas/numpy.
 """
 
 import os
@@ -19,13 +21,13 @@ TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
 # =======================
 
-# Полные фьючерсные символы Bitget (USDT-M perpetual)
+# ===== Символы SPOT (без _UMCBL)
 SYMBOLS = [
-    "BTCUSDT_UMCBL",
-    "ETHUSDT_UMCBL",
-    "SOLUSDT_UMCBL",
-    "XRPUSDT_UMCBL",
-    "TRXUSDT_UMCBL",
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "TRXUSDT",
 ]
 
 # Настройки
@@ -39,9 +41,10 @@ SIGNAL_COOLDOWN_S    = 300
 NO_SIGNAL_COOLDOWN   = 3600
 ERROR_COOLDOWN       = 1800
 
-# Bitget (фьючерсы)
-URL_MIX_CANDLES = "https://api.bitget.com/api/mix/v1/market/candles"
-HEADERS = {"User-Agent": "ema-signal-bot/3.2"}
+# Bitget SPOT
+URL_SPOT_CANDLES  = "https://api.bitget.com/api/spot/v1/market/candles"
+URL_SPOT_HISTORY  = "https://api.bitget.com/api/spot/v1/market/history-candles"
+HEADERS = {"User-Agent": "ema-spot-bot/1.0"}
 
 # Состояние
 app = Flask(__name__)
@@ -112,6 +115,12 @@ def atr(h,l,c,period=14):
 def tf_to_seconds(tf: str) -> int:
     return {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"4h":14400,"1d":86400}.get(tf,300)
 
+def tf_to_period(tf: str) -> str:
+    return {
+        "1m":"1min","5m":"5min","15m":"15min","30m":"30min",
+        "1h":"1hour","4h":"4hour","1d":"1day"
+    }.get(tf, "5min")
+
 def parse_candles(data):
     rows=[]
     for row in data:
@@ -124,25 +133,47 @@ def parse_candles(data):
     t=[r[0] for r in rows]; o=[r[1] for r in rows]; h=[r[2] for r in rows]; l=[r[3] for r in rows]; c=[r[4] for r in rows]
     return t,o,h,l,c
 
-# ===== Свечи через /candles (symbol + granularity + limit)
-def fetch_candles(symbol: str, tf: str, want: int = 300):
-    step = tf_to_seconds(tf)
-    params = {
-        "symbol": symbol,
-        "granularity": str(step),
-        "limit": str(min(500, want))
-    }
+def spot_get(url, params):
+    r = requests.get(url, params=params, headers=HEADERS, timeout=20)
     try:
-        r = requests.get(URL_MIX_CANDLES, params=params, headers=HEADERS, timeout=20)
         j = r.json()
-    except Exception as e:
-        return None, f"Bad response: {e}"
-    if not isinstance(j, dict): return None, "Bad JSON"
-    if j.get("code") != "00000": return None, f"Bitget error {j.get('code')}: {j.get('msg')}"
+    except Exception:
+        return None, f"Bad JSON: {r.text[:160]}"
+    if not isinstance(j, dict):
+        return None, "Bad JSON"
+    if j.get("code") not in (0, "0", "00000"):   # Bitget иногда возвращает 0 на spot
+        return None, f"Bitget error {j.get('code')}: {j.get('msg')}"
     data = j.get("data", [])
-    if not data: return None, "No candles"
-    t,o,h,l,c = parse_candles(data)
-    return {"t":t,"o":o,"h":h,"l":l,"c":c}, None
+    return data, None
+
+# ===== Свечи SPOT: пытаемся в таком порядке
+#  1) /candles?symbol=&granularity(sec)&limit
+#  2) /candles?symbol=&period(text)&limit
+#  3) /history-candles с теми же параметрами
+def fetch_candles(symbol: str, tf: str, want: int = 300):
+    limit = str(min(500, want))
+
+    # 1) granularity (секунды)
+    params1 = {"symbol": symbol, "granularity": str(tf_to_seconds(tf)), "limit": limit}
+    data, err = spot_get(URL_SPOT_CANDLES, params1)
+    if not err and data:
+        t,o,h,l,c = parse_candles(data)
+        return {"t":t,"o":o,"h":h,"l":l,"c":c}, None
+
+    # 2) period (текст)
+    params2 = {"symbol": symbol, "period": tf_to_period(tf), "limit": limit}
+    data, err2 = spot_get(URL_SPOT_CANDLES, params2)
+    if not err2 and data:
+        t,o,h,l,c = parse_candles(data)
+        return {"t":t,"o":o,"h":h,"l":l,"c":c}, None
+
+    # 3) history-candles как запасной
+    data, err3 = spot_get(URL_SPOT_HISTORY, params2)
+    if not err3 and data:
+        t,o,h,l,c = parse_candles(data)
+        return {"t":t,"o":o,"h":h,"l":l,"c":c}, None
+
+    return None, err or err2 or err3 or "No candles"
 
 # ===== Логика сигналов
 def cross_signal(efast, eslow, eps_pct, slope_min, atr_arr, atr_k):
@@ -234,9 +265,10 @@ def handle_command(text: str):
         try:
             payload=t.split(None,1)[1]
             items=[x.strip().upper() for x in payload.replace(","," ").split() if x.strip()]
+            # На SPOT — названия без _UMCBL
             state["symbols"]=items
             send_tg(f"✅ SYMBOLS:\n{', '.join(state['symbols'])}")
-        except: send_tg("Формат: /setsymbols BTCUSDT_UMCBL ETHUSDT_UMCBL ...")
+        except: send_tg("Формат: /setsymbols BTCUSDT ETHUSDT ...")
         return
     if t.startswith("/help"):
         send_tg("Команды: /status, /mode ultra|normal, /setcooldown N, /settf TF, /setsymbols ...")
@@ -264,9 +296,9 @@ def tg_loop():
 
 # ===== Основной воркер
 def worker():
-    send_tg("🤖 Бот запущен (EMA/RSI/ATR сигнальный). Доступные команды: /status, /setcooldown, /settf, /setsymbols, /help")
-    test, err = fetch_candles("BTCUSDT_UMCBL", state["base_tf"], 200)
-    send_tg("✅ Bitget: candles OK." if test else f"⚠️ Диагностика Bitget: {err}")
+    send_tg("🤖 Бот запущен (EMA/RSI/ATR SPOT). Команды: /status, /setcooldown, /settf, /setsymbols, /help")
+    test, err = fetch_candles("BTCUSDT", state["base_tf"], 200)
+    send_tg("✅ Bitget SPOT: candles OK." if test else f"⚠️ Диагностика SPOT: {err}")
     while True:
         start=now_ts()
         for sym in state["symbols"]:
