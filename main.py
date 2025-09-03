@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Сигнальный бот для Bitget UMCBL (EMA 9/21 + ATR фильтр)
-— Свечи: /api/mix/v1/market/candles с startTime/endTime (в мс)
-— granularity в секундах: 60,300,900,1800,3600,14400,86400
-— Без pandas/numPy. Flask + два фоновых потока.
+Сигнальный бот для Bitget UMCBL (EMA 9/21 + ATR)
+— Свечи для фьючерсов: /api/mix/v1/market/history-candles
+— Параметры: symbol=*_UMCBL, granularity=секунды (60..86400), limit<=500
+— Flask для Render + фоновые потоки, без pandas/numpy
 """
 
 import os
@@ -15,12 +15,12 @@ from collections import defaultdict
 import requests
 from flask import Flask
 
-# ====== ТВОИ ДАННЫЕ ======
+# ===== ТВОИ ДАННЫЕ =====
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
-# =========================
+# =======================
 
-# Полные фьючерсные символы (USDT-M perpetual)
+# Полные символы (USDT-M perpetual)
 SYMBOLS = [
     "BTCUSDT_UMCBL",
     "ETHUSDT_UMCBL",
@@ -29,28 +29,22 @@ SYMBOLS = [
     "TRXUSDT_UMCBL",
 ]
 
-# Базовые настройки
-BASE_TF = "5m"
-FALLBACK_TF = "15m"
-CHECK_INTERVAL_S = 60
-MIN_CANDLES = 120
-EMA_FAST, EMA_SLOW = 9, 21
+# Настройки
+BASE_TF, FALLBACK_TF = "5m", "15m"
+CHECK_INTERVAL_S     = 60
+MIN_CANDLES          = 120
+EMA_FAST, EMA_SLOW   = 9, 21
+EPS_PCT, ATR_FACTOR  = 0.0008, 0.25
+SLOPE_MIN            = 0.0
+SIGNAL_COOLDOWN_S    = 300
+NO_SIGNAL_COOLDOWN   = 3600
+ERROR_COOLDOWN       = 1800
 
-# Фильтры
-EPS_PCT    = 0.0008
-ATR_FACTOR = 0.25
-SLOPE_MIN  = 0.0
+# Bitget endpoint (ФЬЮЧЕРСЫ!)
+URL_MIX_HISTORY = "https://api.bitget.com/api/mix/v1/market/history-candles"
+HEADERS = {"User-Agent": "Mozilla/5.0 (ema-signal-bot/2.1)"}
 
-# Антиспам
-SIGNAL_COOLDOWN_S   = 300
-NO_SIGNAL_COOLDOWN  = 3600
-ERROR_COOLDOWN      = 1800
-
-# Bitget API
-URL_MIX_CANDLES = "https://api.bitget.com/api/mix/v1/market/candles"
-HEADERS = {"User-Agent": "Mozilla/5.0 (ema-signal-bot/2.0)"}
-
-# Глобальное состояние
+# Состояние
 app = Flask(__name__)
 state = {
     "symbols": SYMBOLS[:],
@@ -70,9 +64,8 @@ cooldown_signal = defaultdict(float)
 cooldown_no_sig = defaultdict(float)
 cooldown_error  = defaultdict(float)
 
-# ---------- Утилиты ----------
+# ==== Утилиты
 def now_ts(): return time.time()
-def now_ms(): return int(now_ts()*1000)
 def fmt_dt(ts=None): return datetime.fromtimestamp(ts or now_ts()).strftime("%Y-%m-%d %H:%M:%S")
 
 def send_tg(text: str):
@@ -132,61 +125,37 @@ def parse_candles(data):
     t=[r[0] for r in rows]; o=[r[1] for r in rows]; h=[r[2] for r in rows]; l=[r[3] for r in rows]; c=[r[4] for r in rows]
     return t,o,h,l,c
 
-def bitget_get(params):
-    r = requests.get(URL_MIX_CANDLES, params=params, headers=HEADERS, timeout=20)
-    j = r.json()
-    if not isinstance(j, dict):        return None, "Bad response"
-    if j.get("code") != "00000":       return None, f"Bitget error {j.get('code')}: {j.get('msg')}"
-    return j.get("data", []), None
-
 def fetch_candles(symbol: str, tf: str, want: int = 300):
-    """
-    ТРЕБУЕТСЯ startTime & endTime.
-    Берём окно длиной `want` свечей данного TF.
-    """
+    """Фьючерсные свечи: history-candles с limit (до 500)."""
     step = tf_to_seconds(tf)
-    end_ms   = now_ms()
-    start_ms = end_ms - step * want * 1000
     params = {
         "symbol": symbol,
         "granularity": str(step),
-        "startTime": str(start_ms),
-        "endTime": str(end_ms)
+        "limit": str(min(500, want))
     }
-    data, err = bitget_get(params)
-    if err or not data:
-        return None, err or "No candles"
+    try:
+        r = requests.get(URL_MIX_HISTORY, params=params, headers=HEADERS, timeout=20)
+        j = r.json()
+    except Exception:
+        return None, "Bad response"
+    if not isinstance(j, dict):
+        return None, "Bad response"
+    if j.get("code") != "00000":
+        return None, f"Bitget error {j.get('code')}: {j.get('msg')}"
+    data = j.get("data", [])
+    if not data:
+        return None, "No candles"
     t,o,h,l,c = parse_candles(data)
-    if len(c) < 10:  # совсем мало — для надёжности расширим окно
-        start_ms = end_ms - step * max(500, want) * 1000
-        params["startTime"] = str(start_ms)
-        data, err = bitget_get(params)
-        if err or not data:
-            return None, err or "No candles"
-        t,o,h,l,c = parse_candles(data)
     return {"t":t,"o":o,"h":h,"l":l,"c":c}, None
 
-def throttle_err(sym: str, text: str):
-    ts=now_ts()
-    if ts - cooldown_error[sym] >= ERROR_COOLDOWN:
-        cooldown_error[sym]=ts
-        send_tg(text)
-
-def maybe_no_signal(sym: str):
-    ts=now_ts()
-    if ts - cooldown_no_sig[sym] >= NO_SIGNAL_COOLDOWN:
-        cooldown_no_sig[sym]=ts
-        send_tg(f"ℹ️ По {sym} сейчас нет сигнала ({fmt_dt()}).")
-
 def cross_signal(efast, eslow, eps_pct, slope_min, atr_arr, atr_k):
-    if not efast or not eslow or efast[-1] is None or eslow[-1] is None:
-        return None, "нет EMA"
-    if len(efast) < 3 or len(eslow) < 3:
-        return None, "мало EMA"
+    if not efast or not eslow or efast[-1] is None or eslow[-1] is None: return None, "нет EMA"
+    if len(efast)<3 or len(eslow)<3: return None, "мало EMA"
     df_prev = efast[-2]-eslow[-2] if efast[-2] is not None and eslow[-2] is not None else None
     df_curr = efast[-1]-eslow[-1]
-    price = efast[-1]; eps_abs = price*eps_pct
-    slope = (efast[-1] - (efast[-2] if efast[-2] is not None else efast[-1]))
+    price   = efast[-1]
+    eps_abs = price*eps_pct
+    slope   = (efast[-1] - (efast[-2] if efast[-2] is not None else efast[-1]))
     a = atr_arr[-1] if atr_arr and atr_arr[-1] is not None else None
     if slope < slope_min: return None, "slope низкий"
     if a is not None and abs(df_curr) < a*atr_k: return None, "diff < ATR*k"
@@ -194,6 +163,12 @@ def cross_signal(efast, eslow, eps_pct, slope_min, atr_arr, atr_k):
     if df_prev is not None and (df_prev >= 0 > df_curr): return "SHORT","кросс вниз"
     if abs(df_curr) <= eps_abs: return ("LONG" if slope>0 else "SHORT"), "близко к кроссу"
     return None, "нет условия"
+
+def maybe_no_signal(sym: str):
+    ts=now_ts()
+    if ts - cooldown_no_sig[sym] >= NO_SIGNAL_COOLDOWN:
+        cooldown_no_sig[sym]=ts
+        send_tg(f"ℹ️ По {sym} сейчас нет сигнала ({fmt_dt()}).")
 
 def make_signal_text(sym, side, price, tf, note):
     arrow = "🟢 LONG" if side=="LONG" else "🔴 SHORT"
@@ -203,13 +178,13 @@ def make_signal_text(sym, side, price, tf, note):
 
 def check_symbol(sym: str):
     if now_ts() < cooldown_signal[sym]: return
+    # пробуем базовый ТФ, если нет — fallback
     for tf in (state["base_tf"], state["fallback_tf"]):
         candles, err = fetch_candles(sym, tf, want=max(300, state["min_candles"]+50))
         if candles:
             t,o,h,l,c = candles["t"], candles["o"], candles["h"], candles["l"], candles["c"]
             if len(c) < state["min_candles"]: maybe_no_signal(sym); return
-            efast = ema(c, state["ema_fast"])
-            eslow = ema(c, state["ema_slow"])
+            efast = ema(c, state["ema_fast"]); eslow = ema(c, state["ema_slow"])
             atr_a = atr(h, l, c, period=14)
             side, note = cross_signal(efast, eslow, state["eps_pct"], state["slope_min"], atr_a, state["atr_k"])
             if side:
@@ -219,15 +194,19 @@ def check_symbol(sym: str):
                 maybe_no_signal(sym)
             return
         else:
-            throttle_err(sym, f"❌ Ошибка {sym}: {err}")
+            # без спама — не чаще 1 раз/30мин на символ
+            ts=now_ts()
+            if ts - cooldown_error[sym] >= ERROR_COOLDOWN:
+                cooldown_error[sym]=ts
+                send_tg(f"❌ Ошибка {sym}: {err}")
 
 def apply_mode(mode: str):
-    if str(mode).lower() == "ultra":
+    if str(mode).lower()=="ultra":
         state["eps_pct"]=0.0005; state["atr_k"]=0.35; state["mode"]="ultra"
     else:
         state["eps_pct"]=0.0008; state["atr_k"]=0.25; state["mode"]="normal"
 
-# -------- Telegram команды --------
+# ===== Команды Telegram (через getUpdates)
 def handle_command(text: str):
     t=text.strip()
     if t.startswith("/mode"):
@@ -247,7 +226,7 @@ def handle_command(text: str):
         try:
             v=int(t.split()[1]); state["signal_cooldown_s"]=max(60,min(3600,v))
             send_tg(f"🧊 cooldown={state['signal_cooldown_s']}s")
-        except: send_tg("Формат: /setcooldown 300")
+        except: send_tg("Формат: /setcooldown 300"); return
         return
     if t.startswith("/settf"):
         try:
@@ -288,7 +267,7 @@ def tg_loop():
             print("tg loop error:", e)
         time.sleep(1)
 
-# -------- Основной воркер --------
+# ===== Основной воркер / Flask
 def worker():
     send_tg("🤖 Бот запущен (EMA/RSI/ATR сигнальный). Доступные команды: /status, /setcooldown, /settf, /setsymbols, /help")
     test, err = fetch_candles("BTCUSDT_UMCBL", state["base_tf"], 200)
@@ -302,7 +281,6 @@ def worker():
                 print("check_symbol error", sym, e)
         time.sleep(max(2.0, state["check_s"]-(now_ts()-start)))
 
-# -------- Flask (Render keep-alive) --------
 @app.route("/")
 def root(): return "ok"
 
