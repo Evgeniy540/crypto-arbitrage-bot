@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 EMA(9/21)+ATR сигнальный бот для Bitget UMCBL.
-Свечи: /api/mix/v1/market/history-candles (symbol, granularity, startTime, endTime)
+Свечи: GET /api/mix/v1/market/candles  (symbol, granularity, limit)
 Flask + фоновые потоки. Без pandas/numpy.
 """
 
@@ -40,8 +40,8 @@ NO_SIGNAL_COOLDOWN   = 3600
 ERROR_COOLDOWN       = 1800
 
 # Bitget (фьючерсы)
-URL_MIX_HISTORY = "https://api.bitget.com/api/mix/v1/market/history-candles"
-HEADERS = {"User-Agent": "ema-signal-bot/3.1"}
+URL_MIX_CANDLES = "https://api.bitget.com/api/mix/v1/market/candles"
+HEADERS = {"User-Agent": "ema-signal-bot/3.2"}
 
 # Состояние
 app = Flask(__name__)
@@ -65,7 +65,6 @@ cooldown_error  = defaultdict(float)
 
 # ===== Утилиты
 def now_ts(): return time.time()
-def now_ms(): return int(now_ts()*1000)
 def fmt_dt(ts=None): return datetime.fromtimestamp(ts or now_ts()).strftime("%Y-%m-%d %H:%M:%S")
 
 def send_tg(text: str):
@@ -125,19 +124,16 @@ def parse_candles(data):
     t=[r[0] for r in rows]; o=[r[1] for r in rows]; h=[r[2] for r in rows]; l=[r[3] for r in rows]; c=[r[4] for r in rows]
     return t,o,h,l,c
 
-# ===== Bitget: UMCBL требует startTime & endTime
+# ===== Свечи через /candles (symbol + granularity + limit)
 def fetch_candles(symbol: str, tf: str, want: int = 300):
     step = tf_to_seconds(tf)
-    end_ms   = now_ms()
-    start_ms = end_ms - step * want * 1000
     params = {
         "symbol": symbol,
         "granularity": str(step),
-        "startTime": str(start_ms),
-        "endTime": str(end_ms)
+        "limit": str(min(500, want))
     }
     try:
-        r = requests.get(URL_MIX_HISTORY, params=params, headers=HEADERS, timeout=20)
+        r = requests.get(URL_MIX_CANDLES, params=params, headers=HEADERS, timeout=20)
         j = r.json()
     except Exception as e:
         return None, f"Bad response: {e}"
@@ -146,17 +142,6 @@ def fetch_candles(symbol: str, tf: str, want: int = 300):
     data = j.get("data", [])
     if not data: return None, "No candles"
     t,o,h,l,c = parse_candles(data)
-    # Если мало свечей — расширим окно
-    if len(c) < state["min_candles"]:
-        start_ms = end_ms - step * max(500, want) * 1000
-        params["startTime"] = str(start_ms)
-        try:
-            r = requests.get(URL_MIX_HISTORY, params=params, headers=HEADERS, timeout=20)
-            j = r.json()
-            if isinstance(j, dict) and j.get("code") == "00000":
-                data = j.get("data", [])
-                t,o,h,l,c = parse_candles(data)
-        except: pass
     return {"t":t,"o":o,"h":h,"l":l,"c":c}, None
 
 # ===== Логика сигналов
