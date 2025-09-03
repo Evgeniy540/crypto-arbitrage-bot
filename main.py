@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Сигнальный бот для Bitget UMCBL (EMA 9/21 + ATR)
-— Свечи для фьючерсов: /api/mix/v1/market/history-candles
-— Параметры: symbol=*_UMCBL, granularity=секунды (60..86400), limit<=500
-— Flask для Render + фоновые потоки, без pandas/numpy
+EMA(9/21)+ATR сигнальный бот для Bitget UMCBL.
+Свечи: /api/mix/v1/market/history-candles  (symbol, granularity, limit)
+Flask + фоновые потоки. Без pandas/numpy.
 """
 
 import os
@@ -20,7 +19,7 @@ TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
 # =======================
 
-# Полные символы (USDT-M perpetual)
+# Полные фьючерсные символы Bitget (USDT-M perpetual)
 SYMBOLS = [
     "BTCUSDT_UMCBL",
     "ETHUSDT_UMCBL",
@@ -40,9 +39,9 @@ SIGNAL_COOLDOWN_S    = 300
 NO_SIGNAL_COOLDOWN   = 3600
 ERROR_COOLDOWN       = 1800
 
-# Bitget endpoint (ФЬЮЧЕРСЫ!)
+# Bitget (фьючерсы)
 URL_MIX_HISTORY = "https://api.bitget.com/api/mix/v1/market/history-candles"
-HEADERS = {"User-Agent": "Mozilla/5.0 (ema-signal-bot/2.1)"}
+HEADERS = {"User-Agent": "ema-signal-bot/3.0"}
 
 # Состояние
 app = Flask(__name__)
@@ -64,7 +63,7 @@ cooldown_signal = defaultdict(float)
 cooldown_no_sig = defaultdict(float)
 cooldown_error  = defaultdict(float)
 
-# ==== Утилиты
+# ===== Утилиты
 def now_ts(): return time.time()
 def fmt_dt(ts=None): return datetime.fromtimestamp(ts or now_ts()).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -125,8 +124,8 @@ def parse_candles(data):
     t=[r[0] for r in rows]; o=[r[1] for r in rows]; h=[r[2] for r in rows]; l=[r[3] for r in rows]; c=[r[4] for r in rows]
     return t,o,h,l,c
 
+# ===== Bitget: свечи только через history-candles (symbol + granularity + limit)
 def fetch_candles(symbol: str, tf: str, want: int = 300):
-    """Фьючерсные свечи: history-candles с limit (до 500)."""
     step = tf_to_seconds(tf)
     params = {
         "symbol": symbol,
@@ -136,18 +135,16 @@ def fetch_candles(symbol: str, tf: str, want: int = 300):
     try:
         r = requests.get(URL_MIX_HISTORY, params=params, headers=HEADERS, timeout=20)
         j = r.json()
-    except Exception:
-        return None, "Bad response"
-    if not isinstance(j, dict):
-        return None, "Bad response"
-    if j.get("code") != "00000":
-        return None, f"Bitget error {j.get('code')}: {j.get('msg')}"
+    except Exception as e:
+        return None, f"Bad response: {e}"
+    if not isinstance(j, dict): return None, "Bad JSON"
+    if j.get("code") != "00000": return None, f"Bitget error {j.get('code')}: {j.get('msg')}"
     data = j.get("data", [])
-    if not data:
-        return None, "No candles"
+    if not data: return None, "No candles"
     t,o,h,l,c = parse_candles(data)
     return {"t":t,"o":o,"h":h,"l":l,"c":c}, None
 
+# ===== Логика сигналов
 def cross_signal(efast, eslow, eps_pct, slope_min, atr_arr, atr_k):
     if not efast or not eslow or efast[-1] is None or eslow[-1] is None: return None, "нет EMA"
     if len(efast)<3 or len(eslow)<3: return None, "мало EMA"
@@ -178,7 +175,6 @@ def make_signal_text(sym, side, price, tf, note):
 
 def check_symbol(sym: str):
     if now_ts() < cooldown_signal[sym]: return
-    # пробуем базовый ТФ, если нет — fallback
     for tf in (state["base_tf"], state["fallback_tf"]):
         candles, err = fetch_candles(sym, tf, want=max(300, state["min_candles"]+50))
         if candles:
@@ -194,7 +190,6 @@ def check_symbol(sym: str):
                 maybe_no_signal(sym)
             return
         else:
-            # без спама — не чаще 1 раз/30мин на символ
             ts=now_ts()
             if ts - cooldown_error[sym] >= ERROR_COOLDOWN:
                 cooldown_error[sym]=ts
@@ -206,7 +201,7 @@ def apply_mode(mode: str):
     else:
         state["eps_pct"]=0.0008; state["atr_k"]=0.25; state["mode"]="normal"
 
-# ===== Команды Telegram (через getUpdates)
+# ===== Команды Telegram
 def handle_command(text: str):
     t=text.strip()
     if t.startswith("/mode"):
@@ -267,7 +262,7 @@ def tg_loop():
             print("tg loop error:", e)
         time.sleep(1)
 
-# ===== Основной воркер / Flask
+# ===== Основной воркер
 def worker():
     send_tg("🤖 Бот запущен (EMA/RSI/ATR сигнальный). Доступные команды: /status, /setcooldown, /settf, /setsymbols, /help")
     test, err = fetch_candles("BTCUSDT_UMCBL", state["base_tf"], 200)
@@ -281,6 +276,7 @@ def worker():
                 print("check_symbol error", sym, e)
         time.sleep(max(2.0, state["check_s"]-(now_ts()-start)))
 
+# ===== Flask (Render keep-alive)
 @app.route("/")
 def root(): return "ok"
 
