@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-EMA(9/21)+ATR сигнальный бот • KuCoin SPOT (ENTRY preset by default — мягкие фильтры)
+EMA(9/21)+ATR сигнальный бот • KuCoin SPOT (FEATHER preset by default — супер-мягкие фильтры)
 — анти-лимиты KuCoin: батчи, троттлинг, ретраи при 429
-— пресеты: /entry, /quietpp, /quiet, /soft, /hard, /night, /mode insane|turbo|ultra|normal
+— пресеты: /feather, /entry, /quietpp, /quiet, /soft, /hard, /night, /mode insane|turbo|ultra|normal
 — тонкая настройка: /setfilters, /setbounce, /setcooldown, /setcheck, /settf, /setsymbols, /setnosig, /setbatch, /setthrottle
 — отчёты/диагностика: /candles, /report, /autoreport, /status, /help
 — сводка «нет сигналов»: /nosigall on|off [каждые_мин] [мин_без_сигнала], /nosigallstatus
@@ -13,10 +13,10 @@ from datetime import datetime
 from collections import defaultdict
 from flask import Flask
 
-# === ТВОИ ДАННЫЕ (как просил) ===
+# === ТВОИ ДАННЫЕ (как прислал) ===
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
-# =================================
+# ==================================
 
 # Символы KuCoin (формат с дефисом!)
 DEFAULT_SYMBOLS = [
@@ -24,15 +24,15 @@ DEFAULT_SYMBOLS = [
     "TON-USDT","LINK-USDT","LTC-USDT","DOT-USDT","ARB-USDT","OP-USDT","PEPE-USDT","SHIB-USDT"
 ]
 
-# Базовые параметры
+# Базовые параметры (будут переопределены пресетами при старте)
 EMA_FAST, EMA_SLOW     = 9, 21
-BASE_TF, FALLBACK_TF   = "5m", "15m"  # ENTRY: мягче на 5m, резерв 15m
-MIN_CANDLES            = 120          # достаточно истории
+BASE_TF, FALLBACK_TF   = "5m", "15m"
+MIN_CANDLES            = 120
 
 # KuCoin API
 KUCOIN_BASE    = "https://api.kucoin.com"
 KUCOIN_CANDLES = KUCOIN_BASE + "/api/v1/market/candles"
-HEADERS        = {"User-Agent": "ema-kucoin-bot/3.3-entry-nosigall"}
+HEADERS        = {"User-Agent": "ema-kucoin-bot/3.4-feather"}
 
 # Flask + состояние
 app = Flask(__name__)
@@ -45,33 +45,33 @@ state = {
     "ema_fast": EMA_FAST,
     "ema_slow": EMA_SLOW,
 
-    # тайминги (мягче = чаще проверки и короче кулдауны)
-    "check_s": 15,               # пауза между батчами
-    "signal_cooldown_s": 420,    # 7 мин между сигналами по одной паре
-    "no_sig_cooldown_s": 3600,   # «нет сигнала» не чаще, чем раз в 60 минут
-    "error_cooldown_s": 600,     # 10 мин
+    # тайминги (будут мягкие после пресета)
+    "check_s": 15,
+    "signal_cooldown_s": 420,
+    "no_sig_cooldown_s": 3600,
+    "error_cooldown_s": 600,
 
-    # чувствительность (мягкие фильтры для большего числа входов)
-    "eps_pct": 0.0012,           # допуск для «почти-кросс»
-    "atr_k":   0.18,             # дифф EMA должен быть >= 0.18*ATR (низкий порог)
-    "slope_min": -0.0001,        # разрешаем почти плоские/слабые наклоны EMA9
-    "slope21_min": 0.00003,      # лёгкий тренд-фильтр EMA21
-    "dead_pct": 0.0004,          # маленькая «мёртвая зона» — больше сигналов
-    "bounce_k": 0.28,            # отскок от EMA21 — мягкий
+    # фильтры (перезапишутся пресетом)
+    "eps_pct": 0.0012,
+    "atr_k":   0.18,
+    "slope_min": -0.0001,
+    "slope21_min": 0.00003,
+    "dead_pct": 0.0004,
+    "bounce_k": 0.28,
 
     "mode": "entry",
 
     # отчёты
     "report_enabled": True,
-    "report_every_min": 120,     # автоотчёт
+    "report_every_min": 120,
 
     # сводка "нет сигналов" одним сообщением
-    "nosig_all_enabled": True,       # включено по умолчанию
-    "nosig_all_every_min": 120,      # как часто слать сводку (мин)
-    "nosig_all_min_age_min": 60,     # упоминать пары, где нет сигналов >= N минут
+    "nosig_all_enabled": True,
+    "nosig_all_every_min": 120,
+    "nosig_all_min_age_min": 60,
 
     # анти-лимиты
-    "batch_size": 8,             # больше монет за цикл
+    "batch_size": 8,
     "per_req_sleep": 0.25,
     "rr_index": 0,
     "max_retries": 3,
@@ -199,7 +199,7 @@ def decide_signal(e9,e21,atr_arr,price,eps_pct,atr_k,slope_min,slope21_min,dead_
     eps_abs  = price*eps_pct
     dead_abs = price*dead_pct
 
-    # тренд EMA21 (даже в мягком режиме — лёгкая проверка)
+    # тренд EMA21 (лёгкая проверка)
     s21 = e21[-1] - (e21[-2] if e21[-2] is not None else e21[-1])
 
     v=cross_or_near(e9,e21,price,eps_abs,dead_abs)
@@ -208,7 +208,7 @@ def decide_signal(e9,e21,atr_arr,price,eps_pct,atr_k,slope_min,slope21_min,dead_
         slope=e9[-1]-(e9[-2] if e9[-2] is not None else e9[-1])
         if slope < slope_min:
             return None,"slope9"
-        # лёгкий тренд-фильтр (совсем слабый, чтобы не душить входы)
+        # лёгкий тренд-фильтр, почти не душим
         if (side=="LONG" and s21 < slope21_min) or (side=="SHORT" and s21 > -slope21_min):
             return None,"slope21"
         if atr_arr and atr_arr[-1] is not None:
@@ -255,7 +255,7 @@ def check_symbol(sym):
         )
         if side:
             cool_signal[sym]=now_ts()+state["signal_cooldown_s"]
-            last_sig[sym] = now_ts()  # отметка времени последнего сигнала
+            last_sig[sym] = now_ts()
             send_tg(make_text(sym,side,c[-1],tf,note)); return
         else:
             maybe_no_signal(sym); return
@@ -303,15 +303,14 @@ def next_batch():
     return batch
 
 def apply_preset_entry():
-    # максимально «мягкий» пресет для более частых входов (по умолчанию)
     state.update({
         "base_tf": "5m",
         "fallback_tf": "15m",
         "min_candles": 120,
 
         "check_s": 15,
-        "signal_cooldown_s": 420,    # 7 минут
-        "no_sig_cooldown_s": 3600,   # 60 минут
+        "signal_cooldown_s": 420,
+        "no_sig_cooldown_s": 3600,
         "error_cooldown_s": 600,
 
         "eps_pct": 0.0012,
@@ -326,8 +325,35 @@ def apply_preset_entry():
         "mode": "entry"
     })
 
+def apply_preset_feather(use_1m_fallback=True):
+    # СУПЕР-МЯГКИЙ пресет: больше входов
+    state.update({
+        "base_tf": "5m",
+        "fallback_tf": "1m" if use_1m_fallback else "15m",
+        "min_candles": 120,
+
+        # тайминги
+        "check_s": 10,
+        "signal_cooldown_s": 300,   # 5 минут
+        "no_sig_cooldown_s": 2700,  # 45 минут
+        "error_cooldown_s": 600,
+
+        # фильтры ещё мягче
+        "eps_pct": 0.0009,
+        "atr_k": 0.14,
+        "slope_min": -0.0003,
+        "slope21_min": 0.00002,
+        "dead_pct": 0.00025,
+        "bounce_k": 0.35,
+
+        # анти-лимиты
+        "batch_size": 10,
+        "per_req_sleep": 0.22,
+
+        "mode": "feather"
+    })
+
 def apply_preset_quietpp():
-    # мягко, но тише, чем entry (для снижения шума)
     state.update({
         "eps_pct":0.0026,"atr_k":0.42,"slope_min":0.00045,"slope21_min":0.00012,"dead_pct":0.0010,
         "bounce_k":0.12, "signal_cooldown_s":2100, "mode":"quiet++", "base_tf":"15m",
@@ -335,7 +361,6 @@ def apply_preset_quietpp():
     })
 
 def apply_preset_ultra_quiet():
-    # очень тихо (для ночи/работы)
     state.update({
         "eps_pct":0.0030,"atr_k":0.50,"slope_min":0.0006,"slope21_min":0.00015,"dead_pct":0.0012,
         "bounce_k":0.10,"signal_cooldown_s":2700,"mode":"ultra-quiet+","base_tf":"15m",
@@ -343,7 +368,6 @@ def apply_preset_ultra_quiet():
     })
 
 def apply_preset_night():
-    # максимально тихо
     state.update({
         "eps_pct":0.0038,"atr_k":0.60,"slope_min":0.0008,"slope21_min":0.00022,"dead_pct":0.0016,
         "bounce_k":0.08,"signal_cooldown_s":3600,"mode":"night","base_tf":"30m",
@@ -361,7 +385,8 @@ def handle_cmd(text):
         send_tg(
             "Команды:\n"
             "/status\n"
-            "/entry (мягкий пресет — больше входов)\n"
+            "/feather [1m|15m]  (супер-мягкий пресет)\n"
+            "/entry (мягкий пресет)\n"
             "/quietpp | /quiet | /night | /soft | /hard | /mode insane|turbo|ultra|normal\n"
             "/setfilters eps atr_k slope_min [slope21_min] [dead_pct]\n"
             "/setbounce K\n"
@@ -389,8 +414,13 @@ def handle_cmd(text):
         )
 
     # === Пресеты
+    elif cmd=="/feather":
+        fb = parts[1].lower() if len(parts) > 1 else "1m"
+        use_1m = (fb == "1m")
+        apply_preset_feather(use_1m_fallback=use_1m)
+        send_tg(f"🪶 FEATHER preset: супер-мягко (TF 5m, fallback {state['fallback_tf']})")
     elif cmd=="/entry":
-        apply_preset_entry(); send_tg("🚀 ENTRY preset: мягкие фильтры и чаще входы (TF 5m)")
+        apply_preset_entry(); send_tg("🚀 ENTRY preset: мягкие фильтры (TF 5m, fb 15m)")
     elif cmd=="/quietpp":
         apply_preset_quietpp(); send_tg("🎛 QUIET++ (тише, TF 15m)")
     elif cmd=="/quiet":
@@ -444,11 +474,11 @@ def handle_cmd(text):
                 state.update({"eps_pct":eps,"atr_k":ak,"slope_min":sm,"slope21_min":s21,"dead_pct":dead})
                 send_tg(f"ok: eps={eps} atr_k={ak} slope9={sm} slope21={s21} dead={dead}")
         except:
-            send_tg("формат: /setfilters 0.0012 0.18 -0.0001 0.00003 0.0004")
+            send_tg("формат: /setfilters 0.0009 0.14 -0.0003 0.00002 0.00025")
     elif cmd=="/setbounce":
         try:
             v=float(parts[1]); v=max(0.05,min(1.0,v)); state["bounce_k"]=v; send_tg(f"bounce_k={v}")
-        except: send_tg("формат: /setbounce 0.28")
+        except: send_tg("формат: /setbounce 0.35")
     elif cmd=="/setcooldown":
         try:
             v=int(parts[1]); v=max(60,min(14400,v)); state["signal_cooldown_s"]=v; send_tg(f"cooldown={v}")
@@ -461,7 +491,7 @@ def handle_cmd(text):
     elif cmd=="/setcheck":
         try:
             v=int(parts[1]); state["check_s"]=max(5,min(180,v)); send_tg(f"check interval = {state['check_s']}s")
-        except: send_tg("формат: /setcheck 15")
+        except: send_tg("формат: /setcheck 10")
     elif cmd=="/settf":
         try:
             v=parts[1]; state["base_tf"]=v; send_tg(f"TF={v}")
@@ -474,11 +504,11 @@ def handle_cmd(text):
     elif cmd=="/setbatch":
         try:
             v=int(parts[1]); v=max(1,min(50,v)); state["batch_size"]=v; send_tg(f"batch_size={v}")
-        except: send_tg("формат /setbatch 8")
+        except: send_tg("формат /setbatch 10")
     elif cmd=="/setthrottle":
         try:
             v=float(parts[1]); v=max(0.05,min(2.0,v)); state["per_req_sleep"]=v; send_tg(f"throttle={v}s")
-        except: send_tg("формат /setthrottle 0.25")
+        except: send_tg("формат /setthrottle 0.22")
 
     # === Сводка «нет сигналов»
     elif cmd == "/nosigall":
@@ -557,7 +587,7 @@ def tg_loop():
         time.sleep(1)
 
 def signals_worker():
-    send_tg("🤖 KuCoin EMA бот (ENTRY, TF 5m) запущен. /help")
+    send_tg("🤖 KuCoin EMA бот (FEATHER, TF 5m, fb 1m) запущен. /help")
     while True:
         try:
             for s in next_batch():
@@ -627,13 +657,13 @@ def nosig_all_worker():
         time.sleep(5)
 
 @app.route("/")
-def root(): return "ok"
+def root(): return "ок"
 
 if __name__=="__main__":
-    apply_preset_entry()   # стартуем мягко
+    # стартуем СУПЕР-МЯГКО: TF 5m, fallback 1m
+    apply_preset_feather(use_1m_fallback=True)
     threading.Thread(target=signals_worker,daemon=True).start()
     threading.Thread(target=tg_loop,daemon=True).start()
     threading.Thread(target=report_worker,daemon=True).start()
     threading.Thread(target=nosig_all_worker,daemon=True).start()
-    # Поднимем Flask-сервер (важно для Render/ Railway)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT","10000")))
