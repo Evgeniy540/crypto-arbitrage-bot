@@ -56,13 +56,13 @@ state = {
     "ema_fast": EMA_FAST,
     "ema_slow": EMA_SLOW,
 
-    # стартуем в quiet-профиле (чуть мягче, чем раньше)
-    "eps_pct": 0.0010,   # было 0.0012 → мягче
-    "atr_k":   0.18,     # было 0.22  → мягче
-    "slope_min": -0.0008,
+    # quiet-профиль: ещё немного мягче, но без «шторма»
+    "eps_pct": 0.0012,   # было 0.0010 → +чувствительность слегка
+    "atr_k":   0.16,     # было 0.18  → слабее ATR-фильтр
+    "slope_min": -0.0010,# было -0.0008 → допускаем чуть больший уклон
     "signal_cooldown_s": SIGNAL_COOLDOWN_S,
     "mode": "quiet",
-    "bounce_k": 0.35,    # шире «окно» отскока
+    "bounce_k": 0.40,    # отскок шире
 
     # авто-отчёт (раз в час)
     "report_enabled": True,
@@ -200,7 +200,6 @@ def decide_signal(e9, e21, atr_arr, price, eps_pct, atr_k, slope_min):
     a = atr_arr[-1] if atr_arr and atr_arr[-1] is not None else None
     v = bounce_signal(e9, e21, price, a)
     if v:
-        # в мягком quiet допускаем отскоки
         return v
 
     return None,"нет"
@@ -302,12 +301,12 @@ def apply_preset_hard():
     state.update({"eps_pct":0.0015,"atr_k":0.20,"slope_min":-0.0002,"mode":"hard","bounce_k":0.25})
 
 def apply_preset_quiet():
-    # тихий, но ещё чуть мягче
+    # тихий, ещё чуть мягче
     state.update({
-        "eps_pct": 0.0010,
-        "atr_k":   0.18,
-        "slope_min": -0.0008,
-        "bounce_k": 0.35,
+        "eps_pct": 0.0012,
+        "atr_k":   0.16,
+        "slope_min": -0.0010,
+        "bounce_k": 0.40,
         "signal_cooldown_s": max(300, state.get("signal_cooldown_s", 300)),
         "mode": "quiet",
     })
@@ -324,7 +323,7 @@ def handle_cmd(text):
     elif text.startswith("/hard"):
         apply_preset_hard();  send_tg("🎛 HARD preset (строже)")
     elif text.startswith("/quiet"):
-        apply_preset_quiet(); send_tg("🤫 QUIET preset (чуть мягче)")
+        apply_preset_quiet(); send_tg("🤫 QUIET preset (ещё немного мягче)")
 
     elif text.startswith("/status"):
         send_tg(
@@ -466,7 +465,7 @@ def tg_loop():
         time.sleep(1)
 
 def signals_worker():
-    send_tg("🤖 KuCoin EMA бот (quiet — ещё мягче) запущен. /help")
+    send_tg("🤖 KuCoin EMA бот (quiet — ещё немного мягче) запущен. /help")
     while True:
         try:
             batch = next_symbols_batch()
