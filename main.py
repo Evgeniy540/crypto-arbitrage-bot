@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 EMA(9/21)+ATR сигнальный бот • KuCoin SPOT
-— анти-лимиты KuCoin: батчи монет, троттлинг, ретраи при 429
+— анти-лимиты KuCoin: батчи, троттлинг, ретраи при 429
 — режимы/пресеты: /mode, /soft, /hard, /quiet
 — ручная настройка: /setfilters, /setbounce, /setcooldown, /setcheck, /settf, /setsymbols
-— отчёты и диагностика: /candles, /report, /autoreport, /status, /help
+— отчёты/диагностика: /candles, /report, /autoreport, /status, /help
 """
 
 import os, time, threading, requests, random
@@ -14,25 +14,25 @@ from flask import Flask
 
 # === ТВОИ ДАННЫЕ ===
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
-TELEGRAM_CHAT_ID   = "5723086631"
+TELEGRAM_CHAT_ID   = "5723086631"   # твой личный чат
 # ===================
 
-# Список монет KuCoin (символы с дефисом!)
+# Символы KuCoin (с дефисом!)
 DEFAULT_SYMBOLS = [
     "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT","ADA-USDT","DOGE-USDT","TRX-USDT",
     "TON-USDT","LINK-USDT","LTC-USDT","DOT-USDT","ARB-USDT","OP-USDT","PEPE-USDT","SHIB-USDT"
 ]
 
-# Тайминги
+# Тайминги / чувствительность (тихий, ещё мягче)
 CHECK_INTERVAL_S     = 20
-SIGNAL_COOLDOWN_S    = 420   # ← было 300: ещё чуть реже по одной монете
-NO_SIGNAL_COOLDOWN   = 1800
+SIGNAL_COOLDOWN_S    = 600    # 10 минут
+NO_SIGNAL_COOLDOWN   = 3600   # “нет сигнала” максимум раз/час
 ERROR_COOLDOWN       = 600
 MIN_CANDLES          = 120
 EMA_FAST, EMA_SLOW   = 9, 21
 BASE_TF, FALLBACK_TF = "5m", "15m"
 
-# Пресеты для /mode
+# Пресеты /mode (на всякий случай)
 FILTERS = {
     "normal": {"eps": 0.0015, "atr_k": 0.20, "slope_min": -0.0002},
     "ultra":  {"eps": 0.0020, "atr_k": 0.10, "slope_min": -0.0010},
@@ -43,7 +43,7 @@ FILTERS = {
 # KuCoin API
 KUCOIN_BASE    = "https://api.kucoin.com"
 KUCOIN_CANDLES = KUCOIN_BASE + "/api/v1/market/candles"
-HEADERS        = {"User-Agent": "ema-kucoin-bot/2.6"}
+HEADERS        = {"User-Agent": "ema-kucoin-bot/2.7"}
 
 # Flask + состояние
 app = Flask(__name__)
@@ -56,15 +56,15 @@ state = {
     "ema_fast": EMA_FAST,
     "ema_slow": EMA_SLOW,
 
-    # quiet-профиль (ещё чуть мягче → меньше сигналов)
-    "eps_pct": 0.0015,   # было 0.0013
-    "atr_k":   0.24,     # было 0.20
-    "slope_min": 0.0,    # было -0.0001
-    "bounce_k": 0.22,    # было 0.25
+    # QUIET по умолчанию (ещё мягче)
+    "eps_pct": 0.0017,
+    "atr_k":   0.28,
+    "slope_min": 0.0001,
+    "bounce_k": 0.20,
     "signal_cooldown_s": SIGNAL_COOLDOWN_S,
     "mode": "quiet",
 
-    # автоотчёт включён каждый час
+    # автоотчёт — каждый час
     "report_enabled": True,
     "report_every_min": 60,
 
@@ -80,7 +80,7 @@ cool_signal = defaultdict(float)
 cool_no     = defaultdict(float)
 cool_err    = defaultdict(float)
 
-# ===== Утилиты =====
+# ---------- Утилиты ----------
 def now_ts(): return time.time()
 def fmt_dt(ts=None): return datetime.fromtimestamp(ts or now_ts()).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -123,7 +123,7 @@ def tf_to_kucoin(tf):
         "1h":"1hour","4h":"4hour","1d":"1day"
     }.get(tf, "5min")
 
-# ===== Обёртка с ретраями и бэкоффом =====
+# ---------- HTTP с ретраями ----------
 def kucoin_get(url, params, timeout=10):
     tries = 0
     while True:
@@ -136,7 +136,7 @@ def kucoin_get(url, params, timeout=10):
         except Exception:
             if tries >= state["max_retries"]:
                 raise
-            sleep_s = state["backoff_base"] * (2 ** (tries - 1)) + random.uniform(0.0, 0.05)
+            sleep_s = state["backoff_base"]*(2**(tries-1)) + random.uniform(0.0, 0.05)
             time.sleep(sleep_s)
 
 def fetch_candles(symbol, tf, want=300):
@@ -163,7 +163,7 @@ def fetch_candles(symbol, tf, want=300):
     time.sleep(state["per_req_sleep"])
     return {"t":t,"o":o,"h":h,"l":l,"c":c}, None
 
-# ===== Сигналы =====
+# ---------- Сигналы ----------
 def cross_or_near(e9, e21, price, eps_abs):
     if len(e9)<2 or len(e21)<2 or e9[-1] is None or e21[-1] is None: return None
     prev = (e9[-2]-e21[-2]) if (e9[-2] is not None and e21[-2] is not None) else None
@@ -194,17 +194,13 @@ def decide_signal(e9, e21, atr_arr, price, eps_pct, atr_k, slope_min):
         if slope < slope_min: return None, "slope"
         if atr_arr and atr_arr[-1] is not None:
             a = atr_arr[-1]; diff = abs(e9[-1]-e21[-1])
-            # при жёстком quiet требуем больший разлёт относительно ATR
             if diff < a*atr_k and abs(diff) > eps_abs:
                 return None,"atr"
         return side, note
 
     a = atr_arr[-1] if atr_arr and atr_arr[-1] is not None else None
     v = bounce_signal(e9, e21, price, a)
-    if v:
-        # bounce уже ужат bounce_k, дополнительно не либаём
-        return v
-
+    if v: return v
     return None,"нет"
 
 def maybe_no_signal(sym):
@@ -247,7 +243,7 @@ def check_symbol(sym):
             maybe_no_signal(sym)
             return
 
-# ===== Отчёты =====
+# ---------- Отчёты ----------
 def build_candles_report(sym, tf):
     cndl, err = fetch_candles(sym, tf, 120)
     if not cndl: return f"❌ {sym}: {err}"
@@ -273,51 +269,58 @@ def build_all_report(tf):
     if block: msgs.append("\n\n".join(block))
     return msgs
 
-# ===== Батчи, режимы, команды =====
-def next_symbols_batch():
-    syms = state["symbols"]
-    if not syms: return []
-    n = max(1, min(len(syms), int(state.get("batch_size", 6))))
-    i = int(state.get("rr_index", 0)) % len(syms)
-    batch = (syms + syms)[i:i+n]
-    state["rr_index"] = (i + n) % len(syms)
-    return batch
-
+# ---------- Режимы и команды ----------
 def apply_mode(m):
     m = (m or "normal").lower()
     if m in FILTERS:
         f = FILTERS[m]
         state.update({"eps_pct":f["eps"], "atr_k":f["atr_k"], "slope_min":f["slope_min"], "mode":m})
 
-def apply_preset_soft():
-    state.update({"eps_pct":0.0030,"atr_k":0.08,"slope_min":-0.0020,"mode":"soft","bounce_k":0.40})
-
-def apply_preset_hard():
-    state.update({"eps_pct":0.0015,"atr_k":0.20,"slope_min":-0.0002,"mode":"hard","bounce_k":0.25})
-
 def apply_preset_quiet():
     state.update({
-        "eps_pct": 0.0015,
-        "atr_k":   0.24,
-        "slope_min": 0.0,
-        "bounce_k": 0.22,
-        "signal_cooldown_s": max(420, state.get("signal_cooldown_s", 420)),
+        "eps_pct": 0.0017,
+        "atr_k":   0.28,
+        "slope_min": 0.0001,
+        "bounce_k": 0.20,
+        "signal_cooldown_s": max(600, state.get("signal_cooldown_s", 600)),
         "mode": "quiet",
     })
     state["base_tf"] = "5m"
     state["check_s"] = max(15, state.get("check_s", 20))
 
 def handle_cmd(text):
-    if text.startswith("/mode"):
-        parts=text.split(); apply_mode(parts[1] if len(parts)>1 else "normal")
-        send_tg(f"mode={state['mode']} eps={state['eps_pct']} atr_k={state['atr_k']} slope_min={state['slope_min']}")
-    elif text.startswith("/soft"):
-        apply_preset_soft();  send_tg("🎛 SOFT preset (мягко)")
-    elif text.startswith("/hard"):
-        apply_preset_hard();  send_tg("🎛 HARD preset (строже)")
-    elif text.startswith("/quiet"):
-        apply_preset_quiet(); send_tg("🤫 QUIET preset (ещё чуть мягче)")
-    elif text.startswith("/status"):
+    raw = text.strip()
+    parts = raw.split()
+    cmd   = parts[0].lower().split('@')[0]  # /status@my_bot -> /status
+
+    if cmd == "/start":
+        send_tg("🤖 KuCoin EMA бот запущен. Напиши /help для списка команд.")
+    elif cmd == "/help":
+        send_tg(
+            "Команды:\n"
+            "/status\n"
+            "/mode insane|turbo|ultra|normal\n"
+            "/quiet | /soft | /hard\n"
+            "/setfilters eps atr_k slope_min\n"
+            "/setbounce K\n"
+            "/setcooldown N\n"
+            "/setcheck N\n"
+            "/settf TF\n"
+            "/setsymbols A B C\n"
+            "/candles SYMBOL [TF]\n"
+            "/report [TF]\n"
+            "/autoreport on|off [минут]\n"
+            "/setbatch N | /setthrottle S"
+        )
+    elif cmd == "/quiet":
+        apply_preset_quiet(); send_tg("🤫 QUIET preset (ещё мягче)")
+    elif cmd == "/soft":
+        state.update({"eps_pct":0.003,"atr_k":0.08,"slope_min":-0.002,"bounce_k":0.40,"mode":"soft"})
+        send_tg("🎛 SOFT preset")
+    elif cmd == "/hard":
+        state.update({"eps_pct":0.0015,"atr_k":0.20,"slope_min":-0.0002,"bounce_k":0.25,"mode":"hard"})
+        send_tg("🎛 HARD preset")
+    elif cmd == "/status":
         send_tg(
             f"🩺 symbols={state['symbols']}\n"
             f"tf={state['base_tf']} (fb {state['fallback_tf']}) check={state['check_s']}s\n"
@@ -327,9 +330,8 @@ def handle_cmd(text):
             f"throttle={state['per_req_sleep']}s\n"
             f"report={'on' if state['report_enabled'] else 'off'} every={state['report_every_min']}m\n{fmt_dt()}"
         )
-    elif text.startswith("/setfilters"):
-        parts=text.split()
-        if len(parts)<4:
+    elif cmd == "/setfilters":
+        if len(parts) < 4:
             send_tg(f"текущие: eps={state['eps_pct']} atr_k={state['atr_k']} slope_min={state['slope_min']}")
         else:
             try:
@@ -337,94 +339,113 @@ def handle_cmd(text):
                 state.update({"eps_pct":eps,"atr_k":ak,"slope_min":sm})
                 send_tg(f"ok: eps={eps} atr_k={ak} slope_min={sm}")
             except:
-                send_tg("формат: /setfilters 0.0015 0.24 0.0")
-    elif text.startswith("/setbounce"):
+                send_tg("формат: /setfilters 0.0017 0.28 0.0001")
+    elif cmd == "/setbounce":
         try:
-            v=float(text.split()[1]); v=max(0.1,min(1.0,v))
-            state["bounce_k"]=v; send_tg(f"bounce_k={v}")
+            v=float(parts[1]); v=max(0.1,min(1.0,v)); state["bounce_k"]=v; send_tg(f"bounce_k={v}")
         except:
-            send_tg("формат: /setbounce 0.22")
-    elif text.startswith("/setcooldown"):
+            send_tg("формат: /setbounce 0.20")
+    elif cmd == "/setcooldown":
         try:
-            v=int(text.split()[1]); v=max(60,min(3600,v))
-            state["signal_cooldown_s"]=v; send_tg(f"cooldown={v}")
-        except: send_tg("формат /setcooldown 60..3600")
-    elif text.startswith("/setcheck"):
+            v=int(parts[1]); v=max(60,min(3600,v)); state["signal_cooldown_s"]=v; send_tg(f"cooldown={v}")
+        except:
+            send_tg("формат /setcooldown 60..3600")
+    elif cmd == "/setcheck":
         try:
-            v=int(text.split()[1]); state["check_s"]=max(5,min(120,v))
-            send_tg(f"check interval = {state['check_s']}s")
-        except: send_tg("формат: /setcheck 20")
-    elif text.startswith("/settf"):
-        try: v=text.split()[1]; state["base_tf"]=v; send_tg(f"TF={v}")
+            v=int(parts[1]); state["check_s"]=max(5,min(120,v)); send_tg(f"check interval = {state['check_s']}s")
+        except:
+            send_tg("формат: /setcheck 20")
+    elif cmd == "/settf":
+        try: v=parts[1]; state["base_tf"]=v; send_tg(f"TF={v}")
         except: send_tg("формат /settf 1m|5m|15m|1h|4h|1d")
-    elif text.startswith("/setsymbols"):
+    elif cmd == "/setsymbols":
         try:
-            syms=text.split()[1:]; state["symbols"]=[s.upper() for s in syms]; state["rr_index"]=0
+            syms=[s.upper() for s in parts[1:]]; state["symbols"]=syms; state["rr_index"]=0
             send_tg(f"symbols={state['symbols']}")
-        except: send_tg("формат /setsymbols BTC-USDT ETH-USDT ...")
-    elif text.startswith("/candles"):
-        p=text.split(); sym=p[1].upper() if len(p)>1 else "BTC-USDT"; tf=p[2] if len(p)>2 else state["base_tf"]
+        except:
+            send_tg("формат /setsymbols BTC-USDT ETH-USDT ...")
+    elif cmd == "/candles":
+        sym=parts[1].upper() if len(parts)>1 else "BTC-USDT"
+        tf =parts[2] if len(parts)>2 else state["base_tf"]
         send_tg(build_candles_report(sym,tf))
-    elif text.startswith("/report"):
-        p=text.split(); tf=p[1] if len(p)>1 else state["base_tf"]
+    elif cmd == "/report":
+        tf=parts[1] if len(parts)>1 else state["base_tf"]
         for m in build_all_report(tf): send_tg("🧾 Отчёт EMA/ATR\n"+m)
-    elif text.startswith("/autoreport"):
-        p=text.split()
-        if len(p)<2:
+    elif cmd == "/autoreport":
+        if len(parts) < 2:
             send_tg(f"autoreport={'on' if state['report_enabled'] else 'off'} every={state['report_every_min']}m"); return
-        mode=p[1].lower()
+        mode=parts[1].lower()
         if mode=="on":
-            mins=int(p[2]) if len(p)>2 else state["report_every_min"]
+            mins=int(parts[2]) if len(parts)>2 else state["report_every_min"]
             state["report_enabled"]=True; state["report_every_min"]=max(10,min(1440,mins))
             send_tg(f"✅ autoreport ON, every {state['report_every_min']}m")
         elif mode=="off":
             state["report_enabled"]=False; send_tg("⛔ autoreport OFF")
         else:
             send_tg("формат: /autoreport on|off [минут]")
+    else:
+        send_tg("🤷 Не знаю такую команду. Напиши /help")
 
-# ===== Потоки =====
+# ---------- Потоки ----------
 def tg_loop():
-    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"; offset=None
+    # гарантируем отсутствие webhook, чтобы getUpdates работал стабильно
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=6)
+    except: pass
+
+    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    offset=None
     while True:
         try:
             j=requests.get(url,params={"timeout":20,"offset":offset},timeout=25).json()
             if j.get("ok"):
                 for u in j.get("result", []):
                     offset=u["update_id"]+1
-                    msg=u.get("message",{})
-                    if str(msg.get("chat",{}).get("id"))!=TELEGRAM_CHAT_ID: continue
-                    if "text" in msg: handle_cmd(msg["text"])
+                    msg=u.get("message",{}) or {}
+                    chat_id = str(msg.get("chat",{}).get("id",""))
+                    if chat_id != str(TELEGRAM_CHAT_ID):   # чёткая фильтрация по твоему чату
+                        continue
+                    text = msg.get("text","")
+                    if text:
+                        handle_cmd(text)
         except Exception as e:
             print("tg loop error:", e)
         time.sleep(1)
 
+def next_batch():
+    syms=state["symbols"]
+    if not syms: return []
+    n=max(1,min(len(syms),int(state.get("batch_size",6))))
+    i=int(state.get("rr_index",0))%len(syms)
+    batch=(syms+syms)[i:i+n]
+    state["rr_index"]=(i+n)%len(syms)
+    return batch
+
 def signals_worker():
-    send_tg("🤖 KuCoin EMA бот (quiet чуть мягче) запущен. /help")
+    send_tg("🤖 KuCoin EMA бот (quiet ещё мягче) запущен. /help")
     while True:
         try:
-            batch = next_symbols_batch()
-            for s in batch:
+            for s in next_batch():
                 try: check_symbol(s)
                 except Exception as e: print("check_symbol error", s, e)
             time.sleep(max(1, int(state["check_s"])))
         except Exception as e:
-            print("signals_worker loop error:", e)
+            print("signals loop error:", e)
             time.sleep(2)
 
 def report_worker():
-    last = 0
+    last=0
     while True:
         try:
             if state["report_enabled"] and now_ts()-last >= state["report_every_min"]*60:
-                last = now_ts()
-                send_tg(f"🧾 Автоотчёт активен. Интервал: {state['report_every_min']} мин — {fmt_dt()}")
+                last=now_ts()
+                send_tg(f"🧾 Автоотчёт активен. Интервал {state['report_every_min']} мин — {fmt_dt()}")
         except Exception as e:
             print("report worker error:", e)
         time.sleep(10)
 
 @app.route("/")
-def root():
-    return "ok"
+def root(): return "ok"
 
 if __name__=="__main__":
     apply_preset_quiet()
