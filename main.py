@@ -5,13 +5,12 @@ EMA(9/21) сигнальный бот • KuCoin SPOT • STRONG/WEAK
 - WEAK: near-cross (EPS-зона) и ретест после кросса
 - Режимы: /mode strongonly | both
 - TF: 5m по умолчанию, fallback 1m (оба конвертируются в формат KuCoin)
-- Антиспам "нет сигнала", cooldown по символу, сводки, анти-лимиты KuCoin
-- Команды: /help (список)
+- Антиспам "нет сигнала", cooldown по символу, сводка каждые 30 мин, троттлинг между монетами
+- Команды: /help для списка
 """
 
 import os
 import time
-import math
 import threading
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -21,9 +20,9 @@ import requests
 from flask import Flask
 
 # ========== ТВОИ ДАННЫЕ ==========
-# Можно оставить "auto" — тогда бот сам привяжет первый чат, который ему напишет.
-TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
-TELEGRAM_CHAT_ID   = os.environ.get("TG_CHAT_ID", "auto")  # "5723086631" | "auto"
+TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"   # НОВЫЙ токен
+# Можно оставить "auto" — тогда бот сам привяжет первый чат, который ему напишет
+TELEGRAM_CHAT_ID   = os.environ.get("TG_CHAT_ID", "auto")                # "5723086631" | "auto"
 # =================================
 
 # ========== НАСТРОЙКИ ПО УМОЛЧАНИЮ ==========
@@ -36,19 +35,19 @@ BASE_TF_HUMAN     = "5m"    # 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,1w
 FALLBACK_TF_HUMAN = "1m"
 
 EMA_FAST, EMA_SLOW = 9, 21
-CANDLES_NEED       = 100        # история для расчёта
-CHECK_INTERVAL_S   = 180        # пауза между циклами проверок
-COOLDOWN_S         = 180        # минимум между сигналами по одному символу
-SEND_NOSIG_EVERY   = 3600       # «нет сигнала» по символу — не чаще 1/час
-THROTTLE_PER_SYMBOL_S = 0.25    # задержка между монетами (анти-лимиты KuCoin)
+CANDLES_NEED       = 100
+CHECK_INTERVAL_S   = 180
+COOLDOWN_S         = 180
+SEND_NOSIG_EVERY   = 3600
+THROTTLE_PER_SYMBOL_S = 0.25
 
 MODE          = "both"          # "strongonly" | "both"
 USE_ATR       = False
-ATR_MIN_PCT   = 0.20/100        # для STRONG, если USE_ATR=True
-SLOPE_MIN     = 0.00/100        # мин. наклон (%/бар) для STRONG (0 = выключен)
-EPS_PCT       = 0.10/100        # зона «near-cross» для WEAK (чем больше — мягче)
+ATR_MIN_PCT   = 0.20/100        # используется, если USE_ATR=True
+SLOPE_MIN     = 0.00/100        # мин. наклон (%/бар) для STRONG
+EPS_PCT       = 0.10/100        # зона near-cross для WEAK (чем больше — мягче)
 
-REPORT_SUMMARY_EVERY = 30*60    # каждые 30 минут
+REPORT_SUMMARY_EVERY = 30*60
 KUCOIN_BASE = "https://api.kucoin.com"
 
 # ========== ВНУТРЕННИЕ ГЛОБАЛЫ ==========
@@ -56,7 +55,7 @@ app = Flask(__name__)
 
 last_signal_ts = defaultdict(lambda: 0)
 last_nosig_ts  = defaultdict(lambda: 0)
-last_cross_dir = defaultdict(lambda: None)   # 'up'/'down' (последний реальный кросс)
+last_cross_dir = defaultdict(lambda: None)   # 'up'/'down' — последний реальный кросс
 last_summary_ts = 0
 
 SETTINGS = {"symbols": sorted(DEFAULT_SYMBOLS)}
@@ -78,17 +77,24 @@ def tg_api(method, **params):
         return {}
 
 def tg_send(text: str) -> None:
+    """
+    Отправляет сообщение только если чат уже привязан.
+    При первом старте, пока TELEGRAM_CHAT_ID == 'auto', просто пропустит отправку,
+    но это нормально — после /whoami или любого сообщения произойдёт auto-bind.
+    """
+    if TELEGRAM_CHAT_ID in ("", None, "auto"):
+        return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID not in ("", None, "auto") else "",
-                  "text": text, "parse_mode": "HTML"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=10
         )
     except Exception:
         pass
 
 def tg_delete_webhook():
+    # Гасим webhook, чтобы long-polling (getUpdates) точно работал
     try:
         requests.get(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
@@ -125,7 +131,6 @@ def pct(a: float, b: float) -> float:
         return 0.0
     return (a - b) / b
 
-# ----- Нормализация ТФ -----
 _TF_MAP = {
     "1m":"1min","3m":"3min","5m":"5min","15m":"15min","30m":"30min",
     "1h":"1hour","2h":"2hour","4h":"4hour","6h":"6hour","8h":"8hour","12h":"12hour",
@@ -137,12 +142,8 @@ def tf_human_to_kucoin(tf: str) -> str:
         return tf
     return _TF_MAP.get(tf, "5min")
 
-# ----- KuCoin candles -----
+# ----- KuCoin: /api/v1/market/candles -----
 def kucoin_candles(symbol: str, tf_kucoin: str, need: int, max_retries: int = 3) -> Tuple[List[float], List[float], List[float]]:
-    """
-    GET /api/v1/market/candles
-    Возвращает списки closes, highs, lows в хронологическом порядке.
-    """
     url = f"{KUCOIN_BASE}/api/v1/market/candles"
     params = {"type": tf_kucoin, "symbol": symbol}
 
@@ -194,8 +195,8 @@ def analyze_symbol(symbol: str, tf_human: str, need: int) -> Tuple[Optional[str]
     closes, highs, lows = kucoin_candles(symbol, tf_kucoin, need)
     tf_used = tf_kucoin
 
+    # fallback 1m при недостатке истории
     if len(closes) < max(need, EMA_SLOW + 2):
-        # fallback 1m
         fb_kucoin = tf_human_to_kucoin(FALLBACK_TF_HUMAN)
         closes, highs, lows = kucoin_candles(symbol, fb_kucoin, need)
         tf_used = fb_kucoin
@@ -220,7 +221,7 @@ def analyze_symbol(symbol: str, tf_human: str, need: int) -> Tuple[Optional[str]
 
     atrp = atr_percent(highs, lows, closes, period=14)
 
-    # ---- STRONG ----
+    # STRONG
     strong_dir = None
     reasons = []
     if crossed_up and slope >= SLOPE_MIN:
@@ -237,7 +238,7 @@ def analyze_symbol(symbol: str, tf_human: str, need: int) -> Tuple[Optional[str]
         last_cross_dir[symbol] = strong_dir
         return "STRONG", strong_dir, "; ".join(reasons) + f", tf={tf_used}"
 
-    # ---- WEAK ----
+    # WEAK
     if MODE == "both":
         if near_cross:
             direction = "up" if f2 >= s2 else "down"
@@ -245,7 +246,6 @@ def analyze_symbol(symbol: str, tf_human: str, need: int) -> Tuple[Optional[str]
 
         if last_cross_dir[symbol] in ("up", "down"):
             dir_ = last_cross_dir[symbol]
-            # ретест: fast возле slow после кросса, не пересекая
             if dir_ == "up" and f2 > s2 and dist_pct <= (EPS_PCT * 1.2):
                 return "WEAK", "up", f"retest↑ Δ≈{dist_pct*100:.3f}%, tf={tf_used}"
             if dir_ == "down" and f2 < s2 and dist_pct <= (EPS_PCT * 1.2):
@@ -262,7 +262,7 @@ def format_signal(symbol: str, kind: str, direction: str, reason: str) -> str:
         f"• UTC: {ts_utc_str()}"
     )
 
-# ========== ОБРАБОТКА КОМАНД ==========
+# ========== КОМАНДЫ ==========
 def parse_cmd(text: str):
     parts = text.strip().split()
     if not parts:
@@ -274,13 +274,8 @@ def process_updates():
     last_update_id = None
     symbols = set(DEFAULT_SYMBOLS)
 
-    # Переходим на long-polling (отключаем старые webhook-и, если были)
+    # На всякий случай — выключаем webhook и переходим на long polling
     tg_delete_webhook()
-    # Сообщение при старте — даже если чат ещё не привязан, полезно иметь лог в логах Render
-    try:
-        tg_send(f"🤖 Бот запущен! Режим: <b>{MODE}</b>, tf={BASE_TF_HUMAN}, symbols={len(symbols)}")
-    except Exception:
-        pass
 
     while True:
         for upd in tg_get_updates(last_update_id + 1 if last_update_id else None):
@@ -295,18 +290,18 @@ def process_updates():
             if not text:
                 continue
 
-            # ---- АВТО-БИНД ЧАТА ----
+            # Авто-привязка чата при первом сообщении
             if TELEGRAM_CHAT_ID in ("", "auto", None):
                 TELEGRAM_CHAT_ID = chat_id
                 tg_send(f"🔗 Привязал этот чат: <code>{TELEGRAM_CHAT_ID}</code>")
 
-            # ---- ФИЛЬТР НА СВОЙ ЧАТ ----
+            # Фильтр на свой чат
             if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
                 continue
 
             cmd, args = parse_cmd(text)
 
-            # --- Диагностика / привязка ---
+            # Диагностика / привязка
             if cmd == "/whoami":
                 u = msg.get("from", {})
                 tg_send(
@@ -328,7 +323,7 @@ def process_updates():
                 tg_send("♻️ Сброс привязки. Жду первое сообщение для auto-bind.")
                 continue
 
-            # --- Основные команды ---
+            # Основные команды
             if cmd == "/help":
                 tg_send(
                     "Команды:\n"
@@ -417,7 +412,7 @@ def process_updates():
                 )
                 continue
 
-            # неизвестная команда — подскажем help
+            # Неизвестная команда — подсказка
             if cmd and cmd.startswith("/"):
                 tg_send("Не знаю такую команду. Напиши /help")
 
@@ -462,7 +457,7 @@ def root():
     return "OK"
 
 def main():
-    # На всякий случай гасим вебхук ещё раз перед стартом потоков
+    # На всякий случай — гасим webhook перед стартом
     tg_delete_webhook()
     threading.Thread(target=process_updates, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
