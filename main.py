@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-EMA(9/21)+ATR сигнальный бот • KuCoin SPOT (FEATHER+ — чуть строже FEATHER++)
-- мягкие фильтры + проверка наклона EMA, немного ужат bounce и "почти-кросс"
+EMA(9/21)+ATR сигнальный бот • KuCoin SPOT (FEATHER++)
+— ультра-мягкие фильтры + лёгкий тренд-фильтр, heartbeat «нет сигнала»
 """
 
 import os, time, threading, requests, random
@@ -21,56 +21,64 @@ DEFAULT_SYMBOLS = [
 
 KUCOIN_BASE    = "https://api.kucoin.com"
 KUCOIN_CANDLES = KUCOIN_BASE + "/api/v1/market/candles"
-HEADERS        = {"User-Agent": "ema-kucoin-bot/feather-plus"}
+HEADERS        = {"User-Agent": "ema-kucoin-bot/feather-plus-plus"}
 
 app = Flask(__name__)
+
 state = {
     "symbols": DEFAULT_SYMBOLS[:],
-    "base_tf": "5m",
-    "fallback_tf": "1m",
-    "min_candles": 120,          # было 100
+
+    # Таймфреймы
+    "base_tf": "5m",          # основной ТФ
+    "fallback_tf": "1m",      # если по base_tf нет входа
+
+    # История и EMA
+    "min_candles": 120,       # >=21 для EMA21, запас для сглаживания
     "ema_fast": 9,
     "ema_slow": 21,
 
-    # тайминги
-    "check_s": 10,               # было 8
-    "signal_cooldown_s": 300,    # было 240
-    "no_sig_cooldown_s": 1800,
+    # Тайминги
+    "check_s": 10,                 # пауза между итерациями рабочего цикла
+    "signal_cooldown_s": 180,      # анти-спам по символу (было 300)
     "error_cooldown_s": 400,
 
-    # фильтры (чуть строже)
-    "eps_pct": 0.0010,           # было 0.0007 — ужали "почти-кросс" (≈0.10%)
-    "atr_k":   0.10,             # без изменений
-    "slope_min": 0.0000,         # было -0.0005 — не пропускаем явную "противо-наклонную" ерунду
-    "slope21_min": 0.000020,     # было 0.000015 — EMA21 пусть будет каплю «выше/ниже»
-    "dead_pct": 0.0003,          # было 0.0002 — мёртвую зону сделали шире
-    "bounce_k": 0.30,            # было 0.40 — отскок ближе к EMA21 (строже)
-    "slope_window": 4,           # окно, по которому меряем наклон (EMA[-1] vs EMA[-4])
+    # Мягкие фильтры FEATHER++ (ослаблено)
+    "eps_pct": 0.0007,        # «почти-кросс» ±0.07% от цены (было 0.0010 — строже)
+    "dead_pct": 0.0002,       # мёртвая зона (слишком близко — пропускаем)
+    "bounce_k": 0.40,         # отскок от EMA21 — шире (было 0.30)
+    "atr_k":   0.10,          # ATR-фактор (оставил как есть)
 
-    # анти-лимиты
+    # Лёгкий тренд-фильтр (наклоны EMA)
+    "slope_window": 4,        # сравниваем EMA[-1] vs EMA[-4]
+    "slope_min":   -0.0005,   # допускаем очень слабый/чуть отриц. наклон EMA9 (смягчили)
+    "slope21_min":  0.000015, # требование к EMA21 смягчено
+
+    # Анти-лимиты/пулы
     "batch_size": 12,
     "per_req_sleep": 0.18,
     "rr_index": 0,
     "max_retries": 3,
     "backoff_base": 0.6,
 
-    # отчёты
-    "report_enabled": True,
-    "report_every_min": 90,
-
-    # «нет сигналов» сводка
+    # Heartbeat «нет сигналов»
     "nosig_all_enabled": True,
-    "nosig_all_every_min": 90,
-    "nosig_all_min_age_min": 60,  # было 45
-    "mode": "feather+"
+    "nosig_all_every_min": 60,     # как часто можно присылать «нет сигнала»
+    "nosig_all_min_age_min": 45,   # минимум времени с момента последнего реального сигнала
+
+    # Периодический отчёт (можно отключить)
+    "report_enabled": True,
+    "report_every_min": 120,
+
+    "mode": "feather++"
 }
 
-cool_signal = defaultdict(float)
-cool_no     = defaultdict(float)
-cool_err    = defaultdict(float)
-last_sig    = defaultdict(float)
+# Кулдауны/таймстемпы
+cool_signal = defaultdict(float)  # антиспам сигналов по символу
+cool_err    = defaultdict(float)  # антиспам ошибок
+last_sig    = defaultdict(float)  # когда был последний сигнал по символу
+last_nosig  = defaultdict(float)  # когда отправляли последний «нет сигнала» по символу
 
-# ===== Утилиты =====
+# ---------- Утилиты ----------
 def now_ts(): return time.time()
 def fmt_dt(ts=None): return datetime.fromtimestamp(ts or now_ts()).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -127,17 +135,17 @@ def kucoin_get(url, params, timeout=10):
             time.sleep(state["backoff_base"]*(2**(tries-1))+random.uniform(0,0.05))
 
 def fetch_candles(symbol, tf, want=300, drop_last=True):
+    """KuCoin candles: data = [[t, o, c, h, l, v, q, ...], ...]"""
     try:
         r=kucoin_get(KUCOIN_CANDLES,{"symbol":symbol,"type":tf_to_kucoin(tf)},timeout=10)
         j=r.json()
     except Exception as e:
-        return None,str(e)
+        return None,f"req:{e}"
     if j.get("code")!="200000": return None,f"KuCoin error {j}"
     rows=[]
     for v in j.get("data",[]):
         try:
-            # ts, open, high, low, close (KuCoin: [t, o, c, h, l, v, q, ...])
-            rows.append((int(v[0]),float(v[1]),float(v[3]),float(v[4]),float(v[2])))
+            rows.append((int(v[0]),float(v[1]),float(v[3]),float(v[4]),float(v[2])))  # t,o,h,l,c
         except:
             pass
     if not rows: return None,"empty"
@@ -151,9 +159,9 @@ def fetch_candles(symbol, tf, want=300, drop_last=True):
     time.sleep(state["per_req_sleep"])
     return {"t":t,"o":o,"h":h,"l":l,"c":c},None
 
-# ===== Лёгкий тренд-фильтр (наклон EMA) =====
+# ---------- Лёгкий тренд-фильтр ----------
 def rel_slope(arr, price, win):
-    """ относительный наклон EMA за окно win: (EMA[-1] - EMA[-win]) / price """
+    """ Относительный наклон EMA за окно win: (EMA[-1] - EMA[-win]) / price """
     if not arr or len(arr) < win or arr[-1] is None or arr[-win] is None or price <= 0:
         return None
     return (arr[-1] - arr[-win]) / price
@@ -163,24 +171,19 @@ def trend_ok(side, e9, e21, price):
     s9  = rel_slope(e9,  price, win)
     s21 = rel_slope(e21, price, win)
     if s9 is None or s21 is None: 
-        return True  # не душим, если данных по наклону мало
-
-    # пороги
-    s_min   = state["slope_min"]      # требуемая «минимальная» величина для EMA9
-    s21_min = state["slope21_min"]    # и для EMA21 (слабее)
-
+        return True  # не душим, если по наклону данных мало
+    s_min   = state["slope_min"]
+    s21_min = state["slope21_min"]
     if side == "LONG":
-        # хотим, чтобы EMA9 не падала, а EMA21 хотя бы слегка вверх
-        if s9 < s_min: return False
-        if s21 < s21_min: return False
+        if s9 < s_min:     return False
+        if s21 < s21_min:  return False
         return True
     else:  # SHORT
-        # зеркально: EMA9 вниз, EMA21 слегка вниз
-        if s9 > -s_min: return False
+        if s9 > -s_min:    return False
         if s21 > -s21_min: return False
         return True
 
-# ===== Сигнальная логика =====
+# ---------- Сигналы ----------
 def cross_or_near(e9,e21,price,eps_abs,dead_abs):
     if len(e9)<2 or len(e21)<2: return None
     prev = None
@@ -190,15 +193,15 @@ def cross_or_near(e9,e21,price,eps_abs,dead_abs):
         return None
     curr = e9[-1]-e21[-1]
 
-    # "мёртвая" зона
+    # мёртвая зона
     if abs(curr) < dead_abs:
         return None
 
-    # чистый кросс
+    # кросс
     if prev is not None and prev <= 0 < curr:  return "LONG","кросс ↑"
     if prev is not None and prev >= 0 > curr:  return "SHORT","кросс ↓"
 
-    # почти-кросс (ужали eps_abs)
+    # почти-кросс (мягко)
     if abs(curr) <= eps_abs:
         side = "LONG" if (e9[-1] - (e9[-2] if e9[-2] is not None else e9[-1])) >= 0 else "SHORT"
         return side, "почти кросс"
@@ -219,11 +222,10 @@ def decide_signal(e9,e21,atr_arr,price):
     v = cross_or_near(e9,e21,price,eps_abs,dead_abs)
     if v:
         side, note = v
-        # применяем мягкий тренд-фильтр
         if trend_ok(side, e9, e21, price):
             return side, note
 
-    # если «кросса» нет — пробуем отскок от EMA21 (ужатый)
+    # если кросса нет — пробуем отскок от EMA21
     a = atr_arr[-1] if atr_arr and atr_arr[-1] else None
     v = bounce_signal(e9,e21,price,a)
     if v:
@@ -233,45 +235,99 @@ def decide_signal(e9,e21,atr_arr,price):
 
     return None, "нет"
 
-def check_symbol(sym):
-    if now_ts()<cool_signal[sym]: 
+# ---------- Проверка символа ----------
+def heartbeat_no_signal(sym, tf_used, candles_count):
+    """Отправляем «нет сигнала» не чаще nosig_all_every_min и
+       только если с реального сигнала прошло >= nosig_all_min_age_min."""
+    if not state["nosig_all_enabled"]:
         return
-    for tf in (state["base_tf"],state["fallback_tf"]):
-        candles,err=fetch_candles(sym,tf)
-        if not candles: 
-            return
-        c=candles["c"]; h=candles["h"]; l=candles["l"]
-        if len(c)<state["min_candles"]: 
-            return
-        e9 = ema(c, state["ema_fast"])
-        e21= ema(c, state["ema_slow"])
-        atr_a= atr(h,l,c)
+    now = now_ts()
+    # антиспам по «нет сигналов»
+    if now < last_nosig[sym] + state["nosig_all_every_min"]*60:
+        return
+    # ждём после реального сигнала
+    if now < last_sig[sym] + state["nosig_all_min_age_min"]*60:
+        return
+    last_nosig[sym] = now
+    send_tg(f"ℹ️ {sym}: нет сигнала (tf={tf_used}, свечей={candles_count}) {fmt_dt()}")
 
-        side,note=decide_signal(e9,e21,atr_a,c[-1])
-        if side:
-            cool_signal[sym]=now_ts()+state["signal_cooldown_s"]
-            last_sig[sym]=now_ts()
-            send_tg(f"📣 {sym} {side} @ {c[-1]} ({note}) {fmt_dt()}")
+def check_symbol_on_tf(sym, tf):
+    candles, err = fetch_candles(sym, tf)
+    if not candles:
+        return None, f"no_candles:{err}", 0
+    c=candles["c"]; h=candles["h"]; l=candles["l"]
+    if len(c) < state["min_candles"]:
+        return None, "few_candles", len(c)
+    e9  = ema(c, state["ema_fast"])
+    e21 = ema(c, state["ema_slow"])
+    atr_a = atr(h,l,c)
+    side, note = decide_signal(e9, e21, atr_a, c[-1])
+    if side:
+        return (side, note, c[-1]), None, len(c)
+    return None, "no_signal", len(c)
+
+def check_symbol(sym):
+    now = now_ts()
+    if now < cool_signal[sym]:
+        return
+
+    for tf in (state["base_tf"], state["fallback_tf"]):
+        try:
+            res, reason, n_candles = check_symbol_on_tf(sym, tf)
+        except Exception as e:
+            if now > cool_err[sym]:
+                send_tg(f"⚠️ Ошибка {sym} ({tf}): {e} {fmt_dt()}")
+                cool_err[sym] = now + state["error_cooldown_s"]
             return
+
+        if res:
+            side, note, px = res
+            cool_signal[sym] = now + state["signal_cooldown_s"]
+            last_sig[sym]    = now
+            send_tg(f"📣 {sym} {side} @ {px} ({note}, tf={tf}) {fmt_dt()}")
+            return
+        else:
+            # если на этом ТФ нет — возможно пришлём heartbeat
+            heartbeat_no_signal(sym, tf, n_candles)
 
 def next_batch():
     syms=state["symbols"]; n=state["batch_size"]; i=state["rr_index"]%len(syms)
     batch=(syms+syms)[i:i+n]; state["rr_index"]=(i+n)%len(syms)
     return batch
 
+# ---------- Воркеры ----------
 def signals_worker():
-    send_tg("🤖 KuCoin EMA бот (FEATHER+) запущен — фильтры слегка ужаты")
+    send_tg(f"🤖 KuCoin EMA бот ({state['mode'].upper()}) запущен — фильтры мягкие, heartbeat включён")
     while True:
         for s in next_batch():
             try:
                 check_symbol(s)
             except Exception as e:
-                print("check_symbol",s,e)
+                # локальный лог
+                print("check_symbol", s, e)
         time.sleep(state["check_s"])
 
+def reporter_worker():
+    if not state["report_enabled"]:
+        return
+    last_report = 0.0
+    while True:
+        time.sleep(5)
+        if now_ts() - last_report < state["report_every_min"]*60:
+            continue
+        last_report = now_ts()
+        # краткий системный отчёт
+        alive = sum(1 for _ in state["symbols"])
+        send_tg(f"🩺 Отчёт: символов={alive}, tf={state['base_tf']}→{state['fallback_tf']}, "
+                f"cooldown={state['signal_cooldown_s']}s, режим={state['mode']} {fmt_dt()}")
+
+# ---------- HTTP ----------
 @app.route("/")
 def root(): return "ok"
 
+# ---------- MAIN ----------
 if __name__=="__main__":
-    threading.Thread(target=signals_worker,daemon=True).start()
-    app.run(host="0.0.0.0",port=int(os.environ.get("PORT","10000")))
+    threading.Thread(target=signals_worker, daemon=True).start()
+    threading.Thread(target=reporter_worker, daemon=True).start()
+    # Если запускаешь на Render/Replit — оставь Flask-сервер жить
+    # app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
