@@ -2,6 +2,7 @@
 """
 EMA(9/21)+ATR сигнальный бот • KuCoin SPOT (FEATHER++)
 — ультра-мягкие фильтры + лёгкий тренд-фильтр, heartbeat «нет сигнала»
+— готов для Render (держим процесс живым через Flask app.run)
 """
 
 import os, time, threading, requests, random
@@ -30,7 +31,7 @@ state = {
 
     # Таймфреймы
     "base_tf": "5m",          # основной ТФ
-    "fallback_tf": "1m",      # если по base_tf нет входа
+    "fallback_tf": "1m",      # запасной ТФ
 
     # История и EMA
     "min_candles": 120,       # >=21 для EMA21, запас для сглаживания
@@ -38,22 +39,22 @@ state = {
     "ema_slow": 21,
 
     # Тайминги
-    "check_s": 10,                 # пауза между итерациями рабочего цикла
-    "signal_cooldown_s": 180,      # анти-спам по символу (было 300)
+    "check_s": 10,                 # пауза между итерациями
+    "signal_cooldown_s": 180,      # антиспам по символу (сек)
     "error_cooldown_s": 400,
 
     # Мягкие фильтры FEATHER++ (ослаблено)
-    "eps_pct": 0.0007,        # «почти-кросс» ±0.07% от цены (было 0.0010 — строже)
-    "dead_pct": 0.0002,       # мёртвая зона (слишком близко — пропускаем)
-    "bounce_k": 0.40,         # отскок от EMA21 — шире (было 0.30)
-    "atr_k":   0.10,          # ATR-фактор (оставил как есть)
+    "eps_pct": 0.0007,        # «почти-кросс» ±0.07% от цены
+    "dead_pct": 0.0002,       # мёртвая зона
+    "bounce_k": 0.40,         # отскок от EMA21
+    "atr_k":   0.10,          # ATR-фактор (оставлен)
 
     # Лёгкий тренд-фильтр (наклоны EMA)
     "slope_window": 4,        # сравниваем EMA[-1] vs EMA[-4]
-    "slope_min":   -0.0005,   # допускаем очень слабый/чуть отриц. наклон EMA9 (смягчили)
+    "slope_min":   -0.0005,   # допускаем очень слабый/чуть отриц. наклон EMA9
     "slope21_min":  0.000015, # требование к EMA21 смягчено
 
-    # Анти-лимиты/пулы
+    # Анти-лимиты
     "batch_size": 12,
     "per_req_sleep": 0.18,
     "rr_index": 0,
@@ -62,10 +63,10 @@ state = {
 
     # Heartbeat «нет сигналов»
     "nosig_all_enabled": True,
-    "nosig_all_every_min": 60,     # как часто можно присылать «нет сигнала»
-    "nosig_all_min_age_min": 45,   # минимум времени с момента последнего реального сигнала
+    "nosig_all_every_min": 60,     # как часто можно слать «нет сигнала»
+    "nosig_all_min_age_min": 45,   # минимум с прошлого реального сигнала
 
-    # Периодический отчёт (можно отключить)
+    # Периодический отчёт
     "report_enabled": True,
     "report_every_min": 120,
 
@@ -73,10 +74,10 @@ state = {
 }
 
 # Кулдауны/таймстемпы
-cool_signal = defaultdict(float)  # антиспам сигналов по символу
-cool_err    = defaultdict(float)  # антиспам ошибок
-last_sig    = defaultdict(float)  # когда был последний сигнал по символу
-last_nosig  = defaultdict(float)  # когда отправляли последний «нет сигнала» по символу
+cool_signal = defaultdict(float)
+cool_err    = defaultdict(float)
+last_sig    = defaultdict(float)
+last_nosig  = defaultdict(float)
 
 # ---------- Утилиты ----------
 def now_ts(): return time.time()
@@ -89,8 +90,8 @@ def send_tg(txt):
             json={"chat_id": TELEGRAM_CHAT_ID, "text": txt, "parse_mode": "HTML"},
             timeout=10
         )
-    except:
-        pass
+    except Exception as e:
+        print("send_tg error:", e)
 
 def ema(series, period):
     if len(series) < period: return []
@@ -130,7 +131,7 @@ def kucoin_get(url, params, timeout=10):
             r=requests.get(url,params=params,headers=HEADERS,timeout=timeout)
             if r.status_code==429: raise RuntimeError("429 Too many requests")
             return r
-        except:
+        except Exception as e:
             if tries>=state["max_retries"]: raise
             time.sleep(state["backoff_base"]*(2**(tries-1))+random.uniform(0,0.05))
 
@@ -170,7 +171,7 @@ def trend_ok(side, e9, e21, price):
     win = state["slope_window"]
     s9  = rel_slope(e9,  price, win)
     s21 = rel_slope(e21, price, win)
-    if s9 is None or s21 is None: 
+    if s9 is None or s21 is None:
         return True  # не душим, если по наклону данных мало
     s_min   = state["slope_min"]
     s21_min = state["slope21_min"]
@@ -189,7 +190,7 @@ def cross_or_near(e9,e21,price,eps_abs,dead_abs):
     prev = None
     if e9[-2] is not None and e21[-2] is not None:
         prev = e9[-2]-e21[-2]
-    if e9[-1] is None or e21[-1] is None: 
+    if e9[-1] is None or e21[-1] is None:
         return None
     curr = e9[-1]-e21[-1]
 
@@ -237,8 +238,8 @@ def decide_signal(e9,e21,atr_arr,price):
 
 # ---------- Проверка символа ----------
 def heartbeat_no_signal(sym, tf_used, candles_count):
-    """Отправляем «нет сигнала» не чаще nosig_all_every_min и
-       только если с реального сигнала прошло >= nosig_all_min_age_min."""
+    """Шлём «нет сигнала» не чаще nosig_all_every_min
+       и только если с реального сигнала прошло >= nosig_all_min_age_min."""
     if not state["nosig_all_enabled"]:
         return
     now = now_ts()
@@ -303,7 +304,6 @@ def signals_worker():
             try:
                 check_symbol(s)
             except Exception as e:
-                # локальный лог
                 print("check_symbol", s, e)
         time.sleep(state["check_s"])
 
@@ -316,18 +316,18 @@ def reporter_worker():
         if now_ts() - last_report < state["report_every_min"]*60:
             continue
         last_report = now_ts()
-        # краткий системный отчёт
-        alive = sum(1 for _ in state["symbols"])
+        alive = len(state["symbols"])
         send_tg(f"🩺 Отчёт: символов={alive}, tf={state['base_tf']}→{state['fallback_tf']}, "
                 f"cooldown={state['signal_cooldown_s']}s, режим={state['mode']} {fmt_dt()}")
 
 # ---------- HTTP ----------
 @app.route("/")
-def root(): return "ok"
+def root():
+    return "ok"
 
 # ---------- MAIN ----------
 if __name__=="__main__":
     threading.Thread(target=signals_worker, daemon=True).start()
     threading.Thread(target=reporter_worker, daemon=True).start()
-    # Если запускаешь на Render/Replit — оставь Flask-сервер жить
-    # app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    # Держим процесс живым на Render/Replit
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
