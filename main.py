@@ -1,234 +1,280 @@
 # -*- coding: utf-8 -*-
 """
-EMA(9/21) сигнальный бот • KuCoin SPOT • STRONG/WEAK сигналы
-- STRONG: подтверждённый кросс + наклон + (опц.) ATR-порог
-- WEAK: "почти-кросс" (EPS-зона) или ретест после кросса
+EMA(9/21) сигнальный бот • KuCoin SPOT • STRONG/WEAK
+- STRONG: подтверждённый кросс (EMA9/EMA21) + наклон + (опц.) ATR
+- WEAK: near-cross (EPS-зона) и ретест после кросса
 - Режимы: /mode strongonly | both
-- Таймфрейм: базово 5m, fallback 1m при нехватке данных
-- Антиспам "нет сигнала", cooldown по символу
-- Команды: /help (см. список)
+- Таймфрейм: 5m по умолчанию, fallback 1m (оба автоматически переводятся в формат KuCoin: 5min, 1min)
+- Антиспам "нет сигнала", cooldown по символу, отчёты, задержка между запросами к API
+- Команды: /help для списка
 """
 
-import os, time, math, threading, requests
+import os
+import time
+import math
+import threading
 from datetime import datetime, timezone
-from collections import defaultdict, deque
+from collections import defaultdict
+from typing import Tuple, Optional, List
+
+import requests
 from flask import Flask
 
-# === ТВОИ ДАННЫЕ ===
+# ========== ТВОИ ДАННЫЕ ==========
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
 TELEGRAM_CHAT_ID   = "5723086631"
-# ===================
+# =================================
 
-# -------- Настройки по умолчанию --------
+# ========== НАСТРОЙКИ ПО УМОЛЧАНИЮ ==========
 DEFAULT_SYMBOLS = [
     "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT","ADA-USDT","DOGE-USDT","TRX-USDT",
     "TON-USDT","LINK-USDT","LTC-USDT","DOT-USDT","ARB-USDT","OP-USDT","PEPE-USDT","SHIB-USDT"
 ]
 
-BASE_TF          = "5m"    # базовый ТФ: 1m | 3m | 5m | 15m ...
-FALLBACK_TF      = "1m"
-CANDLES_NEED     = 100     # сколько свечей грузим (EMA сглаживается)
-CHECK_INTERVAL_S = 180     # пауза между раундами проверок
-COOLDOWN_S       = 180     # минимум между сигналами по одной монете
-SEND_NOSIG_EVERY = 3600    # раз в час "нет сигнала" по символу
+# Таймфреймы вводим «по-человечески», а в запросе они будут автоматом переведены в формат KuCoin.
+BASE_TF_HUMAN     = "5m"    # можно: 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,1w
+FALLBACK_TF_HUMAN = "1m"
 
 EMA_FAST, EMA_SLOW = 9, 21
+CANDLES_NEED       = 100        # сколько свечей держим для расчёта
+CHECK_INTERVAL_S   = 180        # пауза между циклами проверок
+COOLDOWN_S         = 180        # минимум между сигналами по одному символу
+SEND_NOSIG_EVERY   = 3600       # «нет сигнала» по конкретному символу не чаще, чем раз в час
+THROTTLE_PER_SYMBOL_S = 0.25    # троттлинг между монетами, чтобы KuCoin не резал лимиты
 
-# --- Фильтры сигналов ---
-MODE = "both"              # "strongonly" | "both"
-USE_ATR = False            # включить ATR-фильтр для STRONG
-ATR_MIN_PCT = 0.20/100     # мин. дневной ATR% для STRONG (если USE_ATR=True)
+MODE          = "both"          # "strongonly" | "both"
+USE_ATR       = False
+ATR_MIN_PCT   = 0.20/100        # для STRONG, если USE_ATR=True
+SLOPE_MIN     = 0.00/100        # мин. наклон (%/бар) для STRONG
+EPS_PCT       = 0.10/100        # «почти-кросс» зона для WEAK (чем больше — мягче)
 
-SLOPE_MIN = 0.00/100       # мин. наклон (в % от цены/бар) для STRONG
-EPS_PCT   = 0.10/100       # ширина "почти-кросс" зоны для WEAK (чем больше — мягче)
-
-# --- Анти-спам и статус ---
-REPORT_SUMMARY_EVERY = 30*60   # каждые 30 мин прислать краткий отчёт
+REPORT_SUMMARY_EVERY = 30*60    # 30 минут
 KUCOIN_BASE = "https://api.kucoin.com"
 
+# ========== ВНУТРЕННИЕ ГЛОБАЛЫ ==========
 app = Flask(__name__)
 
-# -------- Глобальные состояния --------
-last_signal_ts = defaultdict(lambda: 0)     # по монете
+last_signal_ts = defaultdict(lambda: 0)
 last_nosig_ts  = defaultdict(lambda: 0)
-last_cross_dir = defaultdict(lambda: None)  # 'up'/'down' — последняя направлённость кросса (для ретестов)
+last_cross_dir = defaultdict(lambda: None)   # 'up'/'down' (последний реальный кросс)
 last_summary_ts = 0
+
+SETTINGS = {"symbols": sorted(DEFAULT_SYMBOLS)}
 
 # ========== УТИЛИТЫ ==========
 def now_ts() -> int:
     return int(time.time())
 
-def ts_utc_str(ts=None):
-    if ts is None: ts = now_ts()
+def ts_utc_str(ts: Optional[int] = None) -> str:
+    ts = ts if ts is not None else now_ts()
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-def tg_send(text: str):
+def tg_send(text: str) -> None:
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML"}, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
     except Exception:
         pass
 
-def ema(series, period):
-    """Простая EMA без pandas."""
-    if len(series) < period: return []
-    k = 2/(period+1)
-    out = []
+def ema(series: List[float], period: int) -> List[Optional[float]]:
+    if len(series) < period:
+        return []
+    k = 2.0 / (period + 1)
+    out: List[Optional[float]] = [None] * (period - 1)
     ema_val = sum(series[:period]) / period
-    out.extend([None]*(period-1))
     out.append(ema_val)
     for x in series[period:]:
-        ema_val = x * k + ema_val * (1-k)
+        ema_val = x * k + ema_val * (1 - k)
         out.append(ema_val)
     return out
 
-def pct(a, b):  # относит. разница (a-b)/b
-    if b == 0: return 0.0
+def pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
     return (a - b) / b
 
-def kucoin_candles(symbol, tf, limit):
-    # KuCoin: /api/v1/market/candles?type=5min&symbol=BTC-USDT
-    # Ответ: [[time,open,close,high,low,volume], ...] в обратном порядке (новые сначала)
-    url = f"{KUCOIN_BASE}/api/v1/market/candles"
-    params = {"type": tf, "symbol": symbol}
-    r = requests.get(url, params=params, timeout=12)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    if not isinstance(data, list): return []
-    # Разворачиваем в хронологический порядок и ограничиваем количеством
-    arr = list(reversed(data))[-limit:]
-    closes = [float(x[2]) for x in arr]  # close
-    highs  = [float(x[3]) for x in arr]
-    lows   = [float(x[4]) for x in arr]
-    return closes, highs, lows
+# ----- Нормализация ТФ -----
+_TF_MAP = {
+    "1m":"1min","3m":"3min","5m":"5min","15m":"15min","30m":"30min",
+    "1h":"1hour","2h":"2hour","4h":"4hour","6h":"6hour","8h":"8hour","12h":"12hour",
+    "1d":"1day","1w":"1week"
+}
+def tf_human_to_kucoin(tf: str) -> str:
+    tf = tf.strip().lower()
+    # разрешаем сразу kucoin-формат, если вдруг ввели его
+    if tf in _TF_MAP.values():
+        return tf
+    return _TF_MAP.get(tf, "5min")  # по умолчанию 5min
 
-def atr_percent(highs, lows, closes, period=14):
-    if len(closes) < period+1: return None
+# ----- Получение свечей с ретраями -----
+def kucoin_candles(symbol: str, tf_kucoin: str, need: int, max_retries: int = 3) -> Tuple[List[float], List[float], List[float]]:
+    """
+    KuCoin /api/v1/market/candles
+    Возвращает списки closes, highs, lows в хронологическом порядке.
+    """
+    url = f"{KUCOIN_BASE}/api/v1/market/candles"
+    params = {"type": tf_kucoin, "symbol": symbol}
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=12)
+            # Если перебор лимита — подождём и повторим
+            if r.status_code in (429, 503):
+                time.sleep(0.5 * attempt)
+                continue
+            r.raise_for_status()
+            data = r.json().get("data", [])
+            if not isinstance(data, list) or len(data) == 0:
+                # пусто — попробуем ещё раз через маленькую паузу
+                time.sleep(0.25 * attempt)
+                continue
+            # формат: [[ts, open, close, high, low, volume], ...] — новее сначала
+            arr = list(reversed(data))[-max(need, EMA_SLOW + 3):]
+            closes = [float(x[2]) for x in arr]
+            highs  = [float(x[3]) for x in arr]
+            lows   = [float(x[4]) for x in arr]
+            return closes, highs, lows
+        except Exception:
+            time.sleep(0.4 * attempt)
+
+    return [], [], []
+
+def atr_percent(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+    if len(closes) < period + 1:
+        return None
     trs = []
     prev_close = closes[0]
     for i in range(1, len(closes)):
-        tr = max(highs[i]-lows[i], abs(highs[i]-prev_close), abs(lows[i]-prev_close))
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - prev_close),
+            abs(lows[i] - prev_close),
+        )
         trs.append(tr)
         prev_close = closes[i]
     atr = sum(trs[-period:]) / period
     price = closes[-1]
     return (atr / price) if price else None
 
-# ========== ЛОГИКА СИГНАЛОВ ==========
-def analyze_symbol(symbol, tf, need):
-    """Возвращает ('STRONG'|'WEAK'|None, direction 'up'|'down', reason:str)"""
-    try:
-        closes, highs, lows = kucoin_candles(symbol, tf, need)
-        if len(closes) < need:  # fallback на 1m
-            closes, highs, lows = kucoin_candles(symbol, FALLBACK_TF, need)
-            tf_used = FALLBACK_TF
-        else:
-            tf_used = tf
-        if len(closes) < max(EMA_SLOW+2, 30):
-            return None, None, f"недостаточно данных ({len(closes)})"
+# ========== АНАЛИТИКА ==========
+def analyze_symbol(symbol: str, tf_human: str, need: int) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    Возвращает: kind('STRONG'|'WEAK'|None), direction('up'|'down'|None), reason(str)
+    """
+    tf_kucoin = tf_human_to_kucoin(tf_human)
+    closes, highs, lows = kucoin_candles(symbol, tf_kucoin, need)
+    tf_used = tf_kucoin
 
-        ema_fast = ema(closes, EMA_FAST)
-        ema_slow = ema(closes, EMA_SLOW)
-        if not ema_fast or not ema_slow: return None, None, "EMA not ready"
+    if len(closes) < max(need, EMA_SLOW + 2):
+        # fallback 1m
+        fb_kucoin = tf_human_to_kucoin(FALLBACK_TF_HUMAN)
+        closes, highs, lows = kucoin_candles(symbol, fb_kucoin, need)
+        tf_used = fb_kucoin
 
-        # Берём последние точки
-        c  = closes[-1]
-        f1, f2 = ema_fast[-2], ema_fast[-1]
-        s1, s2 = ema_slow[-2], ema_slow[-1]
+    if len(closes) < max(EMA_SLOW + 2, 30):
+        return None, None, f"недостаточно данных ({len(closes)})"
 
-        # Наклон быстр. EMA (в %/бар)
-        slope = pct(f2, f1)
+    ema_fast = ema(closes, EMA_FAST)
+    ema_slow = ema(closes, EMA_SLOW)
+    if not ema_fast or not ema_slow:
+        return None, None, "EMA not ready"
 
-        # Детект кросса между предыдущей и текущей свечой
-        crossed_up   = (f1 <= s1) and (f2 > s2)
-        crossed_down = (f1 >= s1) and (f2 < s2)
+    c  = closes[-1]
+    f1, f2 = ema_fast[-2], ema_fast[-1]
+    s1, s2 = ema_slow[-2], ema_slow[-1]
 
-        # «Почти-кросс»: расстояние fast/slow в пределах EPS_PCT от цены
-        dist_pct = abs(pct(f2, s2))
-        near_cross = dist_pct <= EPS_PCT
+    slope = pct(f2, f1)
 
-        # ATR-фильтр (по желанию)
-        atrp = atr_percent(highs, lows, closes, period=14)
+    crossed_up   = (f1 is not None and s1 is not None and f1 <= s1 and f2 > s2)
+    crossed_down = (f1 is not None and s1 is not None and f1 >= s1 and f2 < s2)
 
-        # ====== Правила STRONG ======
-        strong = None
-        reason = []
-        if crossed_up:
-            strong = ("up" if slope >= SLOPE_MIN else None)
-            if strong: reason.append(f"cross↑ & slope≥{SLOPE_MIN*100:.2f}%")
-        elif crossed_down:
-            strong = ("down" if -slope >= SLOPE_MIN else None)
-            if strong: reason.append(f"cross↓ & |slope|≥{SLOPE_MIN*100:.2f}%")
+    dist_pct = abs(pct(f2, s2))
+    near_cross = dist_pct <= EPS_PCT
 
-        if strong and USE_ATR:
-            if atrp is None or atrp < ATR_MIN_PCT:
-                strong = None
-                reason.append(f"ATR{(atrp or 0)*100:.2f}% < {ATR_MIN_PCT*100:.2f}%")
+    atrp = atr_percent(highs, lows, closes, period=14)
 
-        if strong:
-            last_cross_dir[symbol] = strong
-            return "STRONG", strong, "; ".join(reason) + f", tf={tf_used}"
+    # ---- STRONG ----
+    strong_dir = None
+    reasons = []
+    if crossed_up and slope >= SLOPE_MIN:
+        strong_dir = "up"; reasons.append(f"cross↑ & slope≥{SLOPE_MIN*100:.2f}%/бар")
+    elif crossed_down and -slope >= SLOPE_MIN:
+        strong_dir = "down"; reasons.append(f"cross↓ & |slope|≥{SLOPE_MIN*100:.2f}%/бар")
 
-        # ====== Правила WEAK ======
-        # 1) Почти-кросс в EPS-зоне
-        if MODE == "both" and near_cross:
+    if strong_dir and USE_ATR:
+        if atrp is None or atrp < ATR_MIN_PCT:
+            strong_dir = None
+            reasons.append(f"ATR{(atrp or 0)*100:.2f}% < {ATR_MIN_PCT*100:.2f}%")
+
+    if strong_dir:
+        last_cross_dir[symbol] = strong_dir
+        return "STRONG", strong_dir, "; ".join(reasons) + f", tf={tf_used}"
+
+    # ---- WEAK ----
+    if MODE == "both":
+        if near_cross:
             direction = "up" if f2 >= s2 else "down"
             return "WEAK", direction, f"near-cross Δ≈{dist_pct*100:.3f}%, tf={tf_used}"
 
-        # 2) Ретест после последнего кросса (fast вернулась к slow и оттолкнулась)
-        if MODE == "both" and last_cross_dir[symbol] in ("up","down"):
+        if last_cross_dir[symbol] in ("up", "down"):
             dir_ = last_cross_dir[symbol]
-            # «ретест»: fast снаружи и снова сближается к slow, но не пересекает
-            if dir_ == "up" and f2 > s2 and dist_pct <= (EPS_PCT*1.2):
+            # ретест: fast возле slow после кросса, не пересекая
+            if dir_ == "up" and f2 > s2 and dist_pct <= (EPS_PCT * 1.2):
                 return "WEAK", "up", f"retest↑ Δ≈{dist_pct*100:.3f}%, tf={tf_used}"
-            if dir_ == "down" and f2 < s2 and dist_pct <= (EPS_PCT*1.2):
+            if dir_ == "down" and f2 < s2 and dist_pct <= (EPS_PCT * 1.2):
                 return "WEAK", "down", f"retest↓ Δ≈{dist_pct*100:.3f}%, tf={tf_used}"
 
-        return None, None, f"нет сигнала (tf={tf_used}, свечей={len(closes)})"
-    except Exception as e:
-        return None, None, f"ошибка: {e}"
+    return None, None, f"нет сигнала (tf={tf_used}, свечей={len(closes)})"
 
-def format_signal(symbol, kind, direction, reason):
-    arrow = "🟢LONG" if direction=="up" else "🔴SHORT"
-    tag   = "STRONG" if kind=="STRONG" else "weak"
-    return (f"⚡ {symbol}: {arrow} <b>{tag}</b>\n"
-            f"• EMA9/21: {reason}\n"
-            f"• Время (UTC): {ts_utc_str()}")
+def format_signal(symbol: str, kind: str, direction: str, reason: str) -> str:
+    arrow = "🟢LONG" if direction == "up" else "🔴SHORT"
+    tag = "STRONG" if kind == "STRONG" else "weak"
+    return (
+        f"⚡ {symbol}: {arrow} <b>{tag}</b>\n"
+        f"• EMA9/21: {reason}\n"
+        f"• UTC: {ts_utc_str()}"
+    )
 
-# ========== ТЕЛЕГРАМ КОМАНДЫ ==========
-def parse_cmd(text):
-    parts = text.strip().split()
-    if not parts: return None, []
-    return parts[0].lower(), parts[1:]
-
+# ========== TELEGRAM ==========
 def tg_get_updates(offset=None):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"timeout": 0}
-    if offset: params["offset"] = offset
     try:
-        r = requests.get(url, params=params, timeout=10).json()
-        return r.get("result", [])
+        params = {"timeout": 0}
+        if offset: params["offset"] = offset
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                         params=params, timeout=10)
+        return r.json().get("result", [])
     except Exception:
         return []
 
+def parse_cmd(text: str):
+    parts = text.strip().split()
+    if not parts:
+        return None, []
+    return parts[0].lower(), parts[1:]
+
 def process_updates():
+    global MODE, BASE_TF_HUMAN, COOLDOWN_S, CHECK_INTERVAL_S, EPS_PCT, SLOPE_MIN, USE_ATR, ATR_MIN_PCT
     last_update_id = None
-    global MODE, BASE_TF, COOLDOWN_S, CHECK_INTERVAL_S, EPS_PCT, SLOPE_MIN, USE_ATR, ATR_MIN_PCT
-    global REPORT_SUMMARY_EVERY
     symbols = set(DEFAULT_SYMBOLS)
 
-    tg_send("🤖 Бот запущен! Режим: <b>%s</b>, tf=%s, symbols=%d" % (MODE, BASE_TF, len(symbols)))
+    tg_send(f"🤖 Бот запущен! Режим: <b>{MODE}</b>, tf={BASE_TF_HUMAN}, symbols={len(symbols)}")
 
     while True:
-        for upd in tg_get_updates(last_update_id+1 if last_update_id else None):
+        for upd in tg_get_updates(last_update_id + 1 if last_update_id else None):
             last_update_id = upd["update_id"]
             msg = upd.get("message") or upd.get("edited_message")
-            if not msg: continue
+            if not msg:
+                continue
             chat_id = str(msg.get("chat", {}).get("id"))
             if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
-                continue  # игнор чужих чатов
+                continue
+
             text = (msg.get("text") or "").strip()
-            if not text: continue
+            if not text:
+                continue
 
             cmd, args = parse_cmd(text)
 
@@ -236,101 +282,119 @@ def process_updates():
                 tg_send(
                     "Команды:\n"
                     "/mode strongonly|both\n"
-                    "/seteps 0.12   — EPS% для WEAK (0.12 = 0.12%)\n"
-                    "/setslope 0.02 — мин. наклон %/бар для STRONG\n"
-                    "/useatr on|off — ATR-фильтр для STRONG\n"
-                    "/setatr 0.25   — мин. ATR% (0.25 = 0.25%)\n"
-                    "/settf 1m|3m|5m|15m\n"
+                    "/seteps 0.12    — EPS% для WEAK (0.12 = 0.12%)\n"
+                    "/setslope 0.02  — мин. наклон %/бар для STRONG\n"
+                    "/useatr on|off  — включить/выключить ATR для STRONG\n"
+                    "/setatr 0.25    — мин. ATR% (0.25 = 0.25%)\n"
+                    "/settf 1m|3m|5m|15m|30m|1h|4h|1d (вводишь по-человечески)\n"
                     "/setcooldown 180\n"
-                    "/setcheck 120  — пауза между циклами\n"
+                    "/setcheck 120   — пауза между циклами\n"
                     "/setsymbols BTC-USDT,ETH-USDT,...\n"
                     "/status"
                 )
-            elif cmd == "/mode" and args:
-                if args[0].lower() in ("strongonly","both"):
-                    MODE = args[0].lower()
-                    tg_send(f"✅ MODE: {MODE}")
+
+            elif cmd == "/mode" and args and args[0].lower() in ("strongonly", "both"):
+                MODE = args[0].lower()
+                tg_send(f"✅ MODE: {MODE}")
+
             elif cmd == "/seteps" and args:
                 try:
-                    EPS_PCT = float(args[0])/100.0
+                    val = float(args[0]) / 100.0
+                    if val <= 0: raise ValueError
+                    EPS_PCT = val
                     tg_send(f"✅ EPS_PCT: {EPS_PCT*100:.3f}%")
-                except: tg_send("❌ Пример: /seteps 0.10")
+                except Exception:
+                    tg_send("❌ Пример: /seteps 0.10")
+
             elif cmd == "/setslope" and args:
                 try:
-                    SLOPE_MIN = float(args[0])/100.0
+                    SLOPE_MIN = float(args[0]) / 100.0
                     tg_send(f"✅ SLOPE_MIN: {SLOPE_MIN*100:.3f}%/бар")
-                except: tg_send("❌ Пример: /setslope 0.02")
+                except Exception:
+                    tg_send("❌ Пример: /setslope 0.02")
+
             elif cmd == "/useatr" and args:
                 USE_ATR = (args[0].lower() == "on")
                 tg_send(f"✅ USE_ATR: {USE_ATR}")
+
             elif cmd == "/setatr" and args:
                 try:
-                    ATR_MIN_PCT = float(args[0])/100.0
+                    ATR_MIN_PCT = float(args[0]) / 100.0
                     tg_send(f"✅ ATR_MIN_PCT: {ATR_MIN_PCT*100:.2f}%")
-                except: tg_send("❌ Пример: /setatr 0.25")
+                except Exception:
+                    tg_send("❌ Пример: /setatr 0.25")
+
             elif cmd == "/settf" and args:
-                BASE_TF = args[0]
-                tg_send(f"✅ TF: {BASE_TF} (fallback {FALLBACK_TF})")
+                BASE_TF_HUMAN = args[0].lower()
+                tg_send(f"✅ TF: {BASE_TF_HUMAN} (KuCoin type={tf_human_to_kucoin(BASE_TF_HUMAN)}, fallback={tf_human_to_kucoin(FALLBACK_TF_HUMAN)})")
+
             elif cmd == "/setcooldown" and args:
                 try:
                     COOLDOWN_S = int(args[0]); tg_send(f"✅ COOLDOWN: {COOLDOWN_S}s")
-                except: tg_send("❌ Пример: /setcooldown 180")
+                except Exception:
+                    tg_send("❌ Пример: /setcooldown 180")
+
             elif cmd == "/setcheck" and args:
                 try:
                     CHECK_INTERVAL_S = int(args[0]); tg_send(f"✅ CHECK: {CHECK_INTERVAL_S}s")
-                except: tg_send("❌ Пример: /setcheck 120")
+                except Exception:
+                    tg_send("❌ Пример: /setcheck 120")
+
             elif cmd == "/setsymbols" and args:
                 try:
                     arr = [x.strip().upper() for x in " ".join(args).replace(",", " ").split()]
-                    if arr: 
-                        symbols.clear()
-                        symbols.update(arr)
+                    if arr:
+                        symbols = set(arr)
                         tg_send(f"✅ SYMBOLS: {len(symbols)}\n" + ", ".join(sorted(symbols))[:1000])
-                except: tg_send("❌ Пример: /setsymbols BTC-USDT,ETH-USDT,TRX-USDT")
+                except Exception:
+                    tg_send("❌ Пример: /setsymbols BTC-USDT,ETH-USDT,TRX-USDT")
+
             elif cmd == "/status":
                 tg_send(
-                    f"Символов={len(symbols)}, tf={BASE_TF}→{FALLBACK_TF}, cooldown={COOLDOWN_S}s, "
-                    f"режим={MODE}, EPS={EPS_PCT*100:.2f}%, slope≥{SLOPE_MIN*100:.2f}%/бар, "
-                    f"ATR{' ON' if USE_ATR else ' OFF'} ≥ {ATR_MIN_PCT*100:.2f}%"
+                    f"Символов={len(symbols)}, tf={BASE_TF_HUMAN}→{FALLBACK_TF_HUMAN}, cooldown={COOLDOWN_S}s, режим={MODE}\n"
+                    f"EPS={EPS_PCT*100:.2f}%, slope≥{SLOPE_MIN*100:.2f}%/бар, ATR{' ON' if USE_ATR else ' OFF'} ≥ {ATR_MIN_PCT*100:.2f}%"
                 )
-            # сохраняем актуальный список для worker-а
+
             SETTINGS["symbols"] = sorted(list(symbols))
+
         time.sleep(1)
 
-# ========== ВОРКЕР ПРОВЕРОК ==========
-SETTINGS = {"symbols": sorted(DEFAULT_SYMBOLS)}
-
+# ========== РАБОЧИЙ ПОТОК ==========
 def worker():
     global last_summary_ts
     while True:
-        started = now_ts()
-        syms = SETTINGS["symbols"]
-        for sym in syms:
-            kind, direction, reason = analyze_symbol(sym, BASE_TF, CANDLES_NEED)
-            ts_prev = last_signal_ts[sym]
-            allow_signal = (now_ts() - ts_prev) >= COOLDOWN_S
+        round_started = now_ts()
+        for sym in SETTINGS["symbols"]:
+            kind, direction, reason = analyze_symbol(sym, BASE_TF_HUMAN, CANDLES_NEED)
 
-            if kind in ("STRONG","WEAK") and allow_signal:
-                last_signal_ts[sym] = now_ts()
-                msg = format_signal(sym, kind, direction, reason)
-                tg_send(msg)
+            if kind in ("STRONG", "WEAK"):
+                if now_ts() - last_signal_ts[sym] >= COOLDOWN_S:
+                    last_signal_ts[sym] = now_ts()
+                    tg_send(format_signal(sym, kind, direction, reason))
             else:
-                # редкий "нет сигнала"
-                if (now_ts() - last_nosig_ts[sym]) >= SEND_NOSIG_EVERY:
+                if now_ts() - last_nosig_ts[sym] >= SEND_NOSIG_EVERY:
                     last_nosig_ts[sym] = now_ts()
                     tg_send(f"ℹ️ {sym}: {reason}\nUTC: {ts_utc_str()}")
 
-        # периодический отчёт
-        if (now_ts() - last_summary_ts) >= REPORT_SUMMARY_EVERY:
+            # Лёгкая задержка между монетами (анти-лимиты KuCoin)
+            time.sleep(THROTTLE_PER_SYMBOL_S)
+
+        if now_ts() - last_summary_ts >= REPORT_SUMMARY_EVERY:
             last_summary_ts = now_ts()
-            tg_send(f"✂️ Отчёт: символов={len(syms)}, tf={BASE_TF}→{FALLBACK_TF}, cooldown={COOLDOWN_S}s, режим={MODE}\nUTC: {ts_utc_str()}")
+            tg_send(
+                f"✂️ Отчёт: символов={len(SETTINGS['symbols'])}, "
+                f"tf={BASE_TF_HUMAN}→{FALLBACK_TF_HUMAN}, cooldown={COOLDOWN_S}s, режим={MODE}\n"
+                f"UTC: {ts_utc_str()}"
+            )
 
         # пауза до следующего круга
-        dt = now_ts() - started
-        sleep_left = max(1, CHECK_INTERVAL_S - dt)
+        elapsed = now_ts() - round_started
+        sleep_left = max(1, CHECK_INTERVAL_S - elapsed)
         time.sleep(sleep_left)
 
 # ========== FLASK KEEP-ALIVE ==========
+app = Flask(__name__)
+
 @app.route("/")
 def root():
     return "OK"
