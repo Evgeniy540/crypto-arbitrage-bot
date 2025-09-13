@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 EMA(9/21) сигнальный бот • KuCoin SPOT • STRONG/WEAK
-- STRONG: подтверждённый кросс (EMA9/EMA21) + наклон + (опц.) ATR
+- STRONG: подтверждённый кросс (EMA9/EMA21) + (опц.) наклон + (опц.) ATR
 - WEAK: near-cross (EPS-зона) и ретест после кросса
 - Режимы: /mode strongonly | both
-- Таймфрейм: 5m по умолчанию, fallback 1m (оба автоматически переводятся в формат KuCoin: 5min, 1min)
-- Антиспам "нет сигнала", cooldown по символу, отчёты, задержка между запросами к API
-- Команды: /help для списка
+- TF: 5m по умолчанию, fallback 1m (оба конвертируются в формат KuCoin)
+- Антиспам "нет сигнала", cooldown по символу, сводки, анти-лимиты KuCoin
+- Команды: /help (список)
 """
 
 import os
@@ -21,8 +21,9 @@ import requests
 from flask import Flask
 
 # ========== ТВОИ ДАННЫЕ ==========
+# Можно оставить "auto" — тогда бот сам привяжет первый чат, который ему напишет.
 TELEGRAM_BOT_TOKEN = "7630671081:AAG17gVyITruoH_CYreudyTBm5RTpvNgwMA"
-TELEGRAM_CHAT_ID   = "5723086631"
+TELEGRAM_CHAT_ID   = os.environ.get("TG_CHAT_ID", "auto")  # "5723086631" | "auto"
 # =================================
 
 # ========== НАСТРОЙКИ ПО УМОЛЧАНИЮ ==========
@@ -31,24 +32,23 @@ DEFAULT_SYMBOLS = [
     "TON-USDT","LINK-USDT","LTC-USDT","DOT-USDT","ARB-USDT","OP-USDT","PEPE-USDT","SHIB-USDT"
 ]
 
-# Таймфреймы вводим «по-человечески», а в запросе они будут автоматом переведены в формат KuCoin.
-BASE_TF_HUMAN     = "5m"    # можно: 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,1w
+BASE_TF_HUMAN     = "5m"    # 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,1w
 FALLBACK_TF_HUMAN = "1m"
 
 EMA_FAST, EMA_SLOW = 9, 21
-CANDLES_NEED       = 100        # сколько свечей держим для расчёта
+CANDLES_NEED       = 100        # история для расчёта
 CHECK_INTERVAL_S   = 180        # пауза между циклами проверок
 COOLDOWN_S         = 180        # минимум между сигналами по одному символу
-SEND_NOSIG_EVERY   = 3600       # «нет сигнала» по конкретному символу не чаще, чем раз в час
-THROTTLE_PER_SYMBOL_S = 0.25    # троттлинг между монетами, чтобы KuCoin не резал лимиты
+SEND_NOSIG_EVERY   = 3600       # «нет сигнала» по символу — не чаще 1/час
+THROTTLE_PER_SYMBOL_S = 0.25    # задержка между монетами (анти-лимиты KuCoin)
 
 MODE          = "both"          # "strongonly" | "both"
 USE_ATR       = False
 ATR_MIN_PCT   = 0.20/100        # для STRONG, если USE_ATR=True
-SLOPE_MIN     = 0.00/100        # мин. наклон (%/бар) для STRONG
-EPS_PCT       = 0.10/100        # «почти-кросс» зона для WEAK (чем больше — мягче)
+SLOPE_MIN     = 0.00/100        # мин. наклон (%/бар) для STRONG (0 = выключен)
+EPS_PCT       = 0.10/100        # зона «near-cross» для WEAK (чем больше — мягче)
 
-REPORT_SUMMARY_EVERY = 30*60    # 30 минут
+REPORT_SUMMARY_EVERY = 30*60    # каждые 30 минут
 KUCOIN_BASE = "https://api.kucoin.com"
 
 # ========== ВНУТРЕННИЕ ГЛОБАЛЫ ==========
@@ -69,15 +69,44 @@ def ts_utc_str(ts: Optional[int] = None) -> str:
     ts = ts if ts is not None else now_ts()
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+def tg_api(method, **params):
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+                         params=params, timeout=10)
+        return r.json()
+    except Exception:
+        return {}
+
 def tg_send(text: str) -> None:
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            json={"chat_id": TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID not in ("", None, "auto") else "",
+                  "text": text, "parse_mode": "HTML"},
             timeout=10
         )
     except Exception:
         pass
+
+def tg_delete_webhook():
+    try:
+        requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+            params={"drop_pending_updates": True},
+            timeout=10
+        )
+    except Exception:
+        pass
+
+def tg_get_updates(offset=None):
+    try:
+        params = {"timeout": 0}
+        if offset: params["offset"] = offset
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                         params=params, timeout=10)
+        return r.json().get("result", [])
+    except Exception:
+        return []
 
 def ema(series: List[float], period: int) -> List[Optional[float]]:
     if len(series) < period:
@@ -104,15 +133,14 @@ _TF_MAP = {
 }
 def tf_human_to_kucoin(tf: str) -> str:
     tf = tf.strip().lower()
-    # разрешаем сразу kucoin-формат, если вдруг ввели его
     if tf in _TF_MAP.values():
         return tf
-    return _TF_MAP.get(tf, "5min")  # по умолчанию 5min
+    return _TF_MAP.get(tf, "5min")
 
-# ----- Получение свечей с ретраями -----
+# ----- KuCoin candles -----
 def kucoin_candles(symbol: str, tf_kucoin: str, need: int, max_retries: int = 3) -> Tuple[List[float], List[float], List[float]]:
     """
-    KuCoin /api/v1/market/candles
+    GET /api/v1/market/candles
     Возвращает списки closes, highs, lows в хронологическом порядке.
     """
     url = f"{KUCOIN_BASE}/api/v1/market/candles"
@@ -121,17 +149,15 @@ def kucoin_candles(symbol: str, tf_kucoin: str, need: int, max_retries: int = 3)
     for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(url, params=params, timeout=12)
-            # Если перебор лимита — подождём и повторим
             if r.status_code in (429, 503):
                 time.sleep(0.5 * attempt)
                 continue
             r.raise_for_status()
             data = r.json().get("data", [])
-            if not isinstance(data, list) or len(data) == 0:
-                # пусто — попробуем ещё раз через маленькую паузу
+            if not isinstance(data, list) or not data:
                 time.sleep(0.25 * attempt)
                 continue
-            # формат: [[ts, open, close, high, low, volume], ...] — новее сначала
+            # формат: [[ts, open, close, high, low, volume], ...] — свежие сначала
             arr = list(reversed(data))[-max(need, EMA_SLOW + 3):]
             closes = [float(x[2]) for x in arr]
             highs  = [float(x[3]) for x in arr]
@@ -182,12 +208,10 @@ def analyze_symbol(symbol: str, tf_human: str, need: int) -> Tuple[Optional[str]
     if not ema_fast or not ema_slow:
         return None, None, "EMA not ready"
 
-    c  = closes[-1]
     f1, f2 = ema_fast[-2], ema_fast[-1]
     s1, s2 = ema_slow[-2], ema_slow[-1]
 
     slope = pct(f2, f1)
-
     crossed_up   = (f1 is not None and s1 is not None and f1 <= s1 and f2 > s2)
     crossed_down = (f1 is not None and s1 is not None and f1 >= s1 and f2 < s2)
 
@@ -238,17 +262,7 @@ def format_signal(symbol: str, kind: str, direction: str, reason: str) -> str:
         f"• UTC: {ts_utc_str()}"
     )
 
-# ========== TELEGRAM ==========
-def tg_get_updates(offset=None):
-    try:
-        params = {"timeout": 0}
-        if offset: params["offset"] = offset
-        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                         params=params, timeout=10)
-        return r.json().get("result", [])
-    except Exception:
-        return []
-
+# ========== ОБРАБОТКА КОМАНД ==========
 def parse_cmd(text: str):
     parts = text.strip().split()
     if not parts:
@@ -256,11 +270,17 @@ def parse_cmd(text: str):
     return parts[0].lower(), parts[1:]
 
 def process_updates():
-    global MODE, BASE_TF_HUMAN, COOLDOWN_S, CHECK_INTERVAL_S, EPS_PCT, SLOPE_MIN, USE_ATR, ATR_MIN_PCT
+    global MODE, BASE_TF_HUMAN, COOLDOWN_S, CHECK_INTERVAL_S, EPS_PCT, SLOPE_MIN, USE_ATR, ATR_MIN_PCT, TELEGRAM_CHAT_ID
     last_update_id = None
     symbols = set(DEFAULT_SYMBOLS)
 
-    tg_send(f"🤖 Бот запущен! Режим: <b>{MODE}</b>, tf={BASE_TF_HUMAN}, symbols={len(symbols)}")
+    # Переходим на long-polling (отключаем старые webhook-и, если были)
+    tg_delete_webhook()
+    # Сообщение при старте — даже если чат ещё не привязан, полезно иметь лог в логах Render
+    try:
+        tg_send(f"🤖 Бот запущен! Режим: <b>{MODE}</b>, tf={BASE_TF_HUMAN}, symbols={len(symbols)}")
+    except Exception:
+        pass
 
     while True:
         for upd in tg_get_updates(last_update_id + 1 if last_update_id else None):
@@ -268,16 +288,47 @@ def process_updates():
             msg = upd.get("message") or upd.get("edited_message")
             if not msg:
                 continue
-            chat_id = str(msg.get("chat", {}).get("id"))
-            if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
-                continue
 
+            chat = msg.get("chat", {})
+            chat_id = str(chat.get("id"))
             text = (msg.get("text") or "").strip()
             if not text:
                 continue
 
+            # ---- АВТО-БИНД ЧАТА ----
+            if TELEGRAM_CHAT_ID in ("", "auto", None):
+                TELEGRAM_CHAT_ID = chat_id
+                tg_send(f"🔗 Привязал этот чат: <code>{TELEGRAM_CHAT_ID}</code>")
+
+            # ---- ФИЛЬТР НА СВОЙ ЧАТ ----
+            if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
+                continue
+
             cmd, args = parse_cmd(text)
 
+            # --- Диагностика / привязка ---
+            if cmd == "/whoami":
+                u = msg.get("from", {})
+                tg_send(
+                    "👤 whoami:\n"
+                    f"chat_id={chat_id}\n"
+                    f"user_id={u.get('id')}\n"
+                    f"username=@{u.get('username')}\n"
+                    f"name={u.get('first_name','')} {u.get('last_name','')}"
+                )
+                continue
+
+            if cmd == "/bind":
+                TELEGRAM_CHAT_ID = chat_id
+                tg_send(f"✅ Привязал chat_id={TELEGRAM_CHAT_ID}")
+                continue
+
+            if cmd == "/unbind":
+                TELEGRAM_CHAT_ID = "auto"
+                tg_send("♻️ Сброс привязки. Жду первое сообщение для auto-bind.")
+                continue
+
+            # --- Основные команды ---
             if cmd == "/help":
                 tg_send(
                     "Команды:\n"
@@ -286,18 +337,20 @@ def process_updates():
                     "/setslope 0.02  — мин. наклон %/бар для STRONG\n"
                     "/useatr on|off  — включить/выключить ATR для STRONG\n"
                     "/setatr 0.25    — мин. ATR% (0.25 = 0.25%)\n"
-                    "/settf 1m|3m|5m|15m|30m|1h|4h|1d (вводишь по-человечески)\n"
+                    "/settf 1m|3m|5m|15m|30m|1h|4h|1d\n"
                     "/setcooldown 180\n"
                     "/setcheck 120   — пауза между циклами\n"
                     "/setsymbols BTC-USDT,ETH-USDT,...\n"
                     "/status"
                 )
+                continue
 
-            elif cmd == "/mode" and args and args[0].lower() in ("strongonly", "both"):
+            if cmd == "/mode" and args and args[0].lower() in ("strongonly", "both"):
                 MODE = args[0].lower()
                 tg_send(f"✅ MODE: {MODE}")
+                continue
 
-            elif cmd == "/seteps" and args:
+            if cmd == "/seteps" and args:
                 try:
                     val = float(args[0]) / 100.0
                     if val <= 0: raise ValueError
@@ -305,42 +358,49 @@ def process_updates():
                     tg_send(f"✅ EPS_PCT: {EPS_PCT*100:.3f}%")
                 except Exception:
                     tg_send("❌ Пример: /seteps 0.10")
+                continue
 
-            elif cmd == "/setslope" and args:
+            if cmd == "/setslope" and args:
                 try:
                     SLOPE_MIN = float(args[0]) / 100.0
                     tg_send(f"✅ SLOPE_MIN: {SLOPE_MIN*100:.3f}%/бар")
                 except Exception:
                     tg_send("❌ Пример: /setslope 0.02")
+                continue
 
-            elif cmd == "/useatr" and args:
+            if cmd == "/useatr" and args:
                 USE_ATR = (args[0].lower() == "on")
                 tg_send(f"✅ USE_ATR: {USE_ATR}")
+                continue
 
-            elif cmd == "/setatr" and args:
+            if cmd == "/setatr" and args:
                 try:
                     ATR_MIN_PCT = float(args[0]) / 100.0
                     tg_send(f"✅ ATR_MIN_PCT: {ATR_MIN_PCT*100:.2f}%")
                 except Exception:
                     tg_send("❌ Пример: /setatr 0.25")
+                continue
 
-            elif cmd == "/settf" and args:
+            if cmd == "/settf" and args:
                 BASE_TF_HUMAN = args[0].lower()
                 tg_send(f"✅ TF: {BASE_TF_HUMAN} (KuCoin type={tf_human_to_kucoin(BASE_TF_HUMAN)}, fallback={tf_human_to_kucoin(FALLBACK_TF_HUMAN)})")
+                continue
 
-            elif cmd == "/setcooldown" and args:
+            if cmd == "/setcooldown" and args:
                 try:
                     COOLDOWN_S = int(args[0]); tg_send(f"✅ COOLDOWN: {COOLDOWN_S}s")
                 except Exception:
                     tg_send("❌ Пример: /setcooldown 180")
+                continue
 
-            elif cmd == "/setcheck" and args:
+            if cmd == "/setcheck" and args:
                 try:
                     CHECK_INTERVAL_S = int(args[0]); tg_send(f"✅ CHECK: {CHECK_INTERVAL_S}s")
                 except Exception:
                     tg_send("❌ Пример: /setcheck 120")
+                continue
 
-            elif cmd == "/setsymbols" and args:
+            if cmd == "/setsymbols" and args:
                 try:
                     arr = [x.strip().upper() for x in " ".join(args).replace(",", " ").split()]
                     if arr:
@@ -348,18 +408,24 @@ def process_updates():
                         tg_send(f"✅ SYMBOLS: {len(symbols)}\n" + ", ".join(sorted(symbols))[:1000])
                 except Exception:
                     tg_send("❌ Пример: /setsymbols BTC-USDT,ETH-USDT,TRX-USDT")
+                continue
 
-            elif cmd == "/status":
+            if cmd == "/status":
                 tg_send(
                     f"Символов={len(symbols)}, tf={BASE_TF_HUMAN}→{FALLBACK_TF_HUMAN}, cooldown={COOLDOWN_S}s, режим={MODE}\n"
                     f"EPS={EPS_PCT*100:.2f}%, slope≥{SLOPE_MIN*100:.2f}%/бар, ATR{' ON' if USE_ATR else ' OFF'} ≥ {ATR_MIN_PCT*100:.2f}%"
                 )
+                continue
+
+            # неизвестная команда — подскажем help
+            if cmd and cmd.startswith("/"):
+                tg_send("Не знаю такую команду. Напиши /help")
 
             SETTINGS["symbols"] = sorted(list(symbols))
 
         time.sleep(1)
 
-# ========== РАБОЧИЙ ПОТОК ==========
+# ========== РАБОЧИЙ ПОТОК СИГНАЛОВ ==========
 def worker():
     global last_summary_ts
     while True:
@@ -376,7 +442,6 @@ def worker():
                     last_nosig_ts[sym] = now_ts()
                     tg_send(f"ℹ️ {sym}: {reason}\nUTC: {ts_utc_str()}")
 
-            # Лёгкая задержка между монетами (анти-лимиты KuCoin)
             time.sleep(THROTTLE_PER_SYMBOL_S)
 
         if now_ts() - last_summary_ts >= REPORT_SUMMARY_EVERY:
@@ -387,19 +452,18 @@ def worker():
                 f"UTC: {ts_utc_str()}"
             )
 
-        # пауза до следующего круга
         elapsed = now_ts() - round_started
         sleep_left = max(1, CHECK_INTERVAL_S - elapsed)
         time.sleep(sleep_left)
 
 # ========== FLASK KEEP-ALIVE ==========
-app = Flask(__name__)
-
 @app.route("/")
 def root():
     return "OK"
 
 def main():
+    # На всякий случай гасим вебхук ещё раз перед стартом потоков
+    tg_delete_webhook()
     threading.Thread(target=process_updates, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
     port = int(os.environ.get("PORT", "7860"))
